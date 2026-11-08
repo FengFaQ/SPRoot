@@ -36,13 +36,6 @@ getopts = "0.2.24"
 notify = "8.2.0"
 signal-hook = "0.4.4"
 regex-lite = "0.1.9"
-# for insmod (ELF parsing + symbol relocation, no version check)
-# only the ELF formats matter; PE/Mach-O/archive parsers are dead weight
-goblin = { version = "0.10.7", default-features = false, features = ["std", "elf32", "elf64", "endian_fd"] }
-scroll = "0.13.0"
-# for magica (jailbreak adb-root escalation)
-# framebuffer (image crate) is unused - magica only needs TCP + shell
-adb_client = { version = "3.2.3", default-features = false }
 
 [target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
 rustix = { version = "1.1.4", features = ["all-apis"] }

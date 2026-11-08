@@ -1,6 +1,5 @@
 use crate::{
-    auth_list, daemon, defs, deploy, event, insmod, late_load, lua, magica, module, module_config,
-    supercall, utils,
+    auth_list, daemon, defs, deploy, event, lua, module, module_config, supercall, utils,
 };
 #[cfg(target_os = "android")]
 use android_logger::Config;
@@ -12,13 +11,13 @@ use std::path::PathBuf;
 
 /// APatch cli
 #[derive(Parser, Debug)]
-#[command(author, version = defs::VERSION_CODE, about, long_about = None)]
+#[command(name = "apd", author, version = defs::VERSION_CODE, about = "SPRoot AP binary (module manager + resident daemon)", long_about = None)]
 struct Args {
     #[arg(
         short,
         long,
         value_name = "KEY",
-        help = "Root key for authentication (SK model: the key string is the exec path)"
+        help = "Root key (48 chars; the first 47 are the SK execve escalation token, contract v1.1 E1)"
     )]
     superkey: Option<String>,
     /// Read the key from a 0600 file instead of argv (启动时序 §3.3: keeps the
@@ -97,37 +96,6 @@ enum Commands {
     Version {
         #[arg(long)]
         json: bool,
-    },
-
-    /// Load a kernel module (.ko) without version check (jailbreak mode)
-    Insmod {
-        /// kernel module path
-        module: PathBuf,
-        /// module load parameters (e.g. key=val key2=val2)
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
-        params: Vec<String>,
-    },
-
-    /// Emulate system reboot (keep runtime-loaded modules active)
-    SoftReboot,
-
-    /// Jailbreak mode: load the KernelPatch module for this kernel and apply Magisk policy
-    LateLoad {
-        /// kernel module path (auto-detects KMI if omitted)
-        #[arg(long)]
-        module: Option<PathBuf>,
-        /// kernel KMI (e.g. android14-5.15), auto-detected if omitted
-        #[arg(long)]
-        kmi: Option<String>,
-        /// enable adb-root escalation on this tcp port, then run late-load via adb shell
-        #[arg(long)]
-        magica: Option<u16>,
-        /// restore adb properties after a magica jailbreak (used by the adb shell step)
-        #[arg(long)]
-        post_magica: bool,
-        /// manager package name to restart after a successful jailbreak
-        #[arg(long)]
-        package_name: Option<String>,
     },
 
     /// Resetprop - Magisk-compatible system property tool
@@ -263,15 +231,6 @@ enum ModuleConfigCmd {
     },
 }
 
-#[derive(clap::Subcommand, Debug)]
-enum Sepolicy {
-    /// Check if sepolicy statement is supported/valid
-    Check {
-        /// sepolicy statements
-        sepolicy: String,
-    },
-}
-
 pub fn run() -> Result<()> {
     #[cfg(target_os = "android")]
     android_logger::init_once(
@@ -367,27 +326,6 @@ pub fn run() -> Result<()> {
         Commands::Auth { command } => run_auth(command),
 
         Commands::Version { json } => print_version(json),
-
-        Commands::Insmod { module, params } => insmod::insmod(&module, &params),
-
-        Commands::SoftReboot => event::soft_reboot(cli.superkey),
-
-        Commands::LateLoad {
-            module,
-            kmi,
-            magica,
-            post_magica,
-            package_name,
-        } => {
-            if let Some(port) = magica {
-                return magica::run(port, &module, &kmi, &package_name);
-            }
-            let result = late_load::run(module, kmi, package_name);
-            if post_magica && let Err(e) = magica::disable_adb_root() {
-                log::error!("disable adb root failed: {e:#}");
-            }
-            result
-        }
 
         Commands::Module { command } => {
             #[cfg(any(target_os = "linux", target_os = "android"))]
