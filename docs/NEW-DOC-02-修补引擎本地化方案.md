@@ -255,7 +255,8 @@ tasks.named("preBuild") { dependsOn(copyEngine, assertEngine) }
 |---|---|
 | 本地等价 CI 构建（同脚本/同 NDK/同断言） | ✅ 通过（§6.1 ALL PASS） |
 | 本地 qemu 跑**真实内核**（arm64 产物） | ✅ 通过：33,892,864 B 真内核 `rc=0`，耗时 226 s，产物 sha256 与宿主构建**完全一致**（跨架构确定性，§6.2 B9） |
-| GitHub Actions 运行链接 | ⏳ 工作流待推 `v2` 分支后产生 run 链接（人类规则：交付物只认 CI artifacts，本地不产出交付件） |
+| GitHub Actions 运行 | 🔴 **第 1 次 run 失败**（[run 42486267958](https://github.com/FengFaQ/SPRoot/actions/runs/42486267958)，commit b53c58e）：**失败点为 `Install qemu-user-static` 步骤**（ubuntu-latest 的 `apt-get update` 因第三方源 403 失败），构建/断言步骤全部 skipped。已修复：`update` 容错 + apt 安装失败回落下载静态 `qemu-aarch64-static`（multiarch release），并重推 v2 触发新 run |
+| CI 链接归档 | 待第 2 次 run 通过后归档正式链接（人类规则：交付物只认 CI artifacts） |
 
 ---
 
@@ -374,15 +375,18 @@ boot.img:      header v4, kernel@0x1000 (33,892,864 raw), ramdisk_size=0
 另有独立 vbmeta.img 12,288 B（magic AVB0，alg=SHA256_RSA2048）→ 顶层签名链
 ```
 
-结论（**先验推断，待独立子智能体源码核实与真机验证**）：
-1. **修补必然破坏 AVB**：kernel 字节变化 → boot 内嵌 vbmeta 的 hash 失配 → 顶层 `vbmeta.img` 链式校验失败。**直接 `fastboot flash boot` 会触发验证失败/回滚或卡开机**。
-2. **主路径（推荐）**：关闭校验后再刷：
-   `fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img`（官方 vbmeta 只改 flags：`AVB_VBMETA_IMAGE_FLAGS_HASHTREE_DISABLED=1 | VERIFICATION_DISABLED=2`），随后 `fastboot flash --slot=all boot new-boot.img`（A/B 机型必须 `--slot=all`，与官方 `flash.bat` 一致）。
-3. **备选路径**：`--bootimg repack --strip-avb` 去掉 boot 的 AVBf footer/内嵌 vbmeta（输出 33,898,496 B）后刷入；适用于 boot 走"独立校验被跳过"的机型。两条路径**都必须真机实测能否开机**，不能开机则记录阻断并用官方全量包回滚（`flash.bat.reference` 可全量回滚）。
-4. **回滚保障**：刷入前把原 boot.img 落盘并按 **sha1 内容寻址**保存（学 KSU），失败可秒回官方原镜像。
-5. 风险提示：`--disable-verification` 属降级安全态（设备可能显示警告/影响 OTA），需产品侧明示用户。
+结论（⚠️ **主路径待定，勿据此刷机**）：
 
-> ⏳ 待办：AVB 专项结论（独立子智能体）同步后，把"是否必须 vbmeta 关闭/可否只刷 boot"的最终判定回写本节，并在 `bootimg` 里补 `--patch-vbmeta-flags` 子命令（直接产出 flags 已改的 vbmeta.img，去掉对 `fastboot --disable-*` 的依赖）。
+1. **事实层（已实测确认）**：kernel 字节变化 → boot 内嵌 vbmeta 的 hash 失配 → AVB 链式校验失败。**校验未被关闭时，刷入必然触发验证失败/回滚**。
+2. **策略层（存在冲突意见，需实测定案）**：
+   - 方案甲（保守）：`fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img` + `fastboot flash --slot=all boot new-boot.img`。
+     ⚠️ 人类反馈：**魅族关闭 AVB 会强制清数据**，与本方案目标冲突。
+   - 方案乙（AP/KSU 实际做法，待验证）：**只刷 patched boot、完全不碰 vbmeta**——依据是 APatch/KernelSU 在该机均可正常开机且不清数据，推测**解锁状态下该机不强制校验 boot**（可能仅校验 vbmeta 链或依赖 bootloader 解锁态放行）。
+   - 方案丙（备选）：`--bootimg repack --strip-avb` 去掉 boot 的 AVBf footer/内嵌 vbmeta 后再刷。
+3. **定案条件**：等 AVB 专项（含人类 MEIZU21GKI 项目源码）结论 + 真机刷入实测；**不能开机则记录阻断并用官方全量包回滚**（`flash.bat.reference` 可全量回滚）。回滚保障：刷前按 sha1 内容寻址备份原 boot.img（学 KSU）。
+4. 若最终确定"只刷 boot"可行，则 `--patch-vbmeta-flags` 无必要；若必须改 vbmeta flags，再补该子命令（实现成本低：改 `AVB0` header offset 120 的 u32 flags 即可，已有解析基础）。
+
+> ⏳ 待办：AVB 专项结论同步后，把方案甲/乙/丙的最终判定回写本节（含真机是否清数据、是否可只刷 boot 的实测记录）。
 
 ## 8. 与契约对齐（DOC-C1 v1.0 / CALL v1.1）
 

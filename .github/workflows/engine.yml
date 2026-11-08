@@ -47,7 +47,18 @@ jobs:
           echo "ANDROID_NDK_HOME=$HOME/ndk/android-ndk-r27c" >> "$GITHUB_ENV"
 
       - name: Install qemu-user-static (契约自检)
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static
+        # 注意：ubuntu-latest 上 apt-get update 可能因第三方源返回 403 而失败（首版 run
+        # 42486267958 即卡在此步）。这里 update 容错 + 安装失败回落到静态二进制下载。
+        run: |
+          set -euo pipefail
+          sudo apt-get update -o Acquire::Retries=3 || true
+          if ! sudo apt-get install -y --no-install-recommends qemu-user-static; then
+            echo "apt 安装失败，回落下载静态 qemu-aarch64-static"
+            curl -sSL -o /tmp/qemu-aarch64-static \
+              https://github.com/multiarch/qemu-user-static/releases/download/v8.2.2-1/qemu-aarch64-static
+            sudo install -m 0755 /tmp/qemu-aarch64-static /usr/local/bin/qemu-aarch64-static
+          fi
+          command -v qemu-aarch64-static
 
       - name: Build arm64 artifacts (exec + JNI)
         run: bash engine/android/build_arm64.sh both
