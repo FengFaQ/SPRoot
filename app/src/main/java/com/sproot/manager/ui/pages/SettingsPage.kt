@@ -208,6 +208,10 @@ fun SettingsPage(
             ) {
                 Column {
                     InfoRow("AP 二进制", ApdClient.status(context).detail, monospace = true)
+                    ApdClient.versionMismatchHint(context)?.let {
+                        VSpacer(6)
+                        InfoRow("版本一致性", it, valueColor = MiuixTheme.colorScheme.error)
+                    }
                     deployResult?.let {
                         VSpacer(6)
                         InfoRow("最近一次部署结果", it, monospace = true)

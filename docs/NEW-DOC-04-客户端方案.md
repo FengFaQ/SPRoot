@@ -164,8 +164,19 @@ JNIEXPORT jstring JNICALL Java_com_sproot_manager_core_PatchEngine_nativeLastRoo
 - 导出路径：`Downloads/SPRoot/boot_patched_<yyyyMMdd-HHmmss>.img`
   - Android 10+：`MediaStore.Downloads` + `RELATIVE_PATH=Download/SPRoot`（无需存储权限）
   - Android 9-：公共 Downloads 目录（`WRITE_EXTERNAL_STORAGE` maxSdkVersion=28）
-- 导出后 UI 展示：大小、sha256、内核等长校验结果、fastboot 命令（A/B 双槽 `--slot=all`）、AVB 风险提示位。
+- 导出后 UI 展示：大小、sha256、内核等长校验结果、fastboot 命令（A/B 双槽 `--slot=all`）。
 - 「导出成功」与「刷入成功」是**两级状态**：刷入由用户手动确认后状态机才前进。
+
+**AVB 结论（已由三家实现核实，推翻早期假设）**：MEIZU21GKI / KSU / KernelPatch 均**不触碰 AVB 密码学**，依赖已解锁 bootloader 跳过验证；`--disable-verification` 才是清数据来源。因此刷入指引固定为：
+
+```
+fastboot getvar current-slot        # A/B 机型确认槽位
+fastboot flash --slot=all boot <patched>.img
+fastboot reboot
+```
+
+- **明确禁止**提示 `--disable-verity/--disable-verification`，**不碰 vbmeta**；
+- UI 文案：「仅刷 boot 分区；若设备处于锁态将无法开机（属预期），请确认已解锁」。早期版本的「AVB 提示位 + vbmeta 模板」已按本结论删除。
 
 ---
 
@@ -238,8 +249,11 @@ JNIEXPORT jstring JNICALL Java_com_sproot_manager_core_PatchEngine_nativeLastRoo
 
 ## 9. 待办与开放项
 
-1. **native 资产落地**：`libskrootpatch.so`（patcher 的 engine CI 产物）、`libapd.so`（sys-guard 的 apd CI 产物）→ 确认 artifact 名称后由 workflow 自动拉取（当前步骤为候选名猜测，SKIP 不影响构建）。
-2. **AVB 结论**：patcher 正在确认魅族 21 是否需要重刷 vbmeta / `--disable-verification`；UI 已预留提示位与命令模板。
+1. **native 资产落地**：
+   - `libapd.so` ← CI 固定 artifact **`apd-aarch64-latest`**（含 `libapd-arm64.so` + `apd-version.txt`，约 1.35 MB）；工作流已按此名拉取并重命名为 `libapd.so`，同时把 `apd-version.txt` 打到 `app/src/main/assets/`；
+   - `libskrootpatch.so` ← 等 patcher 的 `engine-arm64` 工作流修好（qemu 问题）后按 artifact 名拉取；当前工作流按候选名尝试，缺失 SKIP 不阻断构建；
+   - 版本一致性：`ApdClient.bundledApdVersion()`（assets）对比 `ApdClient.deployedApdVersion()`（`apd version --json` 的 commit），不一致 → UI 提示「需重新部署」，**不允许静默用旧二进制跑 root-exec**。
+2. **AVB**：结论已定（不碰 vbmeta，只刷 boot，依赖已解锁 bootloader），UI 已按结论改写；详见 §4.4。
 3. **模块列表**：待 `apd module list --json` 的 JSON schema 定稿后接入（当前空态 + 说明，不伪造条目）。
 4. **刷入执行**：首阶段保持"导出 + 人工 fastboot"；后续若接入 AP 内刷入（`dd`/`mtd`），必须走 root-exec 且带 bootloop 守卫。
 5. **真机验证**：`PatchPipeline` 的 magiskboot 解包/回压序列需在魅族 21 的 boot.img 上实测（CI 只能验证编译）；失败时错误区/日志/工作目录三件套可直接取证。

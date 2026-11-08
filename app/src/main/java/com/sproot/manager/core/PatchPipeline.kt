@@ -49,6 +49,10 @@ object PatchPipeline {
 
     private val busy = AtomicBoolean(false)
 
+    /** 仅用于失败时更新状态机（Application context，不会泄漏 Activity） */
+    @Volatile
+    private var appContext: Context? = null
+
     /** 阶段耗时统计（结构化日志：阶段 + 耗时 + 结果） */
     private var stageStartedAt = 0L
     private val stageDurations = mutableListOf<Pair<String, Long>>()
@@ -495,7 +499,9 @@ object PatchPipeline {
         )
         AppLog.error(TAG, "修补失败：$title\n$detail")
         logStageDurations()
-        runCatching { InstallState.markError(state.value.running.let { _ -> title }) }
+        runCatching {
+            appContext?.let { InstallState.markError(it, title) }
+        }
     }
 
     private fun newWorkDir(context: Context): File {

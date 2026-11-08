@@ -284,42 +284,38 @@ fun PatchPage(modifier: Modifier = Modifier) {
     }
 }
 
-/** 刷入指引 + AVB 风险提示位（AVB 结论待 patcher 确认后填具体机型/分区） */
+/** 刷入指引（AVB 结论：三家实现都不碰 AVB 密码学，靠已解锁 bootloader；只刷 boot 分区） */
 @Composable
 private fun FlashGuideCard(artifactPath: String, onCopy: (String) -> Unit) {
     val fileName = artifactPath.substringAfterLast('/')
-    val primaryCmd = "fastboot flash --slot=all boot $fileName"
+    val slotCmd = "fastboot getvar current-slot"
+    val flashCmd = "fastboot flash --slot=all boot $fileName"
     val rebootCmd = "fastboot reboot"
     Card(modifier = Modifier.fillMaxWidth()) {
         Column {
-            Text("刷入指引（魅族 21：A/B 双槽，须两槽都刷）", style = MiuixTheme.textStyles.title4)
+            Text("刷入指引（只刷 boot 分区，不碰 vbmeta）", style = MiuixTheme.textStyles.title4)
             VSpacer(6)
             InfoRow("① 进入 bootloader", "adb reboot bootloader")
-            InfoRow("② 刷入 boot（两槽）", primaryCmd, monospace = true)
-            InfoRow("③ 重启", rebootCmd, monospace = true)
+            InfoRow("② 查看当前槽位（A/B 机型）", slotCmd, monospace = true)
+            InfoRow("③ 刷入 boot（双槽都刷）", flashCmd, monospace = true)
+            InfoRow("④ 重启", rebootCmd, monospace = true)
             VSpacer(8)
             ActionRow {
-                Button(onClick = { onCopy(primaryCmd) }) {
+                Button(onClick = { onCopy(flashCmd) }) {
                     Text("复制刷入命令", style = MiuixTheme.textStyles.button)
+                }
+                HSpacer(8)
+                Button(onClick = { onCopy(slotCmd) }) {
+                    Text("复制查槽命令", style = MiuixTheme.textStyles.button)
                 }
             }
             VSpacer(10)
-            Text(
-                "⚠️ AVB 风险提示（待 patcher 结论）",
-                style = MiuixTheme.textStyles.title4,
-                color = MiuixTheme.colorScheme.error,
-            )
+            Text("⚠️ 风险提示", style = MiuixTheme.textStyles.title4, color = MiuixTheme.colorScheme.error)
             VSpacer(4)
+            BodyText("仅刷 boot 分区；不要刷 vbmeta、不要加 --disable-verity/--disable-verification。")
+            BodyText("若设备 bootloader 仍处于锁定态，刷入后将无法开机（属预期行为）——请确认已解锁后再刷。")
             BodyText(
-                "修补会破坏 boot 分区的 AVB 签名与校验链。若刷入后卡在开机第一屏/无限重启，可能需要先禁用校验：",
-            )
-            InfoRow(
-                "vbmeta 模板（待确认是否适用本机）",
-                "fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img",
-                monospace = true,
-            )
-            BodyText(
-                "该命令与是否重刷 vbmeta 由 patcher 按本机 GKI/AVB 实测结论给出；本页仅预留提示位，未确认前请勿盲刷。",
+                "刷前请记录本页 sha256 与产物路径；刷后若无法开机，用 fastboot 刷回原镜像（本页「原镜像备份」可还原）。",
                 color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
             )
         }

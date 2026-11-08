@@ -196,8 +196,39 @@ object ApdClient {
         timeoutSec = timeoutSec,
     )
 
-    /** 非 root 探测：`apd version --json`（§8.3，任意身份） */
-    fun versionProbe(context: Context): Result {
+    /** APK 内置 apd 版本信息（assets/apd-version.txt，由 CI 从 artifact 一并打入） */
+    fun bundledApdVersion(context: Context): Map<String, String> = runCatching {
+        context.assets.open("apd-version.txt").bufferedReader().use { reader ->
+            reader.readLines().mapNotNull { line ->
+                val i = line.indexOf('=')
+                if (i > 0) line.substring(0, i).trim() to line.substring(i + 1).trim() else null
+            }.toMap()
+        }
+    }.getOrDefault(emptyMap())
+
+    /** 设备上已部署 apd 的版本信息（`apd version --json`） */
+    fun deployedApdVersion(context: Context): Map<String, String> {
+        val result = versionProbe(context)
+        return runCatching {
+            listOf("version", "commit", "commit_short", "deployed")
+                .mapNotNull { key -> MiniJson.string(result.stdout, key)?.let { key to it } }
+                .toMap()
+        }.getOrDefault(emptyMap())
+    }
+
+    /**
+     * 版本一致性检查（sys-guard 契约要求）：
+     * 内置 commit ≠ 已部署 commit 时**必须提示重新部署**，不允许静默用旧二进制跑 root-exec。
+     * @return null 表示一致或无法判定（不阻断）；否则返回给人看的提示。
+     */
+    fun versionMismatchHint(context: Context): String? {
+        val bundled = bundledApdVersion(context)["commit"]?.takeIf { it.isNotBlank() } ?: return null
+        val deployed = deployedApdVersion(context)["commit"]?.takeIf { it.isNotBlank() } ?: return null
+        if (bundled == deployed) return null
+        return "版本不一致：内置 AP ${bundled.take(8)} / 已部署 ${deployed.take(8)} → 请重新部署（设置 → AP 部署）"
+    }
+
+    /** 非 root 探测：`apd version --json`（§8.3，任意身份） */    fun versionProbe(context: Context): Result {
         val bin = apdBinary(context)
         if (!bin.isFile) {
             return Result(
