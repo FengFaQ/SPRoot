@@ -16,6 +16,7 @@ import androidx.compose.ui.unit.dp
 import com.sproot.manager.BuildConfig
 import com.sproot.manager.core.ApdClient
 import com.sproot.manager.core.AppLog
+import com.sproot.manager.core.BackupStore
 import com.sproot.manager.core.SecretStore
 import com.sproot.manager.ui.components.ActionRow
 import com.sproot.manager.ui.components.BodyText
@@ -46,6 +47,8 @@ fun SettingsPage(
     var showKey by remember { mutableStateOf(false) }
     var deployResult by remember { mutableStateOf<String?>(null) }
     var deploying by remember { mutableStateOf(false) }
+    var backups by remember { mutableStateOf<List<BackupStore.Backup>>(emptyList()) }
+    var backupMsg by remember { mutableStateOf<String?>(null) }
 
     LazyColumn(modifier = modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp)) {
         item {
@@ -129,6 +132,67 @@ fun SettingsPage(
                         HSpacer(8)
                         Button(onClick = { AppLog.clearMemory() }) {
                             Text("清空内存日志", style = MiuixTheme.textStyles.button)
+                        }
+                    }
+                }
+            }
+        }
+
+        item { VSpacer(14) }
+
+        item {
+            SectionCard(
+                title = "原镜像备份（sha1 内容寻址）",
+                subtitle = "每次修补前自动备份 boot.img；可还原到 Downloads/SPRoot/ 供 fastboot 刷回",
+            ) {
+                Column {
+                    ActionRow {
+                        Button(onClick = {
+                            Thread {
+                                backups = BackupStore.list(context)
+                                backupMsg = "已加载 ${backups.size} 条备份"
+                            }.start()
+                        }) { Text("刷新备份列表", style = MiuixTheme.textStyles.button) }
+                    }
+                    backupMsg?.let {
+                        VSpacer(6)
+                        InfoRow("结果", it)
+                    }
+                    if (backups.isEmpty()) {
+                        VSpacer(6)
+                        BodyText("暂无备份。第一次修补时会自动创建。", color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+                    }
+                    backups.take(10).forEach { backup ->
+                        VSpacer(8)
+                        InfoRow("sha1", backup.sha1, monospace = true)
+                        InfoRow("原始文件名", backup.sourceName)
+                        InfoRow("大小 / 时间", "${com.sproot.manager.core.Capabilities.formatBytes(backup.size)} · ${java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.US).format(java.util.Date(backup.createdAt))}")
+                        ActionRow {
+                            Button(
+                                onClick = {
+                                    Thread {
+                                        val result = runCatching {
+                                            BackupStore.restoreToDownloads(context, backup)
+                                        }
+                                        backupMsg = result.fold(
+                                            onSuccess = { "已还原到 ${it.displayPath}" },
+                                            onFailure = { "还原失败：${it.javaClass.simpleName}: ${it.message}" },
+                                        )
+                                    }.start()
+                                },
+                                colors = ButtonDefaults.buttonColors(),
+                            ) { Text("还原到 Downloads", style = MiuixTheme.textStyles.button) }
+                            HSpacer(8)
+                            Button(onClick = {
+                                Thread {
+                                    backupMsg = if (BackupStore.delete(context, backup)) {
+                                        "已删除备份 ${backup.sha1.take(8)}"
+                                    } else {
+                                        "删除失败"
+                                    }
+                                    backups = BackupStore.list(context)
+                                }.start()
+                            }) { Text("删除", style = MiuixTheme.textStyles.button) }
                         }
                     }
                 }

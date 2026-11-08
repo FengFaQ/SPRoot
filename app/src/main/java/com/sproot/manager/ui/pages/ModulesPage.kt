@@ -38,10 +38,29 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 @Composable
 fun ModulesPage(modifier: Modifier = Modifier) {
     val context = LocalContext.current
+    val apdStatus = remember { ApdClient.status(context) }
+    val apdReady = apdStatus.ok
     var probe by remember { mutableStateOf<String?>(null) }
     var probing by remember { mutableStateOf(false) }
 
     LazyColumn(modifier = modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp)) {
+        // 页面能力门禁：AP 未部署时禁用一切模块操作入口，
+        // 避免出现"点了必然失败"的按钮（旧版管理器的主要体验病灶）。
+        if (!apdReady) {
+            item {
+                SectionCard(
+                    title = "⚠️ 模块功能不可用",
+                    subtitle = "本页所有操作都依赖 AP 守护；当前检测未通过",
+                ) {
+                    Column {
+                        BodyText(apdStatus.detail)
+                        VSpacer(8)
+                        BodyText("请先到「设置 → AP 部署」完成部署；部署前本页按钮保持禁用。")
+                    }
+                }
+            }
+            item { VSpacer(14) }
+        }
         item {
             SectionCard(
                 title = "模块管理",
@@ -67,6 +86,7 @@ fun ModulesPage(modifier: Modifier = Modifier) {
                                     probing = false
                                 }.start()
                             },
+                            enabled = apdReady,
                             colors = ButtonDefaults.buttonColorsPrimary(),
                         ) {
                             Text(if (probing) "探测中…" else "刷新状态", style = MiuixTheme.textStyles.button)

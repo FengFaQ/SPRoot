@@ -3,6 +3,10 @@
 
     <!-- 不申请网络权限：本 App 修补全程离线，禁止构建期/运行期静默下载（旧版缺陷 ③） -->
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <!-- Android 9 及以下导出产物到公共 Downloads 需要；Android 10+ 走 MediaStore 无需权限 -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
 
     <!-- SK 引擎/magiskboot 只交付 arm64 -->
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />

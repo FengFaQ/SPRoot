@@ -18,7 +18,10 @@ import com.sproot.manager.core.ApdClient
 import com.sproot.manager.core.AppLog
 import com.sproot.manager.core.Capabilities
 import com.sproot.manager.core.CapabilityItem
+import com.sproot.manager.core.InstallState
 import com.sproot.manager.core.SecretStore
+import com.sproot.manager.ui.components.ActionRow
+import com.sproot.manager.ui.components.HSpacer
 import com.sproot.manager.ui.components.BodyText
 import com.sproot.manager.ui.components.InfoRow
 import com.sproot.manager.ui.components.SectionCard
@@ -47,19 +50,50 @@ fun HomePage(
     val rootKey = remember { runCatching { SecretStore.get(context).getOrCreateRootKey() }.getOrNull() }
     val apd = remember { ApdClient.status(context) }
     val apdVersion = remember { runCatching { ApdClient.versionProbe(context) }.getOrNull() }
+    var installStatus by remember { mutableStateOf(InstallState.load(context)) }
 
     LazyColumn(modifier = modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp)) {
         item {
             SectionCard(
+                title = "安装状态 · ${installStatus.status.label}",
+                subtitle = installStatus.status.hint,
+            ) {
+                Column {
+                    InfoRow("产物", installStatus.artifactDisplayPath ?: "无")
+                    if (installStatus.artifactSha256 != null) {
+                        InfoRow("sha256", installStatus.artifactSha256!!, monospace = true)
+                    }
+                    InfoRow("最近更新", installStatus.updatedAtText)
+                    installStatus.note?.let { InfoRow("备注", it) }
+                    VSpacer(10)
+                    ActionRow {
+                        Button(
+                            onClick = { installStatus = InstallState.load(context) },
+                            colors = ButtonDefaults.buttonColors(),
+                        ) { Text("刷新状态", style = MiuixTheme.textStyles.button) }
+                        HSpacer(8)
+                        Button(
+                            onClick = { onGoPatch() },
+                            colors = ButtonDefaults.buttonColorsPrimary(),
+                        ) { Text("前往修补", style = MiuixTheme.textStyles.button) }
+                    }
+                }
+            }
+        }
+
+        item { VSpacer(14) }
+
+        item {
+            SectionCard(
                 title = "SPRoot 状态",
-                subtitle = "内核修补在 App 进程内完成；特权操作统一经 AP（root-exec）下发",
+                subtitle = "内核修补在 App 进程内完成（无需 root）；特权操作统一经 AP（root-exec）下发",
             ) {
                 InfoRow(
                     label = "修补引擎",
                     value = if (checked) {
                         caps.firstOrNull { it.key == "engine" }?.detail ?: "未检测"
                     } else {
-                        "未检测（点击下方「重新自检」）"
+                        "未检测（点击下方「开始自检」）"
                     },
                 )
                 InfoRow(

@@ -32,6 +32,38 @@ jobs:
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37" "build-tools;37.0.0" || true
           echo "--- installed ---"
           ls "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools" || true
+      - name: Fetch native libs from CI artifacts (optional, non-blocking)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        continue-on-error: true
+        run: |
+          set -u
+          DEST=app/src/main/jniLibs/arm64-v8a
+          mkdir -p "$DEST"
+          fetch() {
+            name="$1"; shift
+            if gh run download --repo "${{ github.repository }}" --name "$name" --dir "/tmp/n-$name" 2>/dev/null; then
+              find "/tmp/n-$name" -type f \( -name '*.so' -o -name 'skroot-patch' -o -name 'apd' \) | while read -r f; do
+                base=$(basename "$f")
+                case "$base" in
+                  skroot-patch) cp -f "$f" "$DEST/libskrootpatch.so" ;;
+                  apd)          cp -f "$f" "$DEST/libapd.so" ;;
+                  *)            cp -f "$f" "$DEST/$base" ;;
+                esac
+              done
+              echo "ARTIFACT OK: $name"
+            else
+              echo "ARTIFACT SKIP: $name (不存在或未就绪，不阻断本次构建)"
+            fi
+          }
+          fetch skrootpatch-arm64 || true
+          fetch libskrootpatch || true
+          fetch apd-arm64 || true
+          fetch libapd || true
+          echo "--- jniLibs ---"
+          ls -la "$DEST" || true
+          for f in "$DEST"/*.so; do [ -f "$f" ] && file "$f" && head -c 20 "$f" | od -An -tx1 | head -2; done || true
+
       - name: Build release APK
         run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
       - name: Verify APK signature
@@ -40,6 +72,13 @@ jobs:
           APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | tail -1)
           "$BT/apksigner" verify --print-certs "$APK" | head -20
+
+      - name: Inspect APK native libs (info only)
+        if: always()
+        run: |
+          unzip -l app/build/outputs/apk/release/*.apk | grep -E "lib/arm64-v8a|extractNativeLibs" || true
+          unzip -l app/build/outputs/apk/release/*.apk | grep "lib/arm64-v8a" || echo "WARN: APK 内暂无 jniLibs（等 engine/apd artifact 就绪）"
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:

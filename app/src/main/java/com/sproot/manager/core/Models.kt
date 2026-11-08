@@ -26,6 +26,28 @@ enum class PatchStage(val title: String) {
     FAILED("失败"),
 }
 
+/** 修补模式（借鉴 APatch PatchMode，先落地前两种，后两种占位禁用） */
+enum class PatchMode(val label: String, val description: String, val enabled: Boolean = true) {
+    EXPORT_ONLY(
+        "仅导出",
+        "生成修补后的 boot.img 并保存到 Downloads/SPRoot/，不给刷入指引",
+    ),
+    EXPORT_AND_GUIDE(
+        "导出并给出刷入指引",
+        "生成产物 + 校验信息 + fastboot 命令模板 + AVB 风险提示",
+    ),
+    RESTORE_BACKUP(
+        "从备份还原",
+        "把修补前的 boot.img 还原到 Downloads/SPRoot/（在设置 → 备份中操作）",
+        enabled = false,
+    ),
+    UNINSTALL_RESTORE(
+        "卸载并还原内核",
+        "需要已部署 AP；本阶段未开放",
+        enabled = false,
+    ),
+}
+
 /**
  * 修补页 UI 状态。
  *
@@ -38,10 +60,16 @@ data class PatchUiState(
     val progress: Float = 0f,
     val phase: String = "",
     val running: Boolean = false,
+    val mode: PatchMode = PatchMode.EXPORT_AND_GUIDE,
     val sourceUri: String? = null,
     val sourceName: String? = null,
     val workDir: String? = null,
     val outputPath: String? = null,
+    val outputSha256: String? = null,
+    val outputBytes: Long = 0L,
+    val kernelBytes: Long = 0L,
+    val kernelEqualLength: Boolean = false,
+    val backupSha1: String? = null,
     val reportPath: String? = null,
     val logPath: String? = null,
     val rootKey: String? = null,

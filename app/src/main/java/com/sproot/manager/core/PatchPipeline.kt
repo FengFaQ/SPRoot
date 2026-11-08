@@ -13,28 +13,32 @@ import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * 手机本地修补流水线（对应 SPROOT-DOC-C1 的"调用方"职责）。
+ * 手机本地修补流水线（SPROOT-DOC-C1 的"调用方"职责）。
  *
  * ```
  * 选 boot.img
  *   → ①环境自检（ABI / 引擎 / magiskboot / 存储 / 密钥 / 输入魔数）
- *   → ②复制到 cache 工作目录（不直接改用户文件）
+ *   → ②复制到 cache 工作目录 + sha1 内容寻址备份
  *   → ③magiskboot unpack → kernel
  *   → ④kernel 若仍压缩 → magiskboot decompress → kernel.raw
- *   → ⑤PatchEngine.patch(kernel.raw → kernel.patched)  ← 48 位密钥在此注入
+ *   → ⑤PatchEngine.patch(kernel.raw → kernel.patched)  ← 48 位密钥在此注入（JNI，无需 root）
  *   → ⑥kernel.patched 若原为压缩 → magiskboot compress=<fmt>
  *   → ⑦magiskboot repack → new-boot.img
- *   → ⑧校验：大小/IP 产物存在/sha256、密钥可用性 → 导出到外部目录
+ *   → ⑧校验（产物存在 / 内核等长 / sha256 / 与输入不同）→ 导出 Downloads/SPRoot/
+ *   → ⑨状态机置「已修补·待刷入」（用户确认刷入后才进「已刷入·待重启」）
  * ```
  *
  * 设计铁律（逐条对应旧版失败根因规避清单）：
  *  ① 每步入口先自检，缺件立刻报「缺什么/在哪/怎么修」，绝不静默跳过；
  *  ③ 全程离线：不下载任何东西，所需二进制必须随 APK 分发；
- *  ⑤ 失败即写日志文件 + UI 错误区常驻（state.error* 只有用户点重置才清）；
+ *  ⑤ 失败即写日志文件 + UI 错误区常驻（error* 只有用户点重置才清）；
  *  ⑥ 不生成也不执行任何 shell 脚本；
- *  ⑦ 成功必须验证产物存在 + 修补内核等长 + sha256 记录；
+ *  ⑦ 成功必须验证产物存在 + 修补内核等长 + sha256 记录（并记入状态机）；
  *  ⑨ 不 exec filesDir 里的 ELF（magiskboot 在 nativeLibraryDir）；
  *  ⑩ 全部 ProcessBuilder 参数数组调用，无 sh -c 拼接。
+ *
+ * 本流水线**不需要 root**：只读写自己的私有目录与 Downloads。
+ * 特权操作（部署/模块/授权/刷入）走 [ApdClient] 的 root-exec，两条链不混用。
  */
 object PatchPipeline {
 
@@ -45,7 +49,21 @@ object PatchPipeline {
 
     private val busy = AtomicBoolean(false)
 
-    // ------------------------------------------------------------------ 选择输入
+    /** 阶段耗时统计（结构化日志：阶段 + 耗时 + 结果） */
+    private var stageStartedAt = 0L
+    private val stageDurations = mutableListOf<Pair<String, Long>>()
+
+    // ------------------------------------------------------------------ 交互
+    fun selectMode(mode: PatchMode) {
+        if (state.value.running) return
+        if (!mode.enabled) {
+            AppLog.warn(TAG, "模式「${mode.label}」尚未开放：${mode.description}")
+            return
+        }
+        state.value = state.value.copy(mode = mode)
+        AppLog.info(TAG, "修补模式：${mode.label}")
+    }
+
     fun selectInput(uri: Uri?, displayName: String?) {
         val current = state.value
         if (current.running) {
@@ -68,7 +86,9 @@ object PatchPipeline {
             AppLog.warn(TAG, "修补进行中，禁止重置")
             return
         }
-        state.value = PatchUiState()
+        val mode = state.value.mode
+        state.value = PatchUiState(mode = mode)
+        stageDurations.clear()
         AppLog.info(TAG, "修补页状态已重置")
     }
 
@@ -102,13 +122,21 @@ object PatchPipeline {
             startedAt = System.currentTimeMillis(),
             finishedAt = 0L,
             outputPath = null,
+            outputSha256 = null,
+            outputBytes = 0L,
+            kernelBytes = 0L,
+            kernelEqualLength = false,
+            backupSha1 = null,
             reportPath = null,
             rootKey = null,
             errorCode = null,
             errorTitle = null,
             errorDetail = null,
             logPath = logFile?.absolutePath,
+            mode = current.mode,
         )
+        stageDurations.clear()
+        InstallState.markPatching(appContext)
 
         Thread({ execute(appContext, Uri.parse(uriString)) }, "sproot-patch").start()
     }
@@ -140,7 +168,7 @@ object PatchPipeline {
             }
             stage(PatchStage.PREFLIGHT, 5f, "环境自检通过")
 
-            // ---------- ② 准备镜像 ----------
+            // ---------- ② 准备镜像 + 备份 ----------
             stage(PatchStage.COPY_INPUT, 8f, "复制镜像到应用私有工作目录")
             workDir = newWorkDir(context)
             state.value = state.value.copy(workDir = workDir.absolutePath)
@@ -153,6 +181,13 @@ object PatchPipeline {
             }
             val inputSha = sha256(bootImg)
             AppLog.info(TAG, "输入 boot.img sha256=$inputSha")
+
+            val backup = runCatching { BackupStore.backup(context, bootImg, state.value.sourceName) }
+                .onFailure { AppLog.error(TAG, "备份原镜像失败（不阻断修补）", it) }
+                .getOrNull()
+            state.value = state.value.copy(backupSha1 = backup?.sha1)
+            AppLog.info(TAG, "修补前备份：${backup?.sha1 ?: "<失败>"}")
+
             val inputCap = Capabilities.collect(context, bootImg).last()
             if (!inputCap.ok) {
                 finishFailure("镜像校验未通过", inputCap.detail, null)
@@ -223,15 +258,14 @@ object PatchPipeline {
             }
             val rawSize = kernelRaw.length()
             val rawSha = sha256(kernelRaw)
+            state.value = state.value.copy(kernelBytes = rawSize)
             AppLog.info(TAG, "待修补内核：${kernelRaw.name} size=$rawSize sha256=$rawSha")
 
             // ---------- ⑤ 修补内核（引擎 JNI） ----------
             stage(PatchStage.PATCH_KERNEL, 35f, "调用 SK 修补引擎（JNI）")
             val patched = File(workDir, "kernel.patched")
             val jsonFile = File(workDir, "progress.ndjson")
-            val watcher = NdjsonProgressWatcher(jsonFile) { evt ->
-                onEngineEvent(evt)
-            }
+            val watcher = NdjsonProgressWatcher(jsonFile) { evt -> onEngineEvent(evt) }
             watcher.start()
             val exit = try {
                 PatchEngine.patch(
@@ -256,7 +290,7 @@ object PatchPipeline {
                         append("\n\n工作目录（保留供诊断）：").append(workDir!!.absolutePath)
                         append("\n进度事件：").append(watcher.lastLine ?: "<引擎未写进度>")
                     },
-                    EngineExitCode.describe(exit).take(12),
+                    "E${exit}",
                 )
                 return
             }
@@ -286,6 +320,7 @@ object PatchPipeline {
                 )
                 return
             }
+            state.value = state.value.copy(kernelEqualLength = true)
             stage(PatchStage.PATCH_KERNEL, 72f, "修补完成：等长 $rawSize 字节，sha256 已变化")
             AppLog.info(TAG, "修补后内核 sha256=$patchedSha（等长校验通过）")
 
@@ -337,8 +372,13 @@ object PatchPipeline {
             // ---------- ⑧ 校验与导出 ----------
             stage(PatchStage.VERIFY, 92f, "校验并导出产物")
             val outSha = sha256(newBoot)
-            val exported = exportArtifact(context, newBoot)
-            AppLog.info(TAG, "产物就绪：${exported.absolutePath} size=${newBoot.length()} sha256=$outSha")
+            val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+            val exportName = "boot_patched_$stamp.img"
+            val exported = Exporter.exportToDownloads(context, newBoot, exportName)
+            AppLog.info(
+                TAG,
+                "产物就绪：${exported.displayPath} size=${newBoot.length()} sha256=$outSha",
+            )
 
             val rootKey = PatchEngine.lastRootKey() ?: key
             state.value = state.value.copy(
@@ -346,13 +386,24 @@ object PatchPipeline {
                 progress = 1f,
                 phase = "修补完成，产物已导出",
                 running = false,
-                outputPath = exported.absolutePath,
+                outputPath = exported.displayPath,
+                outputSha256 = outSha,
+                outputBytes = newBoot.length(),
+                kernelEqualLength = true,
                 reportPath = File(workDir, "kernel.patched.report.json")
                     .takeIf { it.isFile }?.absolutePath,
                 rootKey = rootKey,
                 finishedAt = System.currentTimeMillis(),
             )
-            AppLog.info(TAG, "==== 修补成功 ==== 产物=${exported.absolutePath} sha256=$outSha")
+            InstallState.markPatchedPendingFlash(
+                context = context,
+                artifactDisplayPath = exported.displayPath,
+                artifactSha256 = outSha,
+                artifactBytes = newBoot.length(),
+                kernelEqualLength = true,
+            )
+            AppLog.info(TAG, "==== 修补成功 ==== 产物=${exported.displayPath} sha256=$outSha")
+            logStageDurations()
         } catch (t: Throwable) {
             finishFailure(
                 "修补异常中断",
@@ -407,12 +458,28 @@ object PatchPipeline {
 
     // --------------------------------------------------------------- 工具方法
     private fun stage(stage: PatchStage, progressPercent: Float, phase: String) {
+        // 记录上一阶段耗时（结构化日志：阶段 + 耗时 + 结果）
+        if (stageStartedAt > 0L) {
+            val elapsed = System.currentTimeMillis() - stageStartedAt
+            stageDurations += (state.value.stage.title to elapsed)
+            AppLog.info(TAG, "[${state.value.stage.title}] 完成，耗时 ${elapsed}ms")
+        }
+        stageStartedAt = System.currentTimeMillis()
         state.value = state.value.copy(
             stage = stage,
             progress = (progressPercent / 100f).coerceIn(0f, 1f),
             phase = phase,
         )
         AppLog.info(TAG, "[${stage.title}] $phase（${progressPercent.toInt()}%）")
+    }
+
+    private fun logStageDurations() {
+        if (stageDurations.isEmpty()) return
+        val total = stageDurations.sumOf { it.second }
+        AppLog.info(
+            TAG,
+            "阶段耗时汇总（总 ${total}ms）：" + stageDurations.joinToString("；") { "${it.first} ${it.second}ms" },
+        )
     }
 
     private fun finishFailure(title: String, detail: String, code: String?) {
@@ -427,6 +494,8 @@ object PatchPipeline {
             finishedAt = System.currentTimeMillis(),
         )
         AppLog.error(TAG, "修补失败：$title\n$detail")
+        logStageDurations()
+        runCatching { InstallState.markError(state.value.running.let { _ -> title }) }
     }
 
     private fun newWorkDir(context: Context): File {
@@ -443,15 +512,6 @@ object PatchPipeline {
             target.outputStream().use { out -> stream.copyTo(out) }
         }
         return target.length()
-    }
-
-    private fun exportArtifact(context: Context, artifact: File): File {
-        val dir = context.getExternalFilesDir("artifacts") ?: File(context.filesDir, "artifacts")
-        dir.mkdirs()
-        val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-        val target = File(dir, "sproot-patched-$stamp.img")
-        artifact.copyTo(target, overwrite = true)
-        return target
     }
 
     fun sha256(file: File): String {
