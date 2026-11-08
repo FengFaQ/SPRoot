@@ -11,6 +11,9 @@ on:
       - 'settings.gradle.kts'
       - 'keystore/**'
       - 'app/src/**'
+      # rc 自启模板从 apd/assets 现拷（apd/assets/init.sproot.rc），
+      # 不纳入触发路径会导致模板更新后 APK 不重建、静默发出旧模板。
+      - 'apd/assets/**'
       - '.github/workflows/apk.yml'
   workflow_dispatch:
 
