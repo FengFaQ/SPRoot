@@ -59,6 +59,33 @@
 | qemu-user（qemu-aarch64/aarch64-static） | 无真机运行时验证（CI/本地） | GPL-2.0（仅测试工具，不随产品分发） |
 | Kotlin / Jetpack Compose / miuix / libsu 等 | 客户端（由 Gradle 依赖管理） | 各自许可（见依赖树） |
 
+## 8. AP 二进制 `apd` 的 Rust 第三方依赖（115 个，除下列标记项外全部 permissive）
+
+- **权威明细**：`apd/THIRD_PARTY_LICENSES.md`（由 `Cargo.lock` + `cargo metadata --filter-platform aarch64-linux-android` 生成；按 name/version/license/source 全量列出，含生成方法与汇总表）。
+- **汇总**（组合许可按项计次，故计数和 > 包数）：MIT 100 · Apache-2.0 88 · Zlib 5 · Unlicense 5 · ISC 2 · LLVM-exception 2 · BSD-3-Clause 1 · BSL-1.0 1 · CC0-1.0 1 · Unicode-3.0 1 · **UNKNOWN 2**。
+- **结论**：除 §8.1/§8.2 标记项外，全部为宽松许可（MIT/Apache-2.0/BSD/ISC/Zlib/Unlicense/BSL-1.0/CC0/Unicode-3.0），与本项目 AGPL-3.0 **兼容**；随 APK / AP 二进制分发时保留各自版权与许可声明。
+- 其他 git 依赖已核实：`ap_policy`(policy crate) = **Apache-2.0**（附 LICENSE）；`java-properties`(pin `42a4aa9`) = **MIT**（附 LICENSE）。
+
+### 8.1 已移除的不兼容依赖（GPL-2.0-only）
+
+| package | version | license | source | 处置 |
+|---|---|---|---|---|
+| `extattr` | 1.0.0 | **GPL-2.0-only** | crates.io | **已移除**：GPL-2.0-only 与 AGPL-3.0 不兼容；已用 raw `libc` 的 `lsetxattr`/`lgetxattr` 等价替换（`apd/src/restorecon.rs`，wire 行为不变），并从 `Cargo.toml` / `Cargo.lock` 移除 |
+
+### 8.2 ⚠️ 阻断项：2 个 UNKNOWN 许可（**公开发布前必须闭环**）
+
+| package | version | license | source | 状态 |
+|---|---|---|---|---|
+| `prop-rs` | 0.2.0 | **UNKNOWN** | git（`AndroidPatch/restprops` @ `6f57231…`） | 上游仓库**无 LICENSE 文件**、`Cargo.toml` 无 `license` 字段 |
+| `prop-rs-android` | 0.2.0 | **UNKNOWN** | git（同上） | 同上；为 **`resetprop`** 功能依赖（bionic property area 操作），不易替换 |
+
+**处置（三选一，由项目所有人 + architect 决策）**：
+1. **向上游作者要求补 LICENSE 文件或书面授权**（推荐；与 SKRoot 授权凭证一并归档保管）；
+2. 自研最小替代（仅需 bionic property area 读写，工作量中等，可评估）；
+3. 移除 `resetprop` 功能（破坏模块生态脚本兼容，**不建议**）。
+
+**门禁**：闭环前，含 `resetprop` 的发布物**不得公开发布**。注意 `quality/static/check_licenses.py` 只校验 `LICENSES.md` 指纹，**检查不到本类 UNKNOWN** → 必须在人工发布清单中勾选（见 `docs/NEW-DOC-01` §11.3 / §11.4）。
+
 ## 免责声明
 
 本项目为**内核级 Root 修补**工具，修改 boot 镜像可能导致设备**无法开机、数据丢失、保修失效**。
