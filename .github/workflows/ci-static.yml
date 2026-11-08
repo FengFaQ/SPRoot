@@ -1,0 +1,98 @@
+# SPRoot 静态质量门禁（D7）
+#
+# 目的：把 quality/static/ 下的脚本纳入 v2 push 必跑（与 apk/apd/engine/licenses/release 五个工作流不重复）：
+#   - check_licenses.py    许可标注漂移（LIC-DRIFT）
+#   - check_error_codes.py 错误码表一致性（qa 产出后自动生效）
+#   - verify_patch.py      修补产物静态校验（支持 --help 自检）
+#
+# 约定：
+#   * 脚本存在即必须跑通（退出码 != 0 → 本工作流红）；
+#   * 脚本尚未就绪 → ::warning:: 但不红（不阻塞其他开发，但会在日志里显式记录缺口）。
+name: ci-static
+
+on:
+  push:
+    branches: [ "v2" ]
+    paths:
+      - 'quality/static/**'
+      - 'quality/**'
+      - 'docs/**'
+      - 'LICENSE'
+      - 'LICENSES.md'
+      - 'NOTICE'
+      - 'app/src/**'
+      - 'engine/**'
+      - '.github/workflows/ci-static.yml'
+  pull_request:
+    paths:
+      - 'quality/static/**'
+      - '.github/workflows/ci-static.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-static-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python syntax check (quality/static)
+        run: |
+          set -e
+          if [ -d quality/static ]; then
+            python3 -m compileall -q quality/static
+            echo "compileall OK"
+          else
+            echo "::error::quality/static 目录不存在"; exit 1
+          fi
+
+      - name: check_licenses.py (LIC-DRIFT, 必须通过)
+        run: |
+          set -e
+          if [ -f quality/static/check_licenses.py ]; then
+            python3 quality/static/check_licenses.py
+            echo "check_licenses.py PASS"
+          else
+            echo "::error::quality/static/check_licenses.py 缺失（许可门禁脚本必须存在）"; exit 1
+          fi
+
+      - name: check_error_codes.py (错误码一致性)
+        run: |
+          set -e
+          if [ -f quality/static/check_error_codes.py ]; then
+            python3 quality/static/check_error_codes.py
+            echo "check_error_codes.py PASS"
+          else
+            echo "::warning::quality/static/check_error_codes.py 尚未就绪（不计红，日志记录缺口）"
+          fi
+
+      - name: verify_patch.py --help (脚本自检)
+        run: |
+          set -e
+          if [ -f quality/static/verify_patch.py ]; then
+            python3 quality/static/verify_patch.py --help
+            echo "verify_patch.py --help PASS"
+          else
+            echo "::warning::quality/static/verify_patch.py 尚未就绪（不计红，日志记录缺口）"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### ci-static 结果" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          for f in quality/static/*.py; do
+            [ -f "$f" ] && echo "- \`$f\` ($(stat -c %s "$f") B)" >> "$GITHUB_STEP_SUMMARY"
+          done
