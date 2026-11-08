@@ -119,18 +119,28 @@ android.newDsl=false
 ### 4.1 阶段序列
 
 ```
-0 环境自检    ABI=arm64 / 引擎 libskrootpatch.so(ELF A64+可加载) / magiskboot(ELF A64+可执行)
+0 环境自检    ABI=arm64 / 引擎 libskpatchjni.so(ELF A64+可加载) / magiskboot(ELF A64+可执行)
               / 存储≥3GB / 密钥可读写 / 输入 ANDROID! 魔数
 1 准备镜像    contentResolver 复制 → cacheDir/patch/job-<ts>/boot.img；sha256 记录
 2 备份        filesDir/backups/<sha1>.img（内容寻址，同镜像复用）+ index.tsv
-3 解包        magiskboot unpack boot.img   (cwd=工作目录)
-4 解压内核    若 kernel 头是 gzip/lz4/zstd/xz/bzip2/lzop → magiskboot decompress kernel kernel.raw
-5 修补        PatchEngine.patch(kernel.raw → kernel.patched, key48, json=progress.ndjson, workdir)
-6 回压        若步骤4做过解压 → magiskboot compress=<fmt> kernel.patched kernel；否则直接覆盖 kernel
+3 解包        magiskboot unpack boot.img   (cwd=工作目录)  → kernel
+3.5 备份内核  cp kernel kernel.orig（repack 模板基准），记录 sha256
+4 解压内核    若 kernel.orig 头是 gzip/lz4/zstd/xz/bzip2/lzop → magiskboot decompress kernel.orig kernel.raw
+5 修补        NativeEngine.patch(kernel.raw → kernel.patched, key48, json=progress.ndjson)
+6 覆盖内核    **必须**把修补结果写回 `kernel`（压缩则 compress=<fmt> kernel.patched kernel，否则直接复制）
+              记录 kernel/kernel.orig/kernel.patched 三者 sha256；若 kernel == kernel.orig → T-12 中止
 7 重打包      magiskboot repack boot.img → new-boot.img
+7.5 回读断言 把 new-boot.img 复制到 verify/ 再 unpack（必要时再 decompress）：
+              回读 kernel sha256 **必须等于** kernel.patched 且 **不等于** kernel.orig/raw，否则 T-12 中止
+              同时检查 AVB footer 存在性是否保持、记录产物/输入总长差异
 8 校验导出    产物存在/非空 → 修补内核与输入内核**长度相等** → sha256 变化 → 导出 Downloads/SPRoot/
 9 状态        失败 → InstallState.ERROR；成功 → PATCHED_PENDING_FLASH
 ```
+
+> **T-12（补丁未生效）是最隐蔽的失败模式**：`magiskboot repack` 只认工作目录里的 `kernel`，
+> 若修补结果写到 `kernel.patched` 而未覆盖 `kernel`，repack 会静默使用原始 kernel——
+> 产物长度/结构都正常，但内核段未修补。因此步骤 6 的覆盖与步骤 7.5 的回读断言都是**强制**的，
+> 任一不通过即中止且**绝不导出产物**。每步 sha256 都写日志，可复现、可追溯。
 
 全程**无 root、无 shell、无网络**。任何一步失败：错误详情 + 完整输出 + 工作目录（保留供诊断）+ 日志文件路径，全部常驻展示。
 

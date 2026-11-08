@@ -79,4 +79,18 @@ object Elf {
             String(buf, Charsets.US_ASCII) == "ANDROID!"
         }
     }.getOrDefault(false)
+
+    /**
+     * 检测 AVB footer（boot.img 尾部 64 字节结构，magic "AVBf"）。
+     * 用途：重打包后确认 AVB footer 仍保留（不触碰 AVB 密码学，但需要它还在原位）。
+     */
+    fun hasAvbFooter(file: File): Boolean = runCatching {
+        if (file.length() < 64) return false
+        RandomAccessFile(file, "r").use { raf ->
+            raf.seek(file.length() - 64)
+            val buf = ByteArray(64)
+            if (raf.read(buf) < 64) return false
+            String(buf, 0, 4, Charsets.US_ASCII) == "AVBf"
+        }
+    }.getOrDefault(false)
 }

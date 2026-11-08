@@ -234,12 +234,21 @@ object PatchPipeline {
             }
             stage(PatchStage.UNPACK, 25f, "解包完成：kernel ${Capabilities.formatBytes(kernel.length())}")
 
+            // ---------- ③.5 备份原始 kernel（magiskboot repack 用 kernel 作模板） ----------
+            // ⚠️ 关键坑（patcher 实测）：repack 只认工作目录里的 `kernel`，若把修补结果写到
+            // kernel.patched 而不覆盖 kernel，repack 会**静默**使用原始 kernel（产物看着正常，
+            // 实际未修补）。因此这里显式备份 kernel.orig，最后必须覆盖 kernel，并在 ⑥.5 回读断言。
+            val kernelOrig = File(workDir, "kernel.orig")
+            kernel.copyTo(kernelOrig, overwrite = true)
+            val origSha = sha256(kernelOrig)
+            AppLog.info(TAG, "kernel.orig 备份完成 sha256=$origSha（repack 模板基准）")
+
             // ---------- ④ 解压内核 ----------
-            val compression = Elf.compressionFormat(kernel)
+            val compression = Elf.compressionFormat(kernelOrig)
             val kernelRaw: File
             if (compression != null) {
                 stage(PatchStage.DECOMPRESS, 30f, "内核仍为 $compression 压缩，调用 magiskboot decompress")
-                val dec = MagiskBoot.exec(context, listOf("decompress", "kernel", "kernel.raw"), workDir!!) { line ->
+                val dec = MagiskBoot.exec(context, listOf("decompress", "kernel.orig", "kernel.raw"), workDir!!) { line ->
                     AppLog.debug("magiskboot", line)
                 }
                 if (dec.timedOut || dec.exitCode != 0) {
@@ -258,7 +267,7 @@ object PatchPipeline {
             } else {
                 stage(PatchStage.DECOMPRESS, 30f, "内核未压缩，直接使用")
                 kernelRaw = File(workDir, "kernel.raw")
-                kernel.copyTo(kernelRaw, overwrite = true)
+                kernelOrig.copyTo(kernelRaw, overwrite = true)
             }
             val rawSize = kernelRaw.length()
             val rawSha = sha256(kernelRaw)
@@ -327,9 +336,9 @@ object PatchPipeline {
             stage(PatchStage.PATCH_KERNEL, 72f, "修补完成：等长 $rawSize 字节，sha256 已变化")
             AppLog.info(TAG, "修补后内核 sha256=$patchedSha（等长校验通过）")
 
-            // ---------- ⑥ 回压内核 ----------
+            // ---------- ⑥ 覆盖 kernel（关键：repack 只认 kernel） ----------
             if (compression != null) {
-                stage(PatchStage.RECOMPRESS, 76f, "回压内核（$compression）")
+                stage(PatchStage.RECOMPRESS, 76f, "回压内核（$compression）并覆盖 kernel")
                 val recompress = MagiskBoot.exec(
                     context,
                     listOf("compress=$compression", "kernel.patched", "kernel"),
@@ -344,8 +353,22 @@ object PatchPipeline {
                     return
                 }
             } else {
-                stage(PatchStage.RECOMPRESS, 76f, "内核未压缩，无需回压")
+                stage(PatchStage.RECOMPRESS, 76f, "覆盖 kernel ← kernel.patched")
                 patched.copyTo(kernel, overwrite = true)
+            }
+            val overwrittenSha = sha256(kernel)
+            AppLog.info(
+                TAG,
+                "已覆盖 kernel：sha256=$overwrittenSha（kernel.orig=$origSha，kernel.patched=$patchedSha）",
+            )
+            if (overwrittenSha == origSha) {
+                finishFailure(
+                    "补丁未生效（T-12）",
+                    "覆盖后的 kernel 与原 kernel 的 sha256 相同（$origSha）。\n" +
+                        "可能原因：回压/覆盖步骤没有真正写入。禁止导出该产物。",
+                    "T-12",
+                )
+                return
             }
 
             // ---------- ⑦ 重打包 ----------
@@ -372,8 +395,87 @@ object PatchPipeline {
                 return
             }
 
-            // ---------- ⑧ 校验与导出 ----------
-            stage(PatchStage.VERIFY, 92f, "校验并导出产物")
+            // ---------- ⑦.5 回读断言（T-12：patch 必须在最终 boot.img 里真实生效） ----------
+            stage(PatchStage.VERIFY, 88f, "回读 new-boot.img 校验补丁是否真实生效")
+            val verifyDir = File(workDir, "verify").apply {
+                check(mkdirs() || isDirectory) { "无法创建校验目录：${absolutePath}" }
+            }
+            newBoot.copyTo(File(verifyDir, "new-boot.img"), overwrite = true)
+            val verifyUnpack = MagiskBoot.exec(context, listOf("unpack", "new-boot.img"), verifyDir) { line ->
+                AppLog.debug("magiskboot", line)
+            }
+            if (verifyUnpack.timedOut || verifyUnpack.exitCode != 0) {
+                finishFailure(
+                    "回读校验失败：无法 unpack 产物（magiskboot exit=${verifyUnpack.exitCode}）",
+                    "完整输出：\n${verifyUnpack.lines.joinToString("\n").ifBlank { "<无输出>" }}",
+                    "T-12",
+                )
+                return
+            }
+            val verifyKernel = File(verifyDir, "kernel")
+            if (!verifyKernel.isFile || verifyKernel.length() == 0L) {
+                finishFailure(
+                    "回读校验失败：产物里没有 kernel",
+                    "unpack 产物目录：\n" + (verifyDir.listFiles()?.joinToString("\n") { it.name } ?: "<空>"),
+                    "T-12",
+                )
+                return
+            }
+            val verifyRaw: File
+            if (compression != null) {
+                val dec2 = MagiskBoot.exec(context, listOf("decompress", "kernel", "kernel.check"), verifyDir) { line ->
+                    AppLog.debug("magiskboot", line)
+                }
+                if (dec2.timedOut || dec2.exitCode != 0) {
+                    finishFailure(
+                        "回读校验失败：产物 kernel 解压失败（magiskboot exit=${dec2.exitCode}）",
+                        "完整输出：\n${dec2.lines.joinToString("\n").ifBlank { "<无输出>" }}",
+                        "T-12",
+                    )
+                    return
+                }
+                verifyRaw = File(verifyDir, "kernel.check")
+            } else {
+                verifyRaw = verifyKernel
+            }
+            val verifySha = sha256(verifyRaw)
+            val verifyMatchesPatched = verifySha == patchedSha
+            val verifyDiffersFromOrig = verifySha != rawSha
+            AppLog.info(
+                TAG,
+                "回读校验：new-boot.img 内 kernel sha256=$verifySha；" +
+                    "kernel.patched=$patchedSha；kernel.orig(raw)=$rawSha；" +
+                    "匹配修补=$verifyMatchesPatched；不同于原始=$verifyDiffersFromOrig",
+            )
+            if (!verifyMatchesPatched || !verifyDiffersFromOrig) {
+                finishFailure(
+                    "补丁未生效（T-12）：产物里的 kernel 不是修补后的 kernel",
+                    buildString {
+                        append("这是最隐蔽的失败模式：magiskboot repack 会静默使用原始 kernel。\n\n")
+                        append("回读 kernel sha256 = $verifySha\n")
+                        append("期望（kernel.patched）= $patchedSha\n")
+                        append("原始（kernel.orig/raw）= $rawSha\n")
+                        append("匹配修补 = $verifyMatchesPatched；不同于原始 = $verifyDiffersFromOrig\n\n")
+                        append("已中止，未导出任何产物。工作目录：").append(workDir!!.absolutePath)
+                    },
+                    "T-12",
+                )
+                return
+            }
+            val avbOrig = Elf.hasAvbFooter(bootImg)
+            val avbNew = Elf.hasAvbFooter(newBoot)
+            AppLog.info(TAG, "AVB footer：原始=$avbOrig 产物=$avbNew（不修改 AVB，仅确认保留）")
+            if (avbOrig != avbNew) {
+                AppLog.warn(TAG, "AVB footer 存在性变化（原始=$avbOrig 产物=$avbNew），请质测关注")
+            }
+            if (newBoot.length() != bootImg.length()) {
+                AppLog.warn(
+                    TAG,
+                    "产物总长与输入不同（${newBoot.length()} vs ${bootImg.length()} 字节）；" +
+                        "若分区大小固定，刷入前需确认未超分区（magiskboot repack 可能重排对齐）",
+                )
+            }
+            stage(PatchStage.VERIFY, 92f, "回读校验通过：补丁已在产物中真实生效")
             val outSha = sha256(newBoot)
             val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
             val exportName = "boot_patched_$stamp.img"
