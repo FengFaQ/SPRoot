@@ -7,6 +7,8 @@ on:
       - 'app/**'
       - '*.kts'
       - 'gradle/**'
+      - 'gradle.properties'
+      - 'settings.gradle.kts'
       - 'keystore/**'
       - 'app/src/**'
       - '.github/workflows/apk.yml'
