@@ -59,6 +59,7 @@ jobs:
           E=/tmp/art-engine
           if fetch_to skroot-engine-arm64 "$E"; then
             find "$E" -name 'libskpatchjni.so' -exec cp -f {} "$DEST/" \; 2>/dev/null || true
+            find "$E" -name 'libskrootpatch.so' -exec cp -f {} "$DEST/" \; 2>/dev/null || true
             find "$E" -name 'magiskboot' -exec cp -f {} "$DEST/libmagiskboot.so" \; 2>/dev/null || true
             find "$E" -name 'magiskboot-meta.txt' -exec cp -f {} "$ASSETS/" \; 2>/dev/null || true
             find "$E" -name 'SHA256SUMS' -exec sh -c 'cat "$1"' _ {} \; 2>/dev/null || true
@@ -111,28 +112,37 @@ jobs:
           unzip -l app/build/outputs/apk/release/*.apk | grep -E "lib/arm64-v8a|extractNativeLibs" || true
           unzip -l app/build/outputs/apk/release/*.apk | grep "lib/arm64-v8a" || echo "WARN: APK 内暂无 jniLibs（等 engine/apd artifact 就绪）"
 
-      - name: Assert APK contains AArch64 native libs
+      - name: Assert APK contains required AArch64 natives
         run: |
-          set -u
+          set -euo pipefail
           APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "APK=$APK"
           unzip -l "$APK" | grep -E "lib/arm64-v8a" || true
-          for lib in libmagiskboot.so libapd.so libskpatchjni.so; do
+          MISSING=0
+          for lib in libskpatchjni.so libskrootpatch.so libmagiskboot.so libapd.so; do
             if unzip -l "$APK" | grep -q "lib/arm64-v8a/$lib"; then
               unzip -p "$APK" "lib/arm64-v8a/$lib" > "/tmp/$lib"
               MACHINE=$(od -An -tu2 -j18 -N2 "/tmp/$lib" | tr -d ' ')
-              echo "$lib: ELF machine=$MACHINE (期望 183)"
+              SIZE=$(stat -c %s "/tmp/$lib")
+              SHA=$(sha256sum "/tmp/$lib" | cut -d' ' -f1)
+              echo "OK $lib  size=$SIZE  sha256=$SHA  elf_machine=$MACHINE"
               if [ "$MACHINE" != "183" ]; then echo "::error::$lib 不是 AArch64 ELF"; exit 1; fi
-              echo "OK $lib AArch64"
             else
-              echo "::warning::APK 未包含 lib/arm64-v8a/$lib（artifact 未就绪或未拉取）"
-              case "$lib" in
-                libmagiskboot.so) [ "${MAGISKBOOT_PRESENT:-0}" = "1" ] && { echo "::error::已拉取 magiskboot 却未打进 APK"; exit 1; } ;;
-                libskpatchjni.so) [ "${ENGINE_PRESENT:-0}" = "1" ] && { echo "::error::已拉取引擎却未打进 APK"; exit 1; } ;;
-                libapd.so)        [ "${APD_PRESENT:-0}" = "1" ] && { echo "::error::已拉取 AP 却未打进 APK"; exit 1; } ;;
-              esac
+              echo "::error::APK 缺少 lib/arm64-v8a/$lib（native 集成未完成，禁止出包）"
+              MISSING=1
             fi
           done
+          if [ "$MISSING" != "0" ]; then exit 1; fi
+          # JNI ABI 断言：引擎必须导出 me.sproot.patch.NativeEngine 的两个符号
+          if command -v nm >/dev/null 2>&1; then
+            nm -D --defined-only /tmp/libskpatchjni.so | grep -q "Java_me_sproot_patch_NativeEngine_patch"               && echo "OK JNI symbol patch" || { echo "::error::libskpatchjni.so 缺少 Java_me_sproot_patch_NativeEngine_patch"; exit 1; }
+            nm -D --defined-only /tmp/libskpatchjni.so | grep -q "Java_me_sproot_patch_NativeEngine_engineVersion"               && echo "OK JNI symbol engineVersion" || { echo "::error::libskpatchjni.so 缺少 Java_me_sproot_patch_NativeEngine_engineVersion"; exit 1; }
+          else
+            echo "::warning::nm 不可用，跳过 JNI 符号断言"
+          fi
+          # extractNativeLibs 断言（Android 需解压 nativeLibraryDir 才能 exec magiskboot/apd）
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | tail -1)
+          "$BT/aapt2" dump xmltree --file AndroidManifest.xml "$APK" | grep -i "extractNativeLibs" || true
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
