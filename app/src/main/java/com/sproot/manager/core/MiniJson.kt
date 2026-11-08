@@ -100,4 +100,103 @@ object MiniJson {
         val raw = s.substring(start, i)
         return raw.ifBlank { null }
     }
+
+    /**
+     * 解析「对象数组」为 Map 列表（本项目够用的最小实现）。
+     *
+     * 用于 `apd module list --json` 与 `apd selftest --json`：
+     * - 支持 `[{...},{...}]`；
+     * - 每个对象只取字符串/数字/布尔标量字段（嵌套对象忽略，不报错）；
+     * - 解析失败返回空列表，由调用方把**原始输出**完整展示（绝不静默丢数据）。
+     */
+    fun arrayOfObjects(json: String?): List<Map<String, String>> {
+        if (json.isNullOrBlank()) return emptyList()
+        val start = json.indexOf('[')
+        if (start < 0) return emptyList()
+        val result = mutableListOf<Map<String, String>>()
+        var i = start + 1
+        while (i < json.length) {
+            when {
+                json[i] == ']' -> return result
+                json[i] == '{' -> {
+                    val end = findObjectEnd(json, i)
+                    if (end < 0) return result
+                    result += parseFlatObject(json.substring(i + 1, end))
+                    i = end + 1
+                }
+                else -> i++
+            }
+        }
+        return result
+    }
+
+    /** 解析单个扁平对象（也用于 `apd selftest --json` 这类顶层对象） */
+    fun objectOf(json: String?): Map<String, String> {
+        if (json.isNullOrBlank()) return emptyMap()
+        val start = json.indexOf('{')
+        if (start < 0) return emptyMap()
+        val end = findObjectEnd(json, start)
+        if (end < 0) return emptyMap()
+        return parseFlatObject(json.substring(start + 1, end))
+    }
+
+    private fun findObjectEnd(s: String, openIndex: Int): Int {
+        var depth = 0
+        var inString = false
+        var escaped = false
+        for (i in openIndex until s.length) {
+            val c = s[i]
+            when {
+                escaped -> escaped = false
+                inString && c == '\\' -> escaped = true
+                c == '"' -> inString = !inString
+                inString -> Unit
+                c == '{' -> depth++
+                c == '}' -> {
+                    depth--
+                    if (depth == 0) return i
+                }
+            }
+        }
+        return -1
+    }
+
+    private fun parseFlatObject(body: String): Map<String, String> {
+        val map = mutableMapOf<String, String>()
+        val pairs = splitTopLevel(body)
+        pairs.forEach { pair ->
+            val idx = pair.indexOf(':')
+            if (idx <= 0) return@forEach
+            val key = pair.substring(0, idx).trim().trim('"')
+            val rawValue = pair.substring(idx + 1).trim()
+            if (rawValue.startsWith("{") || rawValue.startsWith("[")) return@forEach
+            map[key] = when {
+                rawValue.startsWith("\"") -> readString(rawValue, 1) ?: ""
+                else -> rawValue.trim('"')
+            }
+        }
+        return map
+    }
+
+    private fun splitTopLevel(body: String): List<String> {
+        val out = mutableListOf<String>()
+        var inString = false
+        var escaped = false
+        var depth = 0
+        val sb = StringBuilder()
+        body.forEach { c ->
+            when {
+                escaped -> { sb.append(c); escaped = false }
+                inString && c == '\\' -> { sb.append(c); escaped = true }
+                c == '"' -> { inString = !inString; sb.append(c) }
+                inString -> sb.append(c)
+                c == '{' || c == '[' -> { depth++; sb.append(c) }
+                c == '}' || c == ']' -> { depth--; sb.append(c) }
+                c == ',' && depth == 0 -> { out += sb.toString(); sb.clear() }
+                else -> sb.append(c)
+            }
+        }
+        if (sb.isNotBlank()) out += sb.toString()
+        return out
+    }
 }

@@ -228,6 +228,58 @@ object ApdClient {
         return "版本不一致：内置 AP ${bundled.take(8)} / 已部署 ${deployed.take(8)} → 请重新部署（设置 → AP 部署）"
     }
 
+    /** 直接 exec（非 root；仅用于只读探测，如 version/selftest） */
+    fun runDirect(context: Context, args: List<String>, timeoutSec: Int = 30): Result {
+        val bin = apdBinary(context)
+        val argv = listOf(bin.absolutePath) + args
+        if (!bin.isFile) {
+            return Result(
+                exitCode = EXIT_NOT_FOUND,
+                stdout = "",
+                stderr = "apd 未部署：${bin.absolutePath}",
+                timedOut = false,
+                argv = argv,
+            )
+        }
+        return runCatching {
+            AppLog.info(TAG, "direct: ${argv.joinToString(" ")}")
+            val process = ProcessBuilder(argv).redirectErrorStream(false).start()
+            val stdout = StringBuilder()
+            val stderr = StringBuilder()
+            val t1 = Thread {
+                runCatching {
+                    process.inputStream.bufferedReader().useLines { seq ->
+                        seq.take(2000).forEach { line -> stdout.append(line).append('\n') }
+                    }
+                }
+            }.apply { isDaemon = true; start() }
+            val t2 = Thread {
+                runCatching {
+                    process.errorStream.bufferedReader().useLines { seq ->
+                        seq.take(2000).forEach { line -> stderr.append(line).append('\n') }
+                    }
+                }
+            }.apply { isDaemon = true; start() }
+            val finished = process.waitFor(timeoutSec.toLong(), TimeUnit.SECONDS)
+            if (!finished) {
+                process.destroy()
+                runCatching { process.waitFor(2, TimeUnit.SECONDS) }
+                process.destroyForcibly()
+            }
+            runCatching { t1.join(2000) }
+            runCatching { t2.join(2000) }
+            Result(
+                exitCode = if (finished) runCatching { process.exitValue() }.getOrDefault(EXIT_FAIL) else EXIT_TIMEOUT,
+                stdout = stdout.toString(),
+                stderr = stderr.toString(),
+                timedOut = !finished,
+                argv = argv,
+            )
+        }.getOrElse {
+            Result(EXIT_FAIL, "", it.stackTraceToString(), false, argv)
+        }
+    }
+
     /** 非 root 探测：`apd version --json`（§8.3，任意身份） */    fun versionProbe(context: Context): Result {
         val bin = apdBinary(context)
         if (!bin.isFile) {

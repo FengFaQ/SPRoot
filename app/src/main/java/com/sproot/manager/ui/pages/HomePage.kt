@@ -15,6 +15,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.sproot.manager.core.ApdClient
+import com.sproot.manager.core.ApdSelfTest
 import com.sproot.manager.core.AppLog
 import com.sproot.manager.core.Capabilities
 import com.sproot.manager.core.CapabilityItem
@@ -100,6 +101,9 @@ fun HomePage(
                     label = "AP 守护（root-exec 唯一入口）",
                     value = buildString {
                         append(apd.detail)
+                        ApdSelfTest.load(context)?.let {
+                            append("\n自检：").append(it.stageLabel).append("（exit=").append(it.exitCode).append("）")
+                        }
                         apdVersion?.let { v ->
                             append("\nversion: ")
                             append(v.stdout.lineSequence().firstOrNull()?.take(160) ?: "(exit=${v.exitCode})")

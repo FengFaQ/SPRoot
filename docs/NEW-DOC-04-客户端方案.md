@@ -272,8 +272,67 @@ UI 铁律：**原始码与可读文案同时展示**（错误区"错误码"字�
 
 ---
 
-## 8. 旧版失败根因规避清单（逐条落地）
+---
 
+## 7A. 模块列表 / AP 自检 / 引擎自检 / 许可打包（v0.2 新增）
+
+### 7A.1 模块列表 Schema v1（客户端提案，待 AP 对齐）
+
+调用：`apd module list --json`（经 `root-exec`，契约 v1.1 §8.3）。**App 不直接读 /data/adb。**
+
+```json
+[
+  {
+    "id": "magisk-module-id",
+    "name": "显示名",
+    "version": "1.2.3",
+    "versionCode": 12,
+    "author": "作者",
+    "description": "一句话描述",
+    "enabled": true,
+    "update_pending": false
+  }
+]
+```
+
+客户端解析规则（`core/Modules.kt`）：
+- **容忍缺字段**：缺失显示 "—"，未知字段忽略；
+- 兼容键：`module_id/id`、`versionName/version`、`summary/description`、`updatePending/update_pending`；
+- **空数组 = 无模块（正常）**；非空但解析不出 = schema 不符 → 页面常驻展示 apd **原始 stdout/stderr** 并可复制上报；
+- 启用/禁用：`apd module enable|disable <id>`（同样 root-exec），退出码映射见 §6.1；
+- 模块列表加载失败时也保留原始输出（绝不静默）。
+
+### 7A.2 AP 首启自检 `apd selftest --json`
+
+- 启动时 `SPRootApp` 后台执行一次；有密钥走 `root-exec`，无密钥回退直接 exec（只读探测）。
+- `stage=undeployed` **exit 0 = 正常状态**（AP 未部署），UI 显示「AP 未部署」，不报错。
+- 其它 stage 原样展示（`deployed`/`daemon_ready`/`needs_repair`…）；结果缓存 SharedPreferences，主页/模块页/设置页只读展示，并提供「重跑 AP 自检」。
+
+### 7A.3 B-14 引擎自检入口（qa JNI 验证）
+
+设置页「引擎自检」按钮：读取 `libskrootpatch.so` 路径/存在性/AArch64 判定/是否加载，并调用 `engineVersion()`，输出：
+
+```
+库路径：/data/app/.../lib/arm64/libskrootpatch.so
+存在=true；AArch64=true；已加载=true
+engineVersion()=<引擎返回>
+结论：已加载，引擎版本 …，JNI ABI v2
+```
+
+结果同时写日志（tag=Settings），供 qa 做 JNI 加载验证（B-14）。
+
+### 7A.4 NOTICE / 许可证随包（单源）
+
+构建期 CI 组装（不再手工维护两份）：
+
+1. `assets/NOTICE` = 仓库根 `NOTICE`（唯一事实源）+ `assets/NOTICE-APK.md`（APK 特有清单：magiskboot GPL-3.0、apd AGPL-3.0、SKRoot proprietary、Kotlin/Compose/Miuix Apache-2.0）；
+2. `assets/licenses/GPL-3.0.txt`（magiskboot 义务：GPL 全文）+ `assets/licenses/AGPL-3.0.txt`（= 仓库根 `LICENSE`）；
+3. 构建期校验材料（`ENGINE-META.txt`、`SYMBOLS-libskrootpatch.txt`、`SHA256SUMS`、`magiskboot-meta.txt`、`apd-version.txt`）一并入 assets；
+4. CI 硬断言：上述 4 项 asset 必须存在，且 `assets/NOTICE` 必须提及 magiskboot。
+
+---
+
+## 8. 旧版失败根因规避清单（逐条落地）
 | # | 约束 | 落地位置 |
 |---|---|---|
 | ① | 入口能力自检（存在/可执行/ELF AArch64） | `Capabilities` + `Elf`（引擎、magiskboot、输入魔数） |

@@ -116,6 +116,24 @@ jobs:
           if [ -f "$DEST/libskrootpatch.so" ]; then echo "ENGINE_PRESENT=1" >> "$GITHUB_ENV"; fi
           if [ -f "$DEST/libapd.so" ]; then echo "APD_PRESENT=1" >> "$GITHUB_ENV"; fi
 
+      - name: Assemble NOTICE assets (single source of truth)
+        run: |
+          set -eu
+          A=app/src/main/assets
+          mkdir -p "$A/licenses"
+          {
+            echo "# SPRoot Manager APK — 第三方声明（与仓库根 NOTICE 同源）"
+            echo
+            cat NOTICE
+            echo
+            echo "---"
+            echo
+            cat "$A/NOTICE-APK.md"
+          } > "$A/NOTICE"
+          cp -f LICENSE "$A/licenses/AGPL-3.0.txt"
+          echo "--- assets ---"; ls -la "$A" "$A/licenses"
+          echo "NOTICE bytes=$(stat -c %s "$A/NOTICE")"
+
       - name: Build release APK
         run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
       - name: Verify APK signature
@@ -177,12 +195,17 @@ jobs:
           if unzip -l "$APK" | grep -q "lib/arm64-v8a/libskpatchjni.so"; then
             echo "::error::APK 内出现已作废的 libskpatchjni.so"; exit 1
           fi
-          # NOTICE 断言：第三方声明（magiskboot/Magisk GPL-3.0）必须随包
-          if unzip -l "$APK" | grep -q "assets/NOTICE-magiskboot.txt"; then
-            echo "OK assets/NOTICE-magiskboot.txt present"
-          else
-            echo "::error::APK 缺少 assets/NOTICE-magiskboot.txt（第三方声明缺失）"; exit 1
-          fi
+          # NOTICE / 许可证断言：第三方声明与 GPL-3.0、AGPL-3.0 全文必须随包
+          for asset in assets/NOTICE assets/NOTICE-APK.md assets/licenses/GPL-3.0.txt assets/licenses/AGPL-3.0.txt; do
+            if unzip -l "$APK" | grep -q "$asset"; then
+              echo "OK $asset present"
+            else
+              echo "::error::APK 缺少 $asset（第三方声明/许可证文本缺失）"; exit 1
+            fi
+          done
+          unzip -p "$APK" assets/NOTICE | grep -q "magiskboot" \
+            && echo "OK NOTICE mentions magiskboot" \
+            || { echo "::error::NOTICE 未包含 magiskboot 声明"; exit 1; }
           # extractNativeLibs 断言（Android 需解压 nativeLibraryDir 才能 exec magiskboot/apd）
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | tail -1)
           "$BT/aapt2" dump xmltree --file AndroidManifest.xml "$APK" | grep -i "extractNativeLibs" || true

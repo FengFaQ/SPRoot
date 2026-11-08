@@ -15,8 +15,10 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.sproot.manager.BuildConfig
 import com.sproot.manager.core.ApdClient
+import com.sproot.manager.core.ApdSelfTest
 import com.sproot.manager.core.AppLog
 import com.sproot.manager.core.BackupStore
+import com.sproot.manager.core.PatchEngine
 import com.sproot.manager.core.SecretStore
 import com.sproot.manager.ui.components.ActionRow
 import com.sproot.manager.ui.components.BodyText
@@ -49,6 +51,7 @@ fun SettingsPage(
     var deploying by remember { mutableStateOf(false) }
     var backups by remember { mutableStateOf<List<BackupStore.Backup>>(emptyList()) }
     var backupMsg by remember { mutableStateOf<String?>(null) }
+    var engineReport by remember { mutableStateOf<String?>(null) }
 
     LazyColumn(modifier = modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp)) {
         item {
@@ -253,6 +256,52 @@ fun SettingsPage(
                     }
                     VSpacer(8)
                     BodyText("退出码 125 = 密钥无效或需重新修补（不自动重试）；126/127 = 需重新部署；124 = 超时。")
+                }
+            }
+        }
+
+        item { VSpacer(14) }
+
+        item {
+            SectionCard(
+                title = "引擎自检（B-14 / qa JNI 验证入口）",
+                subtitle = "调用 libskrootpatch.so 的 JNI engineVersion()，用于确认库已打进 APK 且 ABI 对齐",
+            ) {
+                Column {
+                    engineReport?.let { InfoRow("自检结果", it, monospace = false) }
+                    VSpacer(10)
+                    ActionRow {
+                        Button(
+                            onClick = {
+                                engineReport = "检查中…"
+                                Thread {
+                                    val status = PatchEngine.status(context)
+                                    val version = runCatching { PatchEngine.version() }.getOrNull()
+                                    engineReport = buildString {
+                                        append("库路径：").append(status.path).append('\n')
+                                        append("存在=").append(status.present)
+                                        append("；AArch64=").append(status.aarch64)
+                                        append("；已加载=").append(status.loaded).append('\n')
+                                        append("engineVersion()=").append(version ?: "<null>").append('\n')
+                                        append("结论：").append(status.detail)
+                                    }
+                                    AppLog.info("Settings", "引擎自检：version=$version loaded=${status.loaded}")
+                                }.start()
+                            },
+                            colors = ButtonDefaults.buttonColorsPrimary(),
+                        ) { Text("引擎自检", style = MiuixTheme.textStyles.button) }
+                        HSpacer(8)
+                        Button(onClick = {
+                            Thread {
+                                val st = ApdSelfTest.run(context)
+                                deployResult = "AP 自检：${st.describe()}"
+                            }.start()
+                        }) { Text("重跑 AP 自检", style = MiuixTheme.textStyles.button) }
+                    }
+                    VSpacer(6)
+                    ApdSelfTest.load(context)?.let {
+                        InfoRow("最近 AP 自检", "${it.stageLabel}（exit=${it.exitCode}）· ${it.summary}")
+                    }
                 }
             }
         }

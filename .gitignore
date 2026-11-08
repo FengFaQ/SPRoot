@@ -69,3 +69,7 @@ engine/dist/
 
 # Rust build output must never be tracked (was accidentally committed in the v2 import)
 apd/target/
+
+# 构建期由 CI 组装（单一来源：仓库根 NOTICE）
+app/src/main/assets/NOTICE
+app/src/main/assets/licenses/AGPL-3.0.txt
