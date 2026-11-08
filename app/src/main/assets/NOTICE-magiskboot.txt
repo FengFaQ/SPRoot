@@ -1,0 +1,23 @@
+SPRoot Manager — 第三方组件声明（原生二进制）
+
+本应用随 APK 分发下列第三方原生二进制，均以 jniLibs（arm64-v8a/）方式打包，
+运行时位于 applicationInfo.nativeLibraryDir，不做二次分发以外的修改。
+
+1) libmagiskboot.so
+   - 来源：Magisk（https://github.com/topjohnwu/Magisk）v31.1 APK 内的 lib/arm64-v8a/libmagiskboot.so
+   - 参考校验：ELF 64-bit ARM aarch64, statically linked；大小约 988,984 B
+   - 许可证：GNU General Public License v3.0（GPL-3.0）
+   - 用途：boot.img 的 unpack/repack、kernel 的 decompress/compress；由 App 以独立进程调用
+   - 说明：该文件在 Magisk 官方 APK 中即以 "libmagiskboot.so" 命名（实为可执行 ELF），
+     保持 lib*.so 命名是为了让 Android 在安装时把它解压到 nativeLibraryDir，
+     从而绕开 Android 10+ 对私有目录执行 ELF 的限制（W^X）。
+
+2) libskrootpatch.so
+   - 来源：SPRoot 项目自带修补引擎（engine/ 交叉编译的 aarch64 产物，经 JNI 调用）
+   - 许可证：随项目仓库 LICENSE
+
+3) libapd.so
+   - 来源：SPRoot 项目自带 AP 守护（apd/ Rust 交叉编译的 aarch64 产物）
+   - 许可证：随项目仓库 LICENSE
+
+Magisk 完整源码与许可证文本：https://github.com/topjohnwu/Magisk/blob/master/LICENSE

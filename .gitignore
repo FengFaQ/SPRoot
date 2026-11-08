@@ -9,9 +9,9 @@
 *.img
 
 # 上游镜像 / 旧代码 / 备份（保留在本机）
+# 注意：/app/ 是本仓库的 Android 工程根模块，绝不能被忽略！
 /upstream/
 /APatch/
-/app/
 /SPRoot-AP/
 /backup/
 
