@@ -62,6 +62,55 @@ fn is_executable(path: &Path) -> bool {
     mode_of(path).map(|m| m & 0o111 != 0).unwrap_or(false)
 }
 
+/// True when `/proc/<pid>/cmdline` is exactly the resident daemon
+/// (`/data/adb/apd daemon ...`). A stale instance-lock pid then cannot be
+/// mistaken for a running service (pid reuse or a plain `apd` invocation).
+fn is_daemon_process(pid: u32) -> bool {
+    let Ok(raw) = fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let cmdline = String::from_utf8_lossy(&raw);
+    let args: Vec<&str> = cmdline.split('\0').collect();
+    let Some(argv0) = args.first() else {
+        return false;
+    };
+    let is_apd = *argv0 == "apd" || argv0.ends_with("/apd");
+    // `apd daemon --selftest` is this very check, not the resident service.
+    is_apd
+        && args.iter().any(|arg| *arg == "daemon")
+        && !args.iter().any(|arg| *arg == "--selftest")
+}
+
+/// PID of the running daemon: the instance-lock pid first, then a `/proc` scan.
+/// `None` only means "no daemon observed"; the caller decides whether that is
+/// determinable (see [`proc_scan_available`]).
+fn running_daemon_pid() -> Option<u32> {
+    if let Some(pid) = daemon::daemon_pid() {
+        if is_daemon_process(pid) {
+            return Some(pid);
+        }
+    }
+    for entry in fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if is_daemon_process(pid) {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// Can we enumerate `/proc` at all? If not, "daemon not found" is unknown, not
+/// a failure — `rc_started` must never report a false negative.
+fn proc_scan_available() -> bool {
+    fs::read_dir("/proc").is_ok()
+}
+
 /// Where the currently running binary lives — reported, never assumed.
 fn running_from() -> (PathBuf, &'static str) {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("<unknown>"));
@@ -156,6 +205,104 @@ pub fn run(json: bool) -> Result<()> {
         false,
         "platform allows locking key pages".to_string(),
     ));
+
+    // ---- self-start chain contract (NEW-DOC-05 §3.1.3) -------------------
+    // Raw bytes, not the parsed key: the AP-side ABI (47 plain-text bytes, no
+    // NUL) is what the injected rc's `--superkey-file` path must lead to, so it
+    // is verified here rather than inferred from a successful read.
+    let key_path = Path::new(defs::SPROOT_KEY_FILE);
+    let superkey_check = match fs::read(key_path) {
+        Ok(mut bytes) => {
+            let mode = mode_of(key_path).unwrap_or(0);
+            let len = bytes.len();
+            let nul_free = !bytes.contains(&0);
+            // The raw copy is key material: wipe it as soon as it is measured.
+            // SAFETY: `bytes` is a live, uniquely-owned buffer we no longer use.
+            unsafe { secret::wipe_bytes(bytes.as_mut_ptr(), bytes.len()) };
+            Check::new(
+                "superkey_file",
+                mode == 0o600 && len == 47 && nul_free,
+                deployed,
+                format!(
+                    "{} mode={mode:o} len={len} nul_free={nul_free} (AP-side ABI: 47 plain bytes)",
+                    defs::SPROOT_KEY_FILE
+                ),
+            )
+        }
+        Err(_) if deployed => Check::new(
+            "superkey_file",
+            false,
+            true,
+            format!(
+                "missing: {} (deploy must write it; rc starts the daemon with this path)",
+                defs::SPROOT_KEY_FILE
+            ),
+        ),
+        Err(_) => Check::pending("superkey_file", "first-boot self-check"),
+    };
+    checks.push(superkey_check);
+
+    // Audit copy of the ramdisk rc template; init reads /init.sproot.rc, so a
+    // missing audit copy is drift evidence, not a boot blocker.
+    let rc_path = Path::new(defs::SPROOT_RC_FILE);
+    let rc_check = if rc_path.is_file() {
+        Check::new(
+            "rc_template_present",
+            true,
+            false,
+            format!(
+                "{} present (audit copy; ramdisk /init.sproot.rc is authoritative)",
+                defs::SPROOT_RC_FILE
+            ),
+        )
+    } else if deployed {
+        Check::new(
+            "rc_template_present",
+            false,
+            false,
+            format!(
+                "missing: {} (deploy writes this audit copy)",
+                defs::SPROOT_RC_FILE
+            ),
+        )
+    } else {
+        Check::pending("rc_template_present", "first-boot self-check")
+    };
+    checks.push(rc_check);
+
+    // Did the rc actually start the daemon? Never critical: deployment without
+    // a reboot is a normal intermediate state, and an unreadable /proc must not
+    // be reported as a failure ("unknown (not applicable)").
+    let rc_started_check = if !deployed {
+        Check::new(
+            "rc_started",
+            true,
+            false,
+            "unknown (not applicable)".to_string(),
+        )
+    } else if let Some(pid) = running_daemon_pid() {
+        Check::new(
+            "rc_started",
+            true,
+            false,
+            format!("daemon running as service: pid={pid}"),
+        )
+    } else if proc_scan_available() {
+        Check::new(
+            "rc_started",
+            false,
+            false,
+            "daemon not observed (rc start pending or device not rebooted)".to_string(),
+        )
+    } else {
+        Check::new(
+            "rc_started",
+            true,
+            false,
+            "unknown (not applicable)".to_string(),
+        )
+    };
+    checks.push(rc_started_check);
 
     // ---- allow list ------------------------------------------------------
     let acl_check = if deployed {

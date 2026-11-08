@@ -1,7 +1,8 @@
 //! Resident daemon for SPRoot (contract v1.1 §3.2 socket, §7, NEW-DOC-05 §5.3).
 //!
-//! Started by the injected `init.sproot.rc` (`service sproot_daemon ...
-//! daemon --superkey-file /data/adb/sproot/key`, `on boot`). Responsibilities:
+//! Started by the injected `init.sproot.rc` (`service sproot-apd
+//! /data/adb/apd --superkey-file /data/adb/sproot/key daemon`, property
+//! trigger `sys.boot_completed=1`). Responsibilities:
 //!
 //! 1. **Stage ②** — dispatch the `services` stage right after start (non
 //!    blocking module scripts, same semantics as APatch);

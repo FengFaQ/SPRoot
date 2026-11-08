@@ -17,7 +17,7 @@
 use std::{
     fs,
     io::{self, Write},
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -26,7 +26,7 @@ use anyhow::{Context, Result, bail, ensure};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
-use crate::{defs, secret, supercall};
+use crate::{assets, defs, secret, supercall};
 
 /// Minimum accepted key length: the kernel compares the first 47 characters.
 const MIN_KEY_LEN: usize = supercall::KERNEL_KEY_LEN;
@@ -76,14 +76,14 @@ pub fn deploy(source: Option<PathBuf>) -> Result<()> {
             .unwrap_or_else(|| PathBuf::from("/")),
     };
 
-    info!("[deploy] step 1/9: directories");
+    info!("[deploy] step 1/10: directories");
     ensure_layout()?;
 
-    info!("[deploy] step 2/9: AP binary");
+    info!("[deploy] step 2/10: AP binary");
     let apd_src = find_component(&source_dir, "apd")?;
     install_file(&apd_src, Path::new(defs::DAEMON_PATH), 0o755)?;
 
-    info!("[deploy] step 3/9: busybox");
+    info!("[deploy] step 3/10: busybox");
     let busybox_src = find_component(&source_dir, "busybox")?;
     install_file(
         &busybox_src,
@@ -91,7 +91,7 @@ pub fn deploy(source: Option<PathBuf>) -> Result<()> {
         0o755,
     )?;
 
-    info!("[deploy] step 4/9: multicall symlinks");
+    info!("[deploy] step 4/10: multicall symlinks");
     ensure_symlink(
         Path::new(defs::DAEMON_PATH),
         &concat_path(defs::BINARY_DIR, "resetprop"),
@@ -101,22 +101,27 @@ pub fn deploy(source: Option<PathBuf>) -> Result<()> {
         &concat_path(defs::BINARY_DIR, "magiskpolicy"),
     )?;
 
-    info!("[deploy] step 5/9: key file");
+    // The key file is the start-chain's single point of failure: `?` aborts
+    // deploy (non-zero exit, no "pretend success") when it cannot be written.
+    info!("[deploy] step 5/10: key file (47 chars, no NUL)");
     write_key_file(key.as_str())?;
 
-    info!("[deploy] step 6/9: hidden su deployment");
+    info!("[deploy] step 6/10: rc audit copy");
+    install_rc_template()?;
+
+    info!("[deploy] step 7/10: hidden su deployment");
     let hidden_file = install_su(key.as_str(), &apd_src)?;
 
-    info!("[deploy] step 7/9: allow list");
+    info!("[deploy] step 8/10: allow list");
     init_allow_list()?;
     // Auth channel name (0644, no key material); idempotent on re-deploy so a
     // running daemon keeps its already-bound name.
     crate::daemon::ensure_socket_name()?;
 
-    info!("[deploy] step 8/9: state");
+    info!("[deploy] step 9/10: state");
     write_state(&hidden_file, &source_dir)?;
 
-    info!("[deploy] step 9/9: smoke checks");
+    info!("[deploy] step 10/10: smoke checks");
     smoke_check()?;
 
     println!("deploy: ok");
@@ -142,7 +147,11 @@ pub fn undeploy(keep_modules: bool) -> Result<()> {
         warn!("[undeploy] key file unavailable, hidden directory left in place");
     }
 
-    // 3. private state (key, safemode flag, boot counter, deploy state).
+    // 3. private state. The key file is the only secret on disk: unlink it
+    //    first so even a partially failed undeploy cannot leave it behind,
+    //    then the rc audit copy and the directory itself.
+    remove_path(defs::SPROOT_KEY_FILE);
+    remove_path(defs::SPROOT_RC_FILE);
     remove_path(defs::SPROOT_DIR);
 
     // 4. working tree. Module data (`/data/adb/modules`, configs) is user data:
@@ -234,15 +243,126 @@ fn ensure_symlink(target: &Path, link: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Build the exact on-disk key material: the 47 key bytes, plain text.
+///
+/// ABI (NEW-DOC-05 §3.1.3, HANDOFF §6.8): the **AP-side file** is 47 chars
+/// with no NUL and no newline; the kernel-side shellcode stores 47 chars + NUL,
+/// but that terminator is *not* part of this file. A NUL here would make
+/// `CString::new` fail in older readers and is therefore forbidden.
+fn key_material(key: &str) -> Result<Vec<u8>> {
+    let trimmed = key.trim();
+    ensure!(
+        trimmed.is_ascii(),
+        "key must be ASCII for the 47-char on-disk ABI"
+    );
+    ensure!(
+        trimmed.len() >= MIN_KEY_LEN,
+        "key too short for the 47-char ABI ({} < {} chars)",
+        trimmed.len(),
+        MIN_KEY_LEN
+    );
+    let material = trimmed.as_bytes()[..MIN_KEY_LEN].to_vec();
+    ensure!(
+        material.len() == MIN_KEY_LEN && !material.contains(&0),
+        "internal error: key material is not 47 NUL-free bytes"
+    );
+    Ok(material)
+}
+
+/// Write the canonical key file (`defs::SPROOT_KEY_FILE`).
+///
+/// * mode 0600, directory 0700, owner root (deploy already runs as root);
+/// * content = [`key_material`] (47 chars, plain text, no NUL/newline);
+/// * **atomic**: temp file in the same directory (0600 from creation) → fsync
+///   → rename over the target, so a crash can never leave a truncated/empty
+///   key behind — the old key stays readable until the rename;
+/// * **idempotent**: byte-identical content is left untouched (mode is still
+///   re-asserted); different content is overwritten and logged (never echoed);
+/// * the in-memory copy is wiped with `write_volatile` right after the write.
 fn write_key_file(key: &str) -> Result<()> {
-    let tmp = format!("{}.tmp", defs::SPROOT_KEY_FILE);
+    let mut material = key_material(key)?;
+    let path = Path::new(defs::SPROOT_KEY_FILE);
+    let dir = Path::new(defs::SPROOT_DIR);
+    fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 0700 {}", dir.display()))?;
+
+    let previous = fs::read(path).ok();
+    let existed = previous.is_some();
+    let unchanged = previous.as_deref() == Some(material.as_slice());
+    // The comparison read the old key into the heap too: wipe that copy now,
+    // in every branch (no key bytes may outlive this function).
+    if let Some(mut previous) = previous {
+        // SAFETY: `previous` is a live, uniquely-owned buffer we no longer use.
+        unsafe { secret::wipe_bytes(previous.as_mut_ptr(), previous.len()) };
+    }
+    if unchanged {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 0600 {}", path.display()))?;
+        info!("[deploy] key file unchanged, skipping write");
+        // SAFETY: `material` is a live, uniquely-owned buffer we no longer use.
+        unsafe { secret::wipe_bytes(material.as_mut_ptr(), material.len()) };
+        return Ok(());
+    }
+
+    let tmp = path.with_extension("tmp");
     {
-        let mut file = fs::File::create(&tmp).with_context(|| format!("create {tmp}"))?;
-        file.write_all(key.trim().as_bytes())?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        file.write_all(&material)?;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         file.sync_all()?;
     }
-    fs::rename(&tmp, defs::SPROOT_KEY_FILE).with_context(|| "install key file")?;
+    // Wipe before the rename: no later error path can keep the secret alive.
+    // SAFETY: `material` is a live, uniquely-owned buffer we no longer use.
+    unsafe { secret::wipe_bytes(material.as_mut_ptr(), material.len()) };
+    fs::rename(&tmp, path).with_context(|| format!("install key file {}", path.display()))?;
+    // Make the rename itself durable (crash after rename, before write-back).
+    if let Ok(dirfd) = fs::File::open(dir) {
+        let _ = dirfd.sync_all();
+    }
+    if existed {
+        info!("[deploy] key file content differed, overwritten atomically");
+    } else {
+        info!("[deploy] key file created (47 bytes, plain text)");
+    }
+    Ok(())
+}
+
+/// Write the rc audit copy (`defs::SPROOT_RC_FILE`, 0644).
+///
+/// init only consumes the ramdisk `/init.sproot.rc`; this copy is written so
+/// `selftest`/QA can prove which template the manager shipped and that it
+/// still names the fixed `--superkey-file` path. Atomic like everything else.
+fn install_rc_template() -> Result<()> {
+    let bytes = assets::INIT_RC_TEMPLATE.as_bytes();
+    let dst = Path::new(defs::SPROOT_RC_FILE);
+    let dir = Path::new(defs::SPROOT_DIR);
+    fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+
+    if fs::read(dst).map(|current| current == bytes).unwrap_or(false) {
+        fs::set_permissions(dst, fs::Permissions::from_mode(0o644))
+            .with_context(|| format!("chmod 0644 {}", dst.display()))?;
+        info!("[deploy] rc audit copy unchanged, skipping write");
+        return Ok(());
+    }
+
+    let tmp = dst.with_extension("tmp");
+    {
+        let mut file =
+            fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        file.write_all(bytes)?;
+        file.set_permissions(fs::Permissions::from_mode(0o644))?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, dst)
+        .with_context(|| format!("install rc audit copy {}", dst.display()))?;
+    info!("[deploy] rc audit copy written ({} bytes)", bytes.len());
     Ok(())
 }
 
@@ -316,6 +436,7 @@ fn smoke_check() -> Result<()> {
     let paths = [
         PathBuf::from(defs::DAEMON_PATH),
         PathBuf::from(defs::SPROOT_KEY_FILE),
+        PathBuf::from(defs::SPROOT_RC_FILE),
         PathBuf::from(defs::ALLOW_LIST_FILE),
         concat_path(defs::BINARY_DIR, "su"),
     ];
@@ -328,6 +449,30 @@ fn smoke_check() -> Result<()> {
     }
     let mode = fs::metadata(defs::SPROOT_KEY_FILE)?.permissions().mode() & 0o777;
     ensure!(mode == 0o600, "key file mode {mode:o} != 600");
+
+    // Start-chain contract (NEW-DOC-05 §3.1.3): exact ABI + fixed path.
+    let mut key_bytes = fs::read(defs::SPROOT_KEY_FILE)?;
+    let len = key_bytes.len();
+    let nul_free = !key_bytes.contains(&0);
+    // SAFETY: `key_bytes` is a live, uniquely-owned buffer we no longer use.
+    unsafe { secret::wipe_bytes(key_bytes.as_mut_ptr(), key_bytes.len()) };
+    ensure!(
+        len == MIN_KEY_LEN,
+        "key file length {len} != {MIN_KEY_LEN} (47 chars, AP-side format)"
+    );
+    ensure!(nul_free, "key file contains a NUL (AP-side format is plain text)");
+
+    let rc = fs::read_to_string(defs::SPROOT_RC_FILE)?;
+    ensure!(
+        rc.contains(defs::SPROOT_KEY_FILE),
+        "rc audit copy does not reference {}",
+        defs::SPROOT_KEY_FILE
+    );
+    ensure!(
+        rc.contains(defs::DAEMON_PATH),
+        "rc audit copy does not reference {}",
+        defs::DAEMON_PATH
+    );
     info!("[deploy] smoke checks passed");
     Ok(())
 }

@@ -27,9 +27,17 @@ pub struct SecretKey {
 }
 
 impl SecretKey {
-    /// Normalise (trim + drop whitespace) and lock the key.
+    /// Normalise and lock the key.
+    ///
+    /// Whitespace and NUL are dropped: the on-disk ABI is "47 chars + NUL"
+    /// (48 bytes, contract v1.1 E1), so a raw read of the key file must not
+    /// leave the terminator inside the key string (it would fail the
+    /// `[A-Za-z0-9]` check and lengthen the escalation token).
     pub fn new(raw: &str) -> Self {
-        let key: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+        let key: String = raw
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '\0')
+            .collect();
         let locked = unsafe { lock_range(key.as_ptr() as usize, key.len()) };
         SecretKey { key, locked }
     }

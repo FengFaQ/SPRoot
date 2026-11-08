@@ -41,11 +41,20 @@ pub const TEMP_CONFIG_NAME: &str = "tmp.config";
 pub const PTS_NAME: &str = "pts";
 
 // ---------------------------------------------------------------------------
-// SPRoot (SK) private state. Contract v1.1 §4: the key file is 0600 root-only
-// and the only carrier of the 48-char root key outside the patched kernel.
+// SPRoot (SK) private state. Contract v1.1 §4 + NEW-DOC-05 §3.1.3: the key
+// file is 0600 root-only and the only carrier of the root key outside the
+// patched kernel. Content = 47-char escalation token, plain text, no NUL.
 // ---------------------------------------------------------------------------
 pub const SPROOT_DIR: &str = concatcp!(ADB_DIR, "sproot/");
+/// Canonical key file — the exact path the injected `init.sproot.rc` passes to
+/// `--superkey-file` (NEW-DOC-05 §3.1.3). 0600 root:root. The AP-side content
+/// is the 47-char escalation token as plain text (no NUL); the kernel-side
+/// shellcode format (47 chars + NUL) is a different thing and is never this
+/// file. `secret` still strips a stray NUL on read, defensively.
 pub const SPROOT_KEY_FILE: &str = concatcp!(SPROOT_DIR, "key");
+/// Audit copy of the rc template written by `deploy`; the ramdisk
+/// `/init.sproot.rc` is the copy init actually consumes.
+pub const SPROOT_RC_FILE: &str = concatcp!(SPROOT_DIR, "init.sproot.rc");
 /// Presence means safe mode (contract v1.1 §3.5, third detection path).
 pub const SPROOT_SAFEMODE_FILE: &str = concatcp!(SPROOT_DIR, "safemode");
 /// Boot-loop guard counter (NEW-DOC-05 §5.5): incremented on every

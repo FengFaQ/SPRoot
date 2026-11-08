@@ -125,11 +125,11 @@
 | 模块域（保留） | `module lua <id> <fn>` | ✅ 保留 | 存量模块能力 |
 | 阶段编排 | `post-fs-data` / `services` / `boot-completed` | ✅ 保留（仅 init 调用） | 加 `--superkey-file`，由 rc 传入 |
 | 多调用 | argv[0]=`su` / `resetprop` / `magiskpolicy` | ✅ 保留（`kp` 已删，契约 §3.4） | 分发为 **basename 精确匹配**（P1 已修）。`resetprop` 为**条件能力**：默认构建启用 `resetprop` feature；`--no-default-features` 的许可干净构建下，`resetprop` 子命令与 `system.prop` 返回明确「本构建未启用」错误（不静默缺失） |
-| 守护 | **`daemon --superkey-file <f>`（新）** | ➕ 新增 | 常驻：授权 socket + uid-listener + 状态文件；init 拉起 |
-| 部署 | **`deploy --source <nativeLibDir> --superkey-file <f>`（新）** | ➕ 新增 | 首装自举（§6.2）：安装 AP/busybox/key/隐藏 su/空授权表 |
+| 守护 | **`--superkey-file <f> daemon`（新，顶层参数须在子命令前）** | ➕ 新增 | 常驻：授权 socket + uid-listener + 状态文件；init 拉起 |
+| 部署 | **`--superkey-file <f> deploy --source <nativeLibDir>`（新，同上）** | ➕ 新增 | 首装自举（§6.2）：安装 AP/busybox/key/隐藏 su/空授权表 |
 | 部署 | **`undeploy [--keep-modules]`（新）** | ➕ 新增 | 逆序清理（§6.4） |
 | 授权 | **`auth list/grant/revoke/exclude/unexclude`（新）** | ➕ 新增 | 供管理器 UI；daemon 单写者语义由 flock 保证 |
-| 提权执行 | **`root-exec --superkey-file <f> [--uid N] -- <cmd...>`（新）** | ➕ 新增 | 管理器唯一 root 入口：进程以 App uid 启动 → AP 自提权 → exec 目标命令，透传 stdio/退出码 |
+| 提权执行 | **`--superkey-file <f> root-exec [--uid N] -- <cmd...>`（新，同上）** | ➕ 新增 | 管理器唯一 root 入口：进程以 App uid 启动 → AP 自提权 → exec 目标命令，透传 stdio/退出码 |
 | 状态 | **`version --json`（新）** | ➕ 新增 | 管理器探测已部署状态/版本，替代 `-V` 字符串 |
 | KP 专属（删除） | `insmod` / `late-load` / `magica` / `soft-reboot` | ❌ 删除 | 依赖 kernelpatch.ko·KPM·supercall（A1 §8-4 无等价物）。连带删除 `Cargo.toml` 的 `goblin/scroll/adb_client`（减体积、减攻击面） |
 | 遗留 | `uid-listener` | ⚠️ 并入 daemon | 独立子命令取消，改为 daemon 线程；保留单实例锁 |
@@ -230,6 +230,59 @@
 
 > 客户端交叉引用：`docs/NEW-DOC-04-客户端方案.md` §7A.1 已加指针（模块安装/卸载 JSON + 退出码以本节为准）。
 
+#### 3.1.3 自启链契约（rc 模板 ↔ 密钥路径 ↔ deploy，**v1.0 定稿 2026-11-08**）
+
+AP 守护的开机自启是一条**四段固定链路**：rc 模板 → ramdisk 注入 → 固定密钥路径 → deploy 写入。任一环自行改名都不会显式报错，只会表现为「开机后 daemon 静默不存在」，所以逐项钉死（实现：`apd/src/assets.rs`、`apd/src/defs.rs`、`apd/src/deploy.rs`、`apd/src/selftest.rs`）。
+
+**1) rc 模板（唯一来源；密钥绝不入内）**
+
+| 项 | 值 |
+|---|---|
+| 仓库模板 | `apd/assets/init.sproot.rc`（Lead 独占维护，**勿改内容**） |
+| 嵌入方式 | `include_str!`（`assets::INIT_RC_TEMPLATE`）。本 crate **不使用** `rust-embed`；`--no-default-features` 许可干净构建同样内嵌该资产 |
+| ramdisk 落点 | `/init.sproot.rc`（管理器 RcInject 按原文注入；`/init.rc` 末尾追加 `import /init.sproot.rc`） |
+| 审计副本 | `/data/adb/sproot/init.sproot.rc`（0644 root:root，`apd deploy` 落盘）。init 不读它，仅作 selftest/QA 取证：可证明管理器发出的模板仍引用固定路径 |
+
+模板中的 service 行（**逐字**）：
+
+```
+service sproot-apd /data/adb/apd --superkey-file /data/adb/sproot/key daemon
+```
+
+注意 `--superkey-file` 是 apd 的**顶层**参数，必须写在子命令 `daemon` 之前；写成 `apd daemon --superkey-file ...` 会被 clap 判 `unexpected argument`（rc=2），真机永远起不来（已在 `fa3298c` 修正）。service 体为 `class late_start` / `user root` / `group root` / `oneshot` / `disabled` / `override`，由 `on property:sys.boot_completed=1` → `start sproot-apd` 触发：daemon 退出后 init 不 respawn（最坏「自启失效」，绝不 bootloop）；AP/密钥未部署时该 service 惰性无害——`on post-fs-data` 只 `mkdir /data/adb/sproot 0700`，绝不写密钥。
+
+**2) 密钥固定路径与权限（AP 侧 ABI：47 字符明文，无 NUL）**
+
+| 项 | 值 |
+|---|---|
+| 文件 | `/data/adb/sproot/key`（= `defs::SPROOT_KEY_FILE`）。rc 的 `--superkey-file` 与 deploy 的写入目标**必须引用同一个常量**，任何一方直接写字面量都会重演 HANDOFF §6.8 的静默失配 |
+| 权限 | 文件 `0600` root:root；目录 `/data/adb/sproot` `0700` root:root |
+| 内容 | `key[0:47]`，**47 字节纯文本**，无 NUL、无换行。注意区分：内核 shellcode 内嵌格式是「47 字符 + NUL」，但 **AP 侧文件不带 NUL**（HANDOFF §6.8）；给文件加 NUL 会让旧读取端 `CString::new` 失败，反而搞坏提权 |
+| 读取兼容 | `secret::SecretKey::new` 规范化时丢弃 NUL/空白：即使某版写入端误加 NUL，读回仍是 47 字符密钥，`escalation_token` 不会看到内部 NUL |
+| 唯一性 | 全机唯一密钥副本；不写入 rc、`state.json`、argv、stdout 或日志，也不保留第二份（早期 `superkey` 命名已废弃） |
+
+**3) deploy / undeploy 的写入与删除责任（`apd deploy`，root）**
+
+| 阶段 | 责任 |
+|---|---|
+| 目录 | 建 `/data/adb/sproot` 并断言 `0700` root:root（deploy 本身以 root 运行） |
+| 写密钥 | 47 字节 → 同目录临时文件（`0600`，创建即定权）→ `fsync` → `rename` 覆盖 → 目录 `fsync`。**绝不先截断再写**：崩溃只会留下旧 key 或完整新 key，绝不会留下空 key。写完立即用 `write_volatile` 擦除内存副本（`secret::wipe_bytes`），比较用的旧内容同样擦除 |
+| 幂等 | 逐字节相同 → 跳过（仅重申 0600）；不同 → 原子覆盖并记一行「content differed, overwritten」（**任何日志都不含密钥或前缀**） |
+| rc 审计副本 | 内容不同才写 `/data/adb/sproot/init.sproot.rc`（0644），同样 tmp + fsync + rename |
+| 冒烟 | 复读密钥并断言：`mode=0600`、`len=47`、无 NUL；rc 副本必须同时包含 `defs::SPROOT_KEY_FILE` 与 `/data/adb/apd` |
+| undeploy | **先删密钥文件**（唯一 secret），再删 rc 审计副本，最后删 `/data/adb/sproot/` 目录 |
+
+**4) 失败语义：写不到 key → deploy 明确失败**
+
+密钥、目录、rename、冒烟任一步失败，`deploy` 立即返回非 0 并保留可读错误，**禁止「假装成功」**（打印 `deploy: ok` 却没有 key，会让设备进入「每次开机 rc 拉起一个立即退出的 daemon」的静默故障）。由于全程 tmp+rename 两段式，失败时旧 key 仍在位、可原位重试，且不触碰 `/data/adb/modules` 用户数据。事后判据：`apd selftest --json` 的 `superkey_file`（`stage=deployed` 时 critical）+ `rc_template_present` + `rc_started`（后者非 critical，不可判定时报 `unknown (not applicable)`，绝不误报失败）。
+
+**5) 版本一致性（rc 指向的二进制 ↔ APK 内 `libapd.so`）**
+
+- rc 只引用固定路径 `/data/adb/apd`，**永不**引用 APK 的 `nativeLibraryDir/libapd.so`（APK 路径每次安装都变，且 App 上下文无可执行权限）。
+- 自启链因此运行「已部署二进制」。当它比 APK 内置副本旧：`apd version --json` 的 `commit` 与 APK 内 `apd-version.txt.commit` 不一致 → `selftest.version_consistency`（critical）失败、`summary=needs_repair`，管理器必须重新 `deploy`（幂等覆盖，`state.json.commit` 同步更新）；**禁止**静默用旧二进制继续提供 root-exec/部署语义。
+- `deploy` 的 `install_file` 为 tmp+rename 原子替换：rc 侧要么 exec 到旧二进制、要么 exec 到完整新二进制，绝不会 exec 到半写文件。
+- `/data/adb/apd` 缺失（已刷入新 boot 但尚未 deploy）：`start sproot-apd` 失败只在 init 日志留痕，不阻断开机、不产生用户态错误日志；结合 `oneshot`+`disabled` 不会形成重启风暴。
+
 ### 3.2 部署路径（/data/adb 与隐藏目录）
 
 ```
@@ -251,7 +304,8 @@
 ├── metamodule -> modules/<id> # 符号链接
 ├── post-fs-data.d/ service.d/ boot-completed.d/   # 公共脚本目录
 └── sproot/                    # SPRoot 私有状态  0700 root
-    ├── key                    # 48 字符密钥原文  0600 root  ← rc 用 --superkey-file 读取
+    ├── key                    # 47 字符明文（无 NUL）0600 root  ← rc 的 --superkey-file 固定路径（§3.1.3）
+    ├── init.sproot.rc         # 自启模板审计副本 0644（init 实际读 ramdisk /init.sproot.rc）
     ├── safemode               # 存在即安全模式（契约 §3.5 第三路）
     ├── boot_count             # 未到 boot-completed 的连续启动计数（bootloop 守卫）
     └── state.json             # 部署状态/版本/时间（不含密钥）
@@ -284,8 +338,8 @@
 
 | 项 | 规格 |
 |---|---|
-| 路径 | `/data/adb/sproot/key`（0600 root:root，仅 root 可读） |
-| 内容 | 48 字符原文（**不写换行**；AP 读取时 trim） |
+| 路径 | `/data/adb/sproot/key`（0600 root:root，仅 root 可读；rc 的 `--superkey-file` 固定路径，§3.1.3） |
+| 内容 | `key[0:47]` 原文，**47 字节纯文本**、无 NUL、无换行（AP 侧格式；内核 shellcode 内嵌的「47+NUL」不是本文件；AP 读取时仍丢弃 NUL/空白以兼容误写） |
 | 写入者 | 管理器 `deploy` 步骤（首装，§6.2）；此后不由任何模块/脚本改写 |
 | 读取者 | rc 拉起的 AP（`--superkey-file`）；管理器仅通过 `root-exec` 使用副本 |
 | App 侧存储 | Android Keystore（AES/GCM）加密后存 SharedPreferences；**App 私有目录明文副本用完即删**（每次 root 操作写临时 0600 文件 → 调用 → 删除） |
@@ -345,24 +399,13 @@
 
 **新建 `init.sproot.rc`**（cpio 根目录，0644 root）：
 
-```
-# SPRoot 启动编排：SK 内核零事件，三阶段全部由用户态驱动
-# 约束：不内联密钥；只引用 /data 下路径
-on post-fs-data
-    exec -- /data/adb/apd post-fs-data --superkey-file /data/adb/sproot/key
-
-service sproot_daemon /data/adb/apd daemon --superkey-file /data/adb/sproot/key
-    class late_start
-    user root
-    group root
-    # 不写 seclabel：默认 init 域起跑，execve(key) 后由 avc_denied 吞 denial（时序稿 §3.5）
-    # class late_start：避开 class core 的崩溃循环重启策略（守护自身故障不得导致整机重启）；
-    # 由下面 on boot 的显式 start 保证启动时机早于 late_start 自动启动。
-    # 非 oneshot → 崩溃由 init respawn（带退避），满足常驻要求。
-
-on boot
-    start sproot_daemon
-```
+> **模板实体已入库**：`apd/assets/init.sproot.rc`（Lead 独占维护；本文不再复制全文，避免双源漂移）。核心 service 行逐字为：
+>
+> ```
+> service sproot-apd /data/adb/apd --superkey-file /data/adb/sproot/key daemon
+> ```
+>
+> 语义（`oneshot` + `disabled` + `override`、`on property:sys.boot_completed=1` 触发、AP/密钥未部署时惰性无害、不写 seclabel）以该文件与 §3.1.3 为准。`apd deploy` 会把它落盘为 `/data/adb/sproot/init.sproot.rc` 审计副本（0644）。
 
 **既有 `init.rc` 末尾文本级追加一行**：`import /init.sproot.rc`（magiskboot `cpio add`；不依赖 kptools embed-extra——SK 无开机解压运行时，时序稿 §3.4 已定）。
 
@@ -388,7 +431,7 @@ on boot
 ### 5.3 daemon 内部结构（新增，`daemon` 子命令）
 
 ```
-apd daemon --superkey-file /data/adb/sproot/key
+apd --superkey-file /data/adb/sproot/key daemon
   ├─ 0. 读 key → escalate（execve(key47)）→ 断言 getuid()==0；失败：脱敏日志 + exit 0（静默，等下次开机）
   ├─ 1. 单实例锁（/data/adb/ap/daemon.lock, flock）
   ├─ 2. 运行 services 阶段（fork，不等待）
@@ -428,7 +471,7 @@ apd daemon --superkey-file /data/adb/sproot/key
 | 阶段 | 时机 | 主体 | 动作 | /data 状态 |
 |---|---|---|---|---|
 | **T1 修补期** | 用户点「修补」 | 管理器（无 root） | 选 boot.img → magiskboot unpack → `skroot-patch --in kernel --out kernel.new --gen-key` → 取回 48 字符 key（Keystore 加密存 SP）→ 写 `init.sproot.rc` + `init.rc` 追 import → magiskboot repack → 导出/刷入 | **完全不动 /data**（只在 App 私有目录有 working dir 与 key） |
-| **T2 首启** | 刷入后第一次开机 | init / 管理器 | ① rc `exec` 失败（预期，AP 不存在）；② 用户打开管理器 → 写临时 key 文件（0600，App 私有）→ `exec nativeLibraryDir/libapd.so deploy --source <nativeLibDir> --superkey-file <tmp>` → AP 自提权 → 执行 §6.2 清单 → 删除临时 key 文件 | `/data/adb/{apd,ap/...,sproot/...}` + 隐藏目录就绪；**模块能力尚未生效** |
+| **T2 首启** | 刷入后第一次开机 | init / 管理器 | ① rc `exec` 失败（预期，AP 不存在）；② 用户打开管理器 → 写临时 key 文件（0600，App 私有）→ `exec nativeLibraryDir/libapd.so --superkey-file <tmp> deploy --source <nativeLibDir>` → AP 自提权 → 执行 §6.2 清单 → 删除临时 key 文件 | `/data/adb/{apd,ap/...,sproot/...}` + 隐藏目录就绪；**模块能力尚未生效** |
 | **T3 二次开机起** | 之后每次开机 | init | rc → post-fs-data → daemon → services/boot-completed → 模块生效、授权可用 | 稳态 |
 
 **T2 的 UI 必做**：部署完成后明确提示「**需重启一次，模块功能才会生效**」；重启前模块页禁用安装按钮（或安装后提示重启生效，与 `modules_update` 语义一致）。
@@ -443,7 +486,7 @@ apd daemon --superkey-file /data/adb/sproot/key
 | 2 | 复制 `libapd.so` → `/data/adb/apd`（0755） | **sha256 与源一致**；并校验 `apd-version.txt`（见 §6.2 版本一致性检查） |
 | 3 | 复制 `libbusybox.so` → `/data/adb/ap/bin/busybox`（0755） | sha256 |
 | 4 | `ln -sfn /data/adb/apd /data/adb/ap/bin/{resetprop,magiskpolicy}` | `readlink` 目标 |
-| 5 | 从临时 key 文件读密钥 → 写 `/data/adb/sproot/key`（0600 root，无换行） | 长度 48、字符集 `[A-Za-z0-9]` |
+| 5 | 从临时 key 文件读密钥 → 写 `/data/adb/sproot/key`（47 字节纯文本、无 NUL；0600 root；tmp+fsync+rename 原子写，幂等）+ 写 rc 审计副本 `/data/adb/sproot/init.sproot.rc`（0644） | `mode=0600`、`len=47`、无 NUL；写入失败 → deploy 明确失败 |
 | 6 | **install_su 等价**：`key16 = key[0:16]`；`mkdir /data/<key16>`（0700，label 伪装）→ 复制 AP 副本为 `<随机16字符>`（0700）→ `ln -sfn <隐藏路径> /data/adb/ap/bin/su` | 隐藏文件可执行；`exec -a su` 冒烟 |
 | 7 | 初始化 `/data/adb/ap/allow_list`（表头 + 空）+ `.lock`（0600） | 可被 daemon 解析 |
 | 8 | 写 `/data/adb/sproot/state.json`（版本、**build commit**、部署时间、隐藏文件名、**`avb: vbmeta_untouched` 审计位**——**不含密钥任何片段**）+ 清空 `boot_count` + 写抽象 socket 名 `/data/adb/ap/bin/.su.sock`（0644，名字不含密钥） | JSON 可解析；socket 名可被客户端读取；AVB 审计位存在 |
