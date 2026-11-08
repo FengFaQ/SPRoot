@@ -10,6 +10,10 @@
 - 授权状态：**项目所有人已确认「有作者授权，可以调用」**（2026-11-08），故本项目内部可编译、可自用；
   **对外分发（APK/二进制）前仍需保存上游书面授权凭证**。详见 `docs/NEW-DOC-02-修补引擎本地化方案.md` §12。
 
+> **逐文件清单（含 sha256 指纹与可复现校验命令）见仓库根 [`LICENSES.md`](LICENSES.md) §2**：
+> 其中 15 个文件经 `diff` 核实与上游 **逐字节完全相同**，1 个（`skroot_patch_main.cpp`）为改造衍生。
+> **上述内容版权归 SKRoot 原作者所有（All Rights Reserved），本项目未改动其许可状态，AGPL-3.0 不适用于该部分。**
+
 ## 2. asmjit（Zlib License）
 
 - 位置：`engine/src/3rdparty/asmjit2-src/`（AArch64 汇编器，引擎跳板字节由此生成）。

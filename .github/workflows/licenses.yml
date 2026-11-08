@@ -1,0 +1,71 @@
+name: License attribution guard (LIC-DRIFT)
+
+# 目的：`engine/src` 里的 15 个 patch 文件是 SKRoot 上游 proprietary 内容的逐字节副本。
+# 一旦被改动，LICENSES.md 的「完全相同」标注即成为错误陈述（法律风险）。
+# 本工作流在每次 push 时校验许可文件存在性 + 上游文件 sha256 指纹未漂移。
+
+on:
+  push:
+    branches: [ "v2" ]
+    paths:
+      - 'LICENSE'
+      - 'LICENSES.md'
+      - 'NOTICE'
+      - 'engine/src/**'
+      - 'quality/static/check_licenses.py'
+      - '.github/workflows/licenses.yml'
+  pull_request:
+    paths:
+      - 'LICENSE'
+      - 'LICENSES.md'
+      - 'NOTICE'
+      - 'engine/src/**'
+  workflow_dispatch:
+
+jobs:
+  license-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check license files exist
+        run: |
+          set -e
+          for f in LICENSE LICENSES.md NOTICE; do
+            test -s "$f" || { echo "::error::缺少 $f"; exit 1; }
+            echo "OK  $f  ($(wc -c <"$f") bytes)"
+          done
+
+      - name: Assert LICENSE is AGPL-3.0
+        run: |
+          set -e
+          grep -q "GNU AFFERO GENERAL PUBLIC LICENSE" LICENSE || { echo "::error::LICENSE 不是 AGPL-3.0"; exit 1; }
+          grep -qi "SPDX-License-Identifier: AGPL-3.0" LICENSE || echo "::warning::LICENSE 缺少 SPDX 头（非阻断）"
+          echo "AGPL-3.0 校验通过"
+
+      - name: Assert upstream attribution markers present
+        run: |
+          set -e
+          # 人类要求：写原作者保留其所有权利、不修改其许可证
+          grep -qiE "保留所有权利|all rights reserved" LICENSES.md || { echo "::error::LICENSES.md 缺少「保留所有权利」声明"; exit 1; }
+          grep -q "SKRoot" LICENSES.md || { echo "::error::LICENSES.md 缺少 SKRoot 来源标注"; exit 1; }
+          grep -q "AGPL-3.0" NOTICE || { echo "::error::NOTICE 缺少 AGPL-3.0 说明"; exit 1; }
+          grep -qi "magiskboot" NOTICE || { echo "::error::NOTICE 缺少 magiskboot 声明"; exit 1; }
+          echo "标注校验通过"
+
+      - name: Verify upstream files unchanged (sha256 fingerprints)
+        run: |
+          set -e
+          python3 quality/static/check_licenses.py --repo-root . | tee /tmp/lic.log
+          grep -q "RESULT: ALL PASS" /tmp/lic.log
+
+      - name: Emit JSON report
+        if: always()
+        run: python3 quality/static/check_licenses.py --repo-root . --json > license-report.json || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: license-report
+          path: license-report.json
+          if-no-files-found: ignore
