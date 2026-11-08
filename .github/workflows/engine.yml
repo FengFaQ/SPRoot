@@ -101,16 +101,21 @@ jobs:
             echo "::warning::qemu 不可用，跳过运行时契约自检（ELF 架构断言已在上一 step 通过）"
             exit 0
           fi
-          $Q "$E" --help > /tmp/help.txt 2>&1; grep -q 'SPRoot patch engine' /tmp/help.txt
-          set +e
-          $Q "$E" >/dev/null 2>&1;                          rc=$?; test $rc -eq 101 || { echo "E_USAGE rc=$rc"; exit 1; }
+          # 说明：本步全篇 set -euo pipefail；所有"预期失败"的调用统一用
+          #   rc=0; cmd ... || rc=$?
+          # 硬编码 expected-rc 断言。**不要**用 `cmd; rc=$?`（set -e 下会直接中止整步，
+          # run 42489595614 即因 key-abi 的 101 把契约步判红而失败）。
+          $Q "$E" --help > /tmp/help.txt 2>&1 || { echo "--help 执行失败"; exit 1; }
+          grep -q 'SPRoot patch engine' /tmp/help.txt || { echo "--help 缺少 engine banner"; exit 1; }
+          rc=0; $Q "$E" >/dev/null 2>&1 || rc=$?
+          test $rc -eq 101 || { echo "E_USAGE rc=$rc"; exit 1; }
           rm -f /tmp/noout.img
-          $Q "$E" --in /tmp/__missing__ --out /tmp/noout.img --gen-key >/dev/null 2>&1; rc=$?; test $rc -eq 102 || { echo "E_INPUT rc=$rc"; exit 1; }
+          rc=0; $Q "$E" --in /tmp/__missing__ --out /tmp/noout.img --gen-key >/dev/null 2>&1 || rc=$?
+          test $rc -eq 102 || { echo "E_INPUT rc=$rc"; exit 1; }
           test ! -e /tmp/noout.img || { echo "失败却产出 --out（违反 C1 §3 铁律）"; exit 1; }
-          set -e
           # P0：非 47+NUL 的 key ABI 必须被拒（Skroot-Next 的 48-no-NUL 不兼容）
           rm -f /tmp/kabi.img
-          $Q "$E" --in /tmp/__missing__ --out /tmp/kabi.img --key ABCdef0123456789ABCdef0123456789ABCdef0123456789 --key-abi 48nul >/tmp/kabi.log 2>&1; rc=$?
+          rc=0; $Q "$E" --in /tmp/__missing__ --out /tmp/kabi.img --key ABCdef0123456789ABCdef0123456789ABCdef0123456789 --key-abi 48nul >/tmp/kabi.log 2>&1 || rc=$?
           test $rc -eq 101 || { echo "key-abi 非 47nul 未被拒绝 rc=$rc"; exit 1; }
           grep -q 'INCOMPATIBLE' /tmp/kabi.log || { echo "key-abi 拒绝信息缺少不兼容说明"; exit 1; }
           test ! -e /tmp/kabi.img || { echo "key-abi 拒绝后仍产出 --out"; exit 1; }
