@@ -279,7 +279,6 @@ object PatchPipeline {
                     genKey = false,
                     jsonFile = jsonFile,
                     workDir = workDir!!,
-                    verbose = true,
                 )
             } finally {
                 watcher.stopAndJoin()

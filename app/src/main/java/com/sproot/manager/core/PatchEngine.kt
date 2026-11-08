@@ -1,6 +1,7 @@
 package com.sproot.manager.core
 
 import android.content.Context
+import me.sproot.patch.NativeEngine
 import java.io.File
 
 /**
@@ -8,45 +9,45 @@ import java.io.File
  *
  * ## 为什么是 .so + JNI，而不是「可执行文件」
  * 旧版根因已确证：APK 内根本没有 `skroot-patch` 可执行文件（jniLibs 为空），
- * 而且产物是宿主 x86-64 glibc ELF；即便放进去，在 Android 上 exec 也需要额外
- * symlink/chmod 路径（旧版就在 filesDir 里 exec，违反 SELinux W^X）。
- * 新方案把引擎编译成 `libskrootpatch.so` 随 APK 分发，由 System.loadLibrary 加载，
- * 进程内调用，**不 exec、不落 filesDir、不拼 shell**。
+ * 而且产物是宿主 x86-64 glibc ELF；即便放进去，Android 10+ 的 untrusted_app 域
+ * 也不允许 exec app 数据目录（W^X/app_data_file neverallow，NEW-DOC-03 根因 R2）。
  *
- * ## JNI 绑定契约（v1，供修补引擎组对齐）
- * 引擎侧需导出下列静态 native 方法（Kotlin `object` + `@JvmStatic external` 直接映射）：
+ * 新方案：patcher 的 CI artifact `skroot-engine-arm64` 内含
+ *  - `libskpatchjni.so`（JNI 形态，进程内调用；本类使用）
+ *  - `libskrootpatch.so`（静态链接 CLI 形态，保留但不使用）
+ *  - `magiskboot`（v31.1 aarch64，打入 jniLibs 供 exec）
  *
- * ```c
- * JNIEXPORT jstring JNICALL Java_com_sproot_manager_core_PatchEngine_nativeVersion(JNIEnv*, jclass);
- * JNIEXPORT jint    JNICALL Java_com_sproot_manager_core_PatchEngine_nativePatch(
- *         JNIEnv*, jclass, jstring inPath, jstring outPath, jstring key, jboolean genKey,
- *         jstring jsonPath, jstring workDir, jboolean verbose);
- * JNIEXPORT jstring JNICALL Java_com_sproot_manager_core_PatchEngine_nativeLastError(JNIEnv*, jclass);
- * JNIEXPORT jstring JNICALL Java_com_sproot_manager_core_PatchEngine_nativeLastRootKey(JNIEnv*, jclass);
+ * ## JNI ABI（引擎提供，非本项目臆造）
+ * 见 `me/sproot/patch/NativeEngine.kt`：
  * ```
+ * Java_me_sproot_patch_NativeEngine_patch(JNIEnv*, jclass, jstring in, jstring out,
+ *                                         jstring key, jstring json, jstring workdir) -> jint
+ * Java_me_sproot_patch_NativeEngine_engineVersion(JNIEnv*, jclass) -> jstring
+ * ```
+ * 进度**只走 `jsonSink` 的 NDJSON 文件轮询**（契约 §2.3），不依赖 stdout（JNI 下不可见）。
  *
- * 语义与 CLI 契约（SPROOT-DOC-C1 §1）一一对应：
- *  - `inPath`  = `--in`（必须是已解压的 arm64 内核 Image；压缩输入引擎应回 E_INPUT）
- *  - `outPath` = `--out`（失败时引擎**不得**留下 out 文件）
- *  - `key`     = `--key`；`genKey=true` 时忽略 key 走 `--gen-key`
- *  - `jsonPath`= `--json`（NDJSON 进度落盘，Kotlin 侧轮询读取，不依赖 stdout 管道）
- *  - 返回值    = 进程退出码枚举（EngineExitCode）
- *
- * 引擎缺失时 ensureLoaded() 返回**可读错误**而不是抛异常——UI 必须把它当成
+ * ## 失败语义
+ * 引擎缺失时 [ensureLoaded] 返回**可读错误**而不是抛异常——UI 必须把它当成
  * 一等公民的失败态展示（这就是旧版"一闪即退"的反面）。
+ * 失败时引擎不得留下 out 文件（C1 §3 铁律），Kotlin 侧仍二次校验。
  */
 object PatchEngine {
 
-    const val LIB_NAME = "skrootpatch"
+    /** 实际打进 APK 的文件名：libskpatchjni.so */
+    const val LIB_NAME = "skpatchjni"
     const val LIB_FILE_NAME = "lib$LIB_NAME.so"
 
-    /** 绑定契约版本；引擎侧实现变更须同步 +1 并在方案文档记录 */
-    const val JNI_BINDING_VERSION = 1
+    /** 引擎 ABI 版本（与 patcher 侧一致；变化时同步本文档） */
+    const val JNI_BINDING_VERSION = 2
 
     @Volatile
-    private var loadState: String? = null // null = 未尝试；"" = 成功；其他 = 失败原因
+    private var loadFailure: String? = null
     @Volatile
     private var loaded = false
+    @Volatile
+    private var lastReportFile: File? = null
+    @Volatile
+    private var lastAttemptedKey: String? = null
 
     data class EngineStatus(
         val path: String,
@@ -58,28 +59,6 @@ object PatchEngine {
         val detail: String,
     )
 
-    // ------------------------------------------------------------------ JNI
-    @JvmStatic
-    external fun nativeVersion(): String
-
-    @JvmStatic
-    external fun nativePatch(
-        inPath: String,
-        outPath: String,
-        key: String,
-        genKey: Boolean,
-        jsonPath: String,
-        workDir: String,
-        verbose: Boolean,
-    ): Int
-
-    @JvmStatic
-    external fun nativeLastError(): String
-
-    @JvmStatic
-    external fun nativeLastRootKey(): String
-
-    // -------------------------------------------------------------- helpers
     fun libraryFile(context: Context): File =
         File(context.applicationInfo.nativeLibraryDir, LIB_FILE_NAME)
 
@@ -87,45 +66,45 @@ object PatchEngine {
     @Synchronized
     fun ensureLoaded(): String? {
         if (loaded) return null
-        loadState?.let { if (!loaded) return it }
+        loadFailure?.let { return it }
         val failure: String? = try {
             System.loadLibrary(LIB_NAME)
             loaded = true
             null
         } catch (t: Throwable) {
             "加载 lib$LIB_NAME.so 失败：${t.javaClass.simpleName}: ${t.message}\n" +
-                "常见原因：①APK 内缺 arm64-v8a/$LIB_FILE_NAME；②ABI 不匹配（非 arm64 设备）；" +
-                "③符号缺失（引擎未导出契约 v$JNI_BINDING_VERSION 的 JNI 函数）。"
+                "常见原因：①APK 内缺 arm64-v8a/$LIB_FILE_NAME（CI 未拉到 skroot-engine-arm64 artifact）；" +
+                "②ABI 不匹配（非 arm64 设备）；③符号缺失（引擎 JNI 入口应为 " +
+                "Java_me_sproot_patch_NativeEngine_patch / _engineVersion）。"
         }
-        loadState = failure ?: ""
+        loadFailure = failure
         return failure
     }
+
+    fun version(): String? =
+        if (ensureLoaded() == null) runCatching { NativeEngine.engineVersion() }.getOrNull() else null
 
     fun status(context: Context): EngineStatus {
         val file = libraryFile(context)
         val present = file.isFile
         val executable = present && file.canExecute()
-        val aarch64 = present && Elf.isAarch64(file.absolutePath)
-        val loadFailure = ensureLoaded()
-        val version = if (loadFailure == null) {
-            runCatching { nativeVersion() }.onFailure {
-                AppLog.error("Engine", "nativeVersion() 调用失败", it)
-            }.getOrNull()
-        } else null
+        val aarch64 = present && Elf.isAArch64(file.absolutePath)
+        val failure = ensureLoaded()
+        val versionValue = if (failure == null) version() else null
         val detail = when {
-            !present -> "APK 内缺少 arm64-v8a/$LIB_FILE_NAME（构建时未打入 jniLibs）"
+            !present -> "APK 内缺少 arm64-v8a/$LIB_FILE_NAME（CI 未拉到 skroot-engine-arm64 artifact）"
             !aarch64 -> "文件存在但不是 AArch64 ELF（可能打入了错误架构产物）"
-            loadFailure != null -> loadFailure
-            version == null -> "已加载，但 nativeVersion() 未返回版本号（绑定契约不符）"
-            else -> "已加载，引擎版本 $version，绑定契约 v$JNI_BINDING_VERSION"
+            failure != null -> failure
+            versionValue == null -> "已加载，但 engineVersion() 未返回版本（ABI 不符）"
+            else -> "已加载，引擎版本 $versionValue，JNI ABI v$JNI_BINDING_VERSION"
         }
         return EngineStatus(
             path = file.absolutePath,
             present = present,
             executable = executable,
             aarch64 = aarch64,
-            loaded = loadFailure == null,
-            version = version,
+            loaded = failure == null,
+            version = versionValue,
             detail = detail,
         )
     }
@@ -141,23 +120,43 @@ object PatchEngine {
         genKey: Boolean,
         jsonFile: File,
         workDir: File,
-        verbose: Boolean,
     ): Int {
         ensureLoaded()?.let { throw IllegalStateException(it) }
-        return nativePatch(
-            inFile.absolutePath,
-            outFile.absolutePath,
-            key,
-            genKey,
-            jsonFile.absolutePath,
-            workDir.absolutePath,
-            verbose,
+        lastReportFile = File(outFile.absolutePath + ".report.json")
+        lastAttemptedKey = if (genKey) null else key
+        return NativeEngine.patch(
+            inPath = inFile.absolutePath,
+            outPath = outFile.absolutePath,
+            key = if (genKey) null else key,
+            jsonSink = jsonFile.absolutePath,
+            workdir = workDir.absolutePath,
         )
     }
 
-    fun lastError(): String? =
-        if (loaded) runCatching { nativeLastError() }.getOrNull()?.takeIf { it.isNotBlank() } else null
+    /** 引擎最后错误：优先 report.json 的 errors，其次原始 report 前 2KB */
+    fun lastError(): String? {
+        val report = lastReportFile?.takeIf { it.isFile } ?: return null
+        val text = runCatching { report.readText() }.getOrNull() ?: return null
+        return extractField(text, "errors")
+            ?: text.take(2000)
+    }
 
-    fun lastRootKey(): String? =
-        if (loaded) runCatching { nativeLastRootKey() }.getOrNull()?.takeIf { it.isNotBlank() } else null
+    /** 引擎最后生成的 Root 密钥（report.json 的 root_key 字段） */
+    fun lastRootKey(): String? {
+        val report = lastReportFile?.takeIf { it.isFile } ?: return null
+        val text = runCatching { report.readText() }.getOrNull() ?: return null
+        return MiniJson.string(text, "root_key") ?: lastAttemptedKey
+    }
+
+    /** 从 JSON 里粗略取数组/字符串字段（避免为报告引入序列化依赖） */
+    private fun extractField(json: String, key: String): String? {
+        val idx = json.indexOf("\"$key\"")
+        if (idx < 0) return null
+        val start = json.indexOf('[', idx).let { if (it < 0) json.indexOf(':', idx) else it }
+        if (start < 0) return null
+        val end = json.indexOf(']', start).let { if (it < 0) json.length else it }
+        if (end <= start) return null
+        val raw = json.substring(start, (end + 1).coerceAtMost(json.length)).trim()
+        return raw.takeIf { it.isNotEmpty() && it != "[]" }
+    }
 }

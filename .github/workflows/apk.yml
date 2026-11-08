@@ -41,28 +41,46 @@ jobs:
           DEST=app/src/main/jniLibs/arm64-v8a
           ASSETS=app/src/main/assets
           mkdir -p "$DEST" "$ASSETS"
-          fetch_art() {
-            name="$1"; destname="$2"
-            id=$(gh api "/repos/${{ github.repository }}/actions/artifacts?name=$name&per_page=1" --jq '.artifacts[0].id // empty' 2>/dev/null || true)
-            if [ -z "${id:-}" ]; then echo "SKIP $name (artifact 不存在)"; return 0; fi
-            D=$(mktemp -d)
-            if ! gh api "/repos/${{ github.repository }}/actions/artifacts/$id/zip" > "$D.zip" 2>/dev/null; then
-              echo "SKIP $name (下载失败)"; return 0
+
+          fetch_to() { # $1=artifact name $2=dest dir
+            name="$1"; out="$2"
+            id=$(gh api "/repos/${{ github.repository }}/actions/artifacts?name=$name&per_page=1"                   --jq '.artifacts[0].id // empty' 2>/dev/null || true)
+            if [ -z "${id:-}" ]; then echo "SKIP $name (artifact 不存在)"; return 1; fi
+            if ! gh api "/repos/${{ github.repository }}/actions/artifacts/$id/zip" > "/tmp/$name.zip" 2>/dev/null; then
+              echo "SKIP $name (下载失败)"; return 1
             fi
-            if ! unzip -o -q "$D.zip" -d "$D"; then echo "SKIP $name (解压失败)"; return 0; fi
-            f=$(find "$D" -type f -name '*.so' | head -1)
-            if [ -z "${f:-}" ]; then echo "SKIP $name (无 .so)"; find "$D" -type f | head -5; return 0; fi
-            cp -f "$f" "$DEST/$destname"
-            echo "OK $name -> $destname ($(stat -c %s "$DEST/$destname") bytes)"
-            vf=$(find "$D" -type f -name '*version*.txt' | head -1)
-            if [ -n "${vf:-}" ]; then cp -f "$vf" "$ASSETS/apd-version.txt"; echo "OK version file -> assets/apd-version.txt"; fi
+            mkdir -p "$out"
+            unzip -o -q "/tmp/$name.zip" -d "$out" || { echo "SKIP $name (解压失败)"; return 1; }
+            echo "OK $name -> $out"
+            return 0
           }
-          fetch_art apd-aarch64-latest libapd.so
-          fetch_art magiskboot-arm64 libmagiskboot.so
-          echo "--- 引擎 artifact 名称待 patcher 确认，先按候选名尝试（缺失不阻断） ---"
-          fetch_art skrootpatch-aarch64 libskrootpatch.so
-          fetch_art engine-aarch64-latest libskrootpatch.so
-          fetch_art engine-arm64 libskrootpatch.so
+
+          # 1) 引擎 + magiskboot（patcher 的 engine CI：libskpatchjni.so / magiskboot / meta / SHA256SUMS）
+          E=/tmp/art-engine
+          if fetch_to skroot-engine-arm64 "$E"; then
+            find "$E" -name 'libskpatchjni.so' -exec cp -f {} "$DEST/" \; 2>/dev/null || true
+            find "$E" -name 'magiskboot' -exec cp -f {} "$DEST/libmagiskboot.so" \; 2>/dev/null || true
+            find "$E" -name 'magiskboot-meta.txt' -exec cp -f {} "$ASSETS/" \; 2>/dev/null || true
+            find "$E" -name 'SHA256SUMS' -exec sh -c 'cat "$1"' _ {} \; 2>/dev/null || true
+          fi
+          # 兼容：若 patcher 单独发布 magiskboot artifact
+          if [ ! -f "$DEST/libmagiskboot.so" ]; then
+            M=/tmp/art-magiskboot
+            if fetch_to magiskboot-arm64 "$M"; then
+              f=$(find "$M" -type f \( -name 'magiskboot' -o -name 'libmagiskboot.so' \) | head -1)
+              [ -n "${f:-}" ] && cp -f "$f" "$DEST/libmagiskboot.so"
+              find "$M" -name '*meta*.txt' -exec cp -f {} "$ASSETS/" \; 2>/dev/null || true
+            fi
+          fi
+
+          # 2) AP 守护（sys-guard：libapd-arm64.so + apd-version.txt）
+          A=/tmp/art-apd
+          if fetch_to apd-aarch64-latest "$A"; then
+            f=$(find "$A" -type f -name 'libapd*.so' | head -1)
+            [ -n "${f:-}" ] && cp -f "$f" "$DEST/libapd.so"
+            find "$A" -name 'apd-version.txt' -exec cp -f {} "$ASSETS/" \; 2>/dev/null || true
+          fi
+
           echo "--- jniLibs ---"; ls -la "$DEST" || true
           for f in "$DEST"/*.so; do
             [ -f "$f" ] || continue
@@ -75,6 +93,8 @@ jobs:
             sha256sum "$DEST/libmagiskboot.so" || true
             echo "MAGISKBOOT_PRESENT=1" >> "$GITHUB_ENV"
           fi
+          if [ -f "$DEST/libskpatchjni.so" ]; then echo "ENGINE_PRESENT=1" >> "$GITHUB_ENV"; fi
+          if [ -f "$DEST/libapd.so" ]; then echo "APD_PRESENT=1" >> "$GITHUB_ENV"; fi
 
       - name: Build release APK
         run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
@@ -97,7 +117,7 @@ jobs:
           APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
           echo "APK=$APK"
           unzip -l "$APK" | grep -E "lib/arm64-v8a" || true
-          for lib in libmagiskboot.so libapd.so libskrootpatch.so; do
+          for lib in libmagiskboot.so libapd.so libskpatchjni.so; do
             if unzip -l "$APK" | grep -q "lib/arm64-v8a/$lib"; then
               unzip -p "$APK" "lib/arm64-v8a/$lib" > "/tmp/$lib"
               MACHINE=$(od -An -tu2 -j18 -N2 "/tmp/$lib" | tr -d ' ')
@@ -106,9 +126,11 @@ jobs:
               echo "OK $lib AArch64"
             else
               echo "::warning::APK 未包含 lib/arm64-v8a/$lib（artifact 未就绪或未拉取）"
-              if [ "$lib" = "libmagiskboot.so" ] && [ "${MAGISKBOOT_PRESENT:-0}" = "1" ]; then
-                echo "::error::已拉取 libmagiskboot.so 却未打进 APK"; exit 1
-              fi
+              case "$lib" in
+                libmagiskboot.so) [ "${MAGISKBOOT_PRESENT:-0}" = "1" ] && { echo "::error::已拉取 magiskboot 却未打进 APK"; exit 1; } ;;
+                libskpatchjni.so) [ "${ENGINE_PRESENT:-0}" = "1" ] && { echo "::error::已拉取引擎却未打进 APK"; exit 1; } ;;
+                libapd.so)        [ "${APD_PRESENT:-0}" = "1" ] && { echo "::error::已拉取 AP 却未打进 APK"; exit 1; } ;;
+              esac
             fi
           done
 

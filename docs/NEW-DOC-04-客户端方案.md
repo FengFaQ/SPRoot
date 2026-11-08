@@ -134,23 +134,24 @@ android.newDsl=false
 
 全程**无 root、无 shell、无网络**。任何一步失败：错误详情 + 完整输出 + 工作目录（保留供诊断）+ 日志文件路径，全部常驻展示。
 
-### 4.2 JNI 绑定契约（与 C1 CLI 语义一一对应）
+### 4.2 JNI 绑定契约（引擎已提供，App 侧对齐）
 
-`libskrootpatch.so` 必须导出 4 个静态 native 函数（详见 `core/PatchEngine.kt` 注释）：
+patcher 的 CI artifact **`skroot-engine-arm64`**（实测内容：`libskpatchjni.so`、`libskrootpatch.so`、`magiskboot`、`magiskboot-meta.txt`、`SHA256SUMS`）提供 JNI 形态，导出符号（`nm -D` 实测）：
 
-```c
-JNIEXPORT jstring JNICALL Java_com_sproot_manager_core_PatchEngine_nativeVersion(JNIEnv*, jclass);
-JNIEXPORT jint    JNICALL Java_com_sproot_manager_core_PatchEngine_nativePatch(
-        JNIEnv*, jclass, jstring inPath, jstring outPath, jstring key, jboolean genKey,
-        jstring jsonPath, jstring workDir, jboolean verbose);
-JNIEXPORT jstring JNICALL Java_com_sproot_manager_core_PatchEngine_nativeLastError(JNIEnv*, jclass);
-JNIEXPORT jstring JNICALL Java_com_sproot_manager_core_PatchEngine_nativeLastRootKey(JNIEnv*, jclass);
+```
+Java_me_sproot_patch_NativeEngine_patch(JNIEnv*, jclass, jstring inPath, jstring outPath,
+                                        jstring key, jstring jsonSink, jstring workdir) -> jint
+Java_me_sproot_patch_NativeEngine_engineVersion(JNIEnv*, jclass) -> jstring
 ```
 
-- 参数 ↔ `--in/--out/--key|--gen-key/--json/--workdir/--verbose`；
-- 返回值 = C1 §3 退出码枚举（0/101/102/201/202/210/211/220/230/240/250），Kotlin 侧逐码映射为中文可读文案；
-- **进度只走 `jsonPath` 的 NDJSON 文件轮询**（150ms），不依赖 stdout（JNI 进程内无法可靠抓 stdout）；
-- 失败时引擎**不得**留下 out 文件（C1 §3 铁律），Kotlin 侧仍二次校验"有产物 + 等长 + sha 变化"。
+App 侧对应实现 `me/sproot/patch/NativeEngine.kt`（`@JvmStatic external`），并由 `core/PatchEngine.kt` 包装：
+
+- `inPath` = `--in`（已解压 arm64 内核 Image）｜`outPath` = `--out`｜`key`（null/空 → `--gen-key`）
+- `jsonSink` = `--json`（NDJSON 进度落盘，Java 侧轮询 150ms）｜`workdir` = `--workdir`
+- 引擎内部固定追加 `--quiet`；**进度与结果不走 stdout**（JNI 下不可见），只走 json + `<out>.report.json`
+- 返回值 = C1 §3 退出码枚举，Kotlin 侧逐码映射中文文案；`root_key` 从 `report.json` 取，取不到回落到调用方密钥
+- 引擎缺失/ABI 不符时 `ensureLoaded()` 返回**可读错误**（含期望符号名），UI 作为阻断项展示
+- **不再**使用旧草案里的 `com.sproot.manager.core.PatchEngine.native*` 符号（那是本项目自拟，未采用）
 
 ### 4.3 为什么 magiskboot 走 nativeLibraryDir
 

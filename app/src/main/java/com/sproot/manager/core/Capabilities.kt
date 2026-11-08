@@ -38,7 +38,7 @@ object Capabilities {
         val engineHeader = if (engineFile.isFile) Elf.readHeader(engineFile.absolutePath) else null
         val engineIsAarch64 = engineHeader?.let { it.isElf && it.is64Bit && it.machine == Elf.EM_AARCH64 } == true
         val engineLoadError = PatchEngine.ensureLoaded()
-        val engineVersion = if (engineLoadError == null) runCatching { PatchEngine.nativeVersion() }.getOrNull() else null
+        val engineVersion = if (engineLoadError == null) PatchEngine.version() else null
         items += CapabilityItem(
             key = "engine",
             label = "SK 修补引擎 libskrootpatch.so",
