@@ -1,9 +1,9 @@
-# 全新 SP 管理器技术方案 v0.1（NEW-DOC-01）
+﻿# 全新 SP 管理器技术方案 v0.1（NEW-DOC-01）
 
 - 文档编号：NEW-DOC-01
-- 版本：v0.4（草案，可评审；已并入 RC 根因报告 + MI(miuix 产物级实证) + KSU/APatch 管理器架构调研 + DOC-05 模块守护方案 + **契约 v1.1（2026-11-08 21:23 FROZEN，三方签 + leader 终审）** + lead 决议：JNI 引擎/两链分离/自研 bootimg/AVB 刷入路径/CI 唯一构建源）
+- 版本：**v1.1.2（定稿）**（新增 §11.4.4：`prop-rs` 依赖做成可选 feature `resetprop` + `--no-default-features` 干净构建 + CI 防腐化）
 - 作者：架构（architect）
-- 状态：**草案（可评审）｜待 lead 终审后升 v1.0**
+- 状态：**定稿 v1.1.2｜供实现与质测引用**
 - 项目重大转向：**放弃「改造 APatch 管理器 APK」路线，从零实现全新 SP 管理器；内核修补全程在安卓手机本地完成（不经 PC/云端）**
 - 参考对象：KernelSU(KSU) 与 APatch(AP) 管理器的**架构形态与修补方式**（不复制其内核侧机制）
 - UI 库指定：<https://github.com/compose-miuix-ui/miuix>
@@ -21,26 +21,27 @@
   - **已并入**：契约 v1.1 **FROZEN**（2026-11-08 21:23，三方签 + leader 终审；E1–E5 + 两链分离 + 两 native 资产边界）→ §3.1.1/§3.5/§5.2/§6.4
   - **已并入**：人类指令「禁止本地编译 APK/镜像，构建统一走 CI」→ §8
 
-> **证据约定**：本文所有技术断言均给出「本地文件路径 + 行号」或「URL + 版本」两类证据之一。凡未取得证据者，一律写入 §8 待决项，不作为设计前提。文末附录 A 汇总。
+> **证据约定**：本文所有技术断言均给出「本地文件路径 + 行号」或「URL + 版本」两类证据之一。凡未取得证据者，一律写入 §9 待决项，不作为设计前提。文末附录 A 汇总。
 
 ---
 
-## 0. 摘要与结论（先看这 12 条）
+## 0. 摘要与结论（先看这 13 条）
 
 | # | 结论 | 依据 |
 |---|---|---|
-| 1 | **四层架构**成立：UI 层（miuix/Compose）→ 修补执行层（Kotlin 编排 + 引擎双形态调用）→ Root 授权层（47 字符密钥 execve 提权 + 用户态 allow_list + **root-exec 为唯一 root 入口**）→ 模块管理层（apd 守护改造）。层间只用三类接口：引擎 CLI（C1）、APK↔AP 接口（§3.5，含 `root-exec`/`deploy`/`auth`）、apd 子命令。**组件总数比旧方案少 1 个：不再有独立部署器**（E5）。 | §3、§3.5 |
+| 1 | **四层架构**成立：UI 层（miuix/Compose）→ 修补执行层（Kotlin 编排 + **JNI 引擎**）→ Root 授权层（47 字符密钥 execve 提权 + 用户态 allow_list + **root-exec 为唯一 root 入口**）→ 模块管理层（AP 守护改造）。层间只用三类接口：引擎 JNI/CLI（C1）、APK↔AP 接口（§3.5）、AP 子命令。**组件总数比旧方案少 1 个：不再有独立部署器**（E5）。 | §3、§3.5 |
 | 2 | **miuix 可用且已实证到 Maven 产物级**：坐标 `top.yukonga.miuix.kmp:miuix-ui-android:0.9.4`（仅需 `mavenCentral()`），AAR 元数据 `minCompileSdk=37` / 库 `minSdk=24`；现有 BOM `2026.08.00`（foundation 1.12.0）与 miuix 要求**天然对齐**。 | §4.1、§4.7（E1–E6） |
 | 3 | **工程形态：Android 单平台**（非 KMP），动作项只有两个：① `exclude("org.jetbrains.compose.material3:material3-window-size-class")`（否则 material3 在 runtime 被抬到 `1.5.0-alpha22`，编译 1.4.0/运行 alpha）；② Kotlin 升 `2.4.20`。**能力边界**：blur 需 minSdk 33、glass 在 0.9.4 未发布（404）。 | §4.2、§4.6（U1–U3）、E3/E5/E7/E8/E9/E10 |
 | 4 | **引擎交付 = JNI 进程内（默认）**：`libskrootpatch.so` 以 JNI 加载进 App 进程执行修补（同库保留 CLI `main()` 作诊断/PC 复用）。**修补链不需要 root**。子进程 exec 形态降为诊断/回退模式。 | §5.2、§5.2.1、A-27 |
 | 5 | **修补链与特权链两条独立通道**（lead 决议，契约 v1.1）：**修补链**＝App 进程内（选镜像→解包→JNI 引擎→rc 注入→重打包→导出/写分区），权限=普通 App；**特权链**＝`apd root-exec`（deploy/模块/授权/刷入）→ AP 自提权。**两链不合并、不互代**（§3.1）。 | §3.1、§3.5、§3.6 |
 | 6 | **两个 native 资产、职责不可互换**：`libskrootpatch.so`（JNI，修补，无 root）vs `libapd.so`→`/data/adb/apd`（守护/特权，root）。 | §5.2 资产表、§3.5.2 |
-| 7 | **bootimg 解包/重打包 = 引擎自研**（lead 已裁，替代 magiskboot/kptools）：无第三方 ELF、无 GPL-3.0 传染、无「缺件即失败」。SK 只 patch kernel 段；rc 注入是否做取决于 D-14。 | §5.3、§5.4、A-8、A-23、A-30 |
+| 7 | **打包链 = magiskboot（人类指令）+ 引擎 patch kernel**：`magiskboot unpack` → 引擎 patch kernel 段 → `magiskboot repack`（**原厂镜像作模板**）；自研 bootimg 保留为**交叉校验/回退**实现。magiskboot 取 **Magisk v31.1 ARM64 官方构建**，按「独立程序聚合」处理（APK NOTICE 标注来源 + GPL-3.0 声明，不传染自研代码）；**禁用 AIK（Android.Image.Kitchen）与非官方 Windows 版 magiskboot**。 | §5.3、§5.3.1、A-8、A-36 |
 | 8 | **旧路线失败根因已确证（RC）**：`boot_patch.sh` 调 `./skroot-patch`，但该文件**全仓 0 命中、从未被打包**（`lib/arm64-v8a/` 只有 `libbootctl.so`/`libbusybox.so`；jniLibs 目录不存在；`engine/src/skroot-patch` 是 **x86-64 glibc** ELF，`e_machine=0x3e`）；脚本缺失即 `exit 1`；同时 `Patches.kt:261` 的瞬态条件让失败瞬间卸载日志面板、真实 stderr 被注释 → 用户只见「一闪即退」。新方案落实 **二进制资产清单 + 构建期断言 + 运行期自检 + 日志落盘** 四件套。 | §5.7、RC §一/§二、A-10~A-13 |
 | 9 | **失败回滚做三级**：①引擎级（非 0 退出绝不产出 `--out`，C1 §3 铁律）；②编排级（staging 工作目录 + manifest 校验，绝不原地覆盖原厂镜像）；③刷机级（内容寻址原厂备份 + A/B 备槽切换 + 开机成功才 `mark-boot-successful`）。 | §5.6、A-14 |
 | 10 | **提权/授权/部署按契约 v1.1 五处勘误口径落定（E1–E5）**：提权串=**47 字符密钥本体**（非路径）；su 部署=隐藏目录内**随机 16 字符名**+`/data/adb/ap/bin/su` 符号链接；废弃 `SP_REQUEST_UID`，第三方身份改 **抽象 socket + `SO_PEERCRED`**；`exclude_list` 并入单一 `allow_list`；**取消独立部署器**，部署职责拆分给「管理器（修补期写 rc）+ `apd deploy`（首启 T2）」。 | §3.5、§5.4、§6.4（E1–E5 差异表）、A-23 |
 | 11 | **root 入口唯一化**：管理器**所有**需要 root 的动作（部署、模块、授权、刷入镜像）统一走 `apd root-exec --superkey-file <tmp> -- <cmd>`；管理器自身不实现提权逻辑、不长期持有 root shell。 | §3.5.2 |
-| 12 | **最大未知不在 UI、在分区与 AVB**：Android 13+ `init_boot` 与 `boot` 的分区拆分、kernel 压缩格式与重打包尺寸偏移、rc 注入是否做（D-14）、**AVB footer + vbmeta 刷入路径与「无 PC」目标张力（D-15）**、引擎 arm64/JNI 交叉编译（task-3）。 | §7、§9 |
+| 12 | **最大未知不在 UI、在分区与 AVB**：Android 13+ `init_boot`（8MB，ramdisk 形态 → RcInject 优先目标）与 `boot`（96MB）拆分、kernel 压缩与重打包尺寸、**AVB 只保留语义不碰密码学（刷入仅 `fastboot flash boot --slot=all`，禁止 vbmeta/disable-verity/disable-verification）**、引擎 arm64/JNI 交叉编译（task-3）。 | §5.4.1、§7、§9 |
+| 13 | **许可与合规**：自有代码定案 **AGPL-3.0-only**（仓根 `LICENSE` 全文 + SPDX 头）；`NOTICE` 覆盖 magiskboot(GPL-3.0)/Apache-2.0/Zlib/BSD-3/MIT；**⚠️ `engine/` 为 SKRoot proprietary 移植，AGPL 整仓发布等于对其再许可 → 授权未明确覆盖 AGPL 再分发时，公开发布前必须剥离 `engine/`**（§11，需人类/律师确认）。 | §11、§5.3.3、A-38~A-41 |
 
 ---
 
@@ -70,7 +71,7 @@
 |---|---|---|---|
 | K1 | **薄 UI + 厚 CLI**：管理器只做界面/状态机/参数拼装/日志渲染，特权逻辑全在执行者进程 | KSU §0-1、§5.1-① | §3.1.1 特权链；`libapd.so`→`/data/adb/apd` |
 | K2 | **修补全参数化单命令、可复现**（无交互、无 shell 拼串） | KSU §5.1-② | §5.4 八步 + C1 CLI 参数面 |
-| K3 | **纯自研 bootimg 解包/回包**（不用 magiskboot/kptools） | KSU §2.7、§5.1-③ | **lead 已裁：引擎自研**（§5.3） |
+| K3 | **自研/内嵌 bootimg 解析而非依赖外部工具** | KSU §2.7、§5.1-③ | **人类指令改为：打包用 magiskboot（官方 ARM64）+ 自研 bootimg 作交叉校验/回退**（§5.3）；禁用 AIK |
 | K4 | **内容寻址备份**（sha1 索引 + 引导内指纹） | KSU §5.1-④ | §5.6-③ |
 | K5 | **UiState + 状态机 + 页面能力门禁** | KSU §5.1-⑤；APM §1.3、§5.1-④ | §3.6（10 态改造） |
 | A1 | **双轨迁移**：新机制优先探测 → 成功即清旧凭证 → 不可用则旧凭证兜底 | APM §5.1-① | §3.5.3 部署向导（先 `version --json` 探测 SK/AP 状态；旧 SuperKey 路径**不保留**，见 C1） |
@@ -83,7 +84,7 @@
 | # | 上游做法 | 为什么必须改 | SPRoot 做法 |
 |---|---|---|---|
 | B1 | SuperKey 作为 **argv** 传给 `/system/bin/truncate`（APM §5.2-①） | 密钥进 `/proc/<pid>/cmdline`/logcat；依赖具体系统二进制；与去 SuperKey 目标冲突 | **`root-exec --superkey-file <tmp 0600>`**，密钥不进 argv；用完即删（§3.5.2） |
-| B2 | 预编译二进制 + shell 脚本当引擎（APM §5.2-②） | 不可审计、文本判定、无结构化错误码、构建期下载 | **自研 bootimg + JNI 引擎 + C1 退出码/NDJSON**（§5.2/§5.3） |
+| B2 | 预编译二进制 + shell 脚本当**引擎**（APM §5.2-②） | 不可审计、文本判定、无结构化错误码、构建期下载 | **引擎 = JNI `libskrootpatch.so` + C1 退出码**；打包工具允许官方 magiskboot（独立程序聚合、sha256 锁定、退出码直传），**禁止 shell 脚本编排** |
 | B3 | ProcessBuilder 与 libsu **双路径 + 字符串拼命令**（APM §5.2-③） | 参数转义 bug、语义不一致、排查翻倍 | **单一路径**：JNI（修补）/`root-exec`（特权），不拼 shell 串 |
 | B4 | 无交互预授权（KSU §5.2-①） | SK 零常驻无法做 pending 队列 | 接受限制 + 「待授权应用」引导页补偿（§6.3 注） |
 | B5 | 把 `nativeLibraryDir` 当**守护进程**固定路径（KSU §5.2-②） | APK 升级即失效 | 只有一次性工具/引擎走该路径；**守护固定 `/data/adb/apd`**（§6.2-M14） |
@@ -93,11 +94,45 @@
 | # | 禁止项 | 理由/替代 |
 |---|---|---|
 | X1 | 禁止 superkey/密钥经 argv 或 `truncate` 等通用二进制传递 | 用 `--superkey-file`（临时 0600）+ AP 内部 `execve(key47)` |
-| X2 | 禁止「预编译二进制 + shell 脚本」作为修补引擎 | 用 JNI `libskrootpatch.so` + 结构化退出码 |
+| X2 | 禁止「预编译二进制 + **shell 脚本**」作为修补**引擎** | 引擎用 JNI `libskrootpatch.so` + 结构化退出码；**打包工具**允许使用官方 magiskboot 二进制（独立程序聚合，§5.3.3），但禁止用 shell 脚本做编排 |
 | X3 | 禁止把 nativeLibraryDir 当守护进程长期路径 | 守护固定 `/data/adb/apd`，管理器建模 bundled/installed/stale |
 | X4 | 禁止运行期/构建期网络下载二进制当交付物 | 入库 + CI 构建 + sha256 校验（§5.7-L1/L2） |
 | X5 | **禁止本地编译 APK / 镜像**（人类硬规则） | 唯一可信构建源 = GitHub Actions（§8） |
 | X6 | 禁止「脚本打印 Successfully」当成功判据 | 只认可验证事实（等长/魔数/回读 sha256，§5.4 步 6/8） |
+
+### 1.4 刷机风险与能力边界（面向用户 / 发布者）
+
+> 写法参考 `Skroot-Next` README 的「能力边界 + 危险警告」体例（简洁、不承诺、把选择权交用户）。本节应**原样出现在 App「关于/警告」页与 Release Notes 顶部**。
+
+#### 1.4.1 能力边界（能做什么 / 不能做什么）
+
+| ✅ 本项目管理器能做 | ❌ 本项目不能做 / 不承诺 |
+|---|---|
+| 在**手机本地**把用户提供的原厂 `boot.img`/`init_boot.img` 修成 SK 修补镜像 | 不提供「一键 root」：**首次刷入必须由用户在 PC 上 fastboot 完成**（§5.4.1） |
+| 生成 48 位（实为 47+NUL）Root 密钥并加密保管 | 不破解 bootloader、不绕过厂商锁、不提供解锁服务 |
+| 管理 AP 二进制部署、模块、root 授权（经 `apd root-exec`） | **不碰 AVB 密码学**：不重签 vbmeta、不提供 `--disable-verity/--disable-verification` 方案 |
+| 提供 sha1 内容寻址原厂备份与回滚指令（可复制） | 不保证所有机型/内核可修补（SK 仅支持 3.10~6.18 且需 kallsyms/CFI 兼容） |
+| 全程离线（运行期零网络；无遥测、无后台上传） | 不做 OTA 保留（系统 OTA 会覆盖 boot，需重新修补） |
+
+#### 1.4.2 危险警告（必须展示，用户确认后才可继续）
+
+1. **解锁 bootloader 会清空设备数据**，且可能失去官方保修、影响部分支付/银行类 App。
+2. **刷入非原厂 boot 有变砖风险**。是否能回滚取决于：是否已备份原厂镜像（本 App 自动做 sha1 备份）、是否 A/B 设备、是否具备 PC + 官方固件包。
+3. **AVB 状态会改变**：解锁设备后 bootloader 跳过验证；**不要**尝试用 `--disable-verification` 等命令（会清数据），本项目所有刷入命令**只允许** `fastboot flash boot --slot=all` / `flash init_boot --slot=all` + `reboot`。
+4. **密钥丢了就没了**：密钥内嵌在内核镜像中，无法热轮换；换钥=重新修补并刷入。密钥泄露=设备 root 失守。
+5. **模块与脚本以 root 运行**，第三方模块可能损坏系统；请只安装可信来源。
+6. **不要混用不同体系的镜像/密钥**：本项目密钥 ABI 为 **47 字符 + NUL**，与 `Skroot-Next` 风格（48 字节无 NUL）**不兼容**（§3.5.4）。
+7. 本软件**按「现状」提供，不附带任何担保**；因使用导致的设备损坏、数据丢失、保修失效由用户自行承担。
+
+#### 1.4.3 发布者义务（Release 门禁）
+
+| 项 | 要求 |
+|---|---|
+| 命令 | Release Notes 必须给出**准确**的 `fastboot` 命令（含 `--slot=all`），并显式写「禁止 vbmeta/disable-verification」 |
+| 回滚 | 必须给出「如何刷回原厂」的完整步骤（原厂镜像获取途径 + `flash.bat`） |
+| 机型 | 必须列出**已验证机型**与**已报告不兼容机型**；不得宣称「全机型支持」 |
+| 合规 | 仓根 `LICENSE`/`NOTICE` 齐全（**AGPL-3.0-only**，§5.3.4/§11）；APK 内 NOTICE 与仓根一致（CI 断言）；**发布前完成 §11.3 检查清单** |
+| 密钥 | 不得在 Release/日志/示例中展示任何**真实用户密钥**；文档示例一律用占位符 |
 
 ---
 
@@ -107,11 +142,12 @@
 
 | 资产 | 路径 | 状态 | 本方案用法 |
 |---|---|---|---|
-| SK 修补引擎源码 | `engine/src/`（`skroot_patch_main.cpp`、`patch_pipeline.*`、`analyze/*`、五组 `patch_*.cpp`） | 已在 WSL 编译出 x86-64 产物 `engine/src/skroot-patch`（2,121,080 B，2026-11-06） | task-3 交叉编译为 arm64 后随 APK 分发 |
+| SK 修补引擎源码 | `engine/src/`（`skroot_patch_main.cpp`、`patch_pipeline.*`、`analyze/*`、五组 `patch_*.cpp`） | 已在 WSL 编译出 x86-64 产物 `engine/src/skroot-patch`（2,121,080 B，2026-11-06）；**需 task-3 补 JNI 入口 + arm64 交叉编译** | 引擎以 `libskrootpatch.so`（JNI）随 APK 分发（§5.2） |
+| **magiskboot**（新增，人类指令） | **外部获取**：Magisk **v31.1** 官方 ARM64 release 产物（不入 git，由 CI 按 sha256 拉取/校验） | **需 CI 固化版本 + sha256** | 打包主路径：`unpack` / `repack` / `cpio`（§5.3.1） |
 | 引擎 I/O 契约 | `docs/SPROOT-DOC-C1-修补引擎IO契约.md` | v1.0 草案（12 个退出码、NDJSON 事件、report schema） | 编排层唯一调用面，不再自定义协议 |
 | SK 机制分析 | `docs/SPROOT-DOC-A1-*.md` | v1.0 正式稿 | 决定 hack 点、稳定性要求、验收断言 |
 | 旧修补链 | `app/app/src/main/assets/boot_patch.sh` + `PatchesViewModel.kt` | 已含 SPRoot 改造注记（P1/P2 标记） | 保留其「模式/备份/槽位」思路，废弃其脚本主链 |
-| bootimg 工具源码 | `upstream/KernelPatch/tools/bootimg.{c,h}` | GPL-2.0，含 `repack_bootimg()` | 解包/重打包主选 |
+| bootimg 工具源码（参考） | `upstream/KernelPatch/tools/bootimg.{c,h}` | GPL-2.0，含 `repack_bootimg()` | **仅离线参考/对照**；打包主路径改用 magiskboot（§5.3） |
 | SK↔AP 契约 | `docs/phase2_skroot_ap_call_contract_draft.md` | v1.0 定稿（双签） | Root 授权层接口基线 |
 | 启动时序 | `docs/phase2_boot_sequence_analysis_draft.md` | v0.5 联合稿 | 首装顺序与 rc 注入边界 |
 
@@ -139,10 +175,10 @@
                 │ UiState / Command（单向数据流）
 ┌───────────────┴──────────────────────────────────────────────────────┐
 │ L2 修补执行层（Kotlin, :patch 模块）                                 │
-│  BootImageRepository  → 引擎 bootimg 模块（JNI）：解包/回包/AVB + 分区探测 │
+│  BootImageRepository  → magiskboot 解包/回包（exec）+ 自研 bootimg 交叉校验 + AVB │
 │  RcInjector           → 写 init.sproot.rc + init.rc 追加 import（cpio）│
 │  PatchOrchestrator    → 八步状态机 + 进度聚合 + 失败恢复             │
-│  EngineRunner         → 双形态（子进程 / JNI）+ NDJSON 解析 + 退出码映射│
+│  EngineRunner         → JNI 引擎调用 + 进度回调/NDJSON 双写 + 退出码映射   │
 │  ArtifactVerifier     → 等长/sha256/密钥内嵌/hook_table 断言          │
 │  WorkdirManager       → staging 目录 + manifest + 清理策略            │
 └───────────────▲──────────────────────────────────────────────────────┘
@@ -173,7 +209,7 @@
 │ App 进程（UI + Kotlin 编排）        │            │ App 进程（只做参数拼装 + 流式渲染）     │
 │  ① 选 boot.img（SAF）               │            │  ① apd version --json（探测）           │
 │  ② libskrootpatch.so（JNI，进程内） │            │  ② apd deploy（T2 首启）                │
-│  ③ 无第三方工具（解包/回包/rc 注入全在 JNI 引擎内）│         │  ③ apd root-exec -- <cmd>               │
+│  ③ magiskboot（官方 ARM64，子进程，无 root）│         │  ③ apd root-exec -- <cmd>               │
 │  ④ rc 注入（cpio）                  │            └───────────────┬────────────────────────┘
 │  ⑤ repack → new-boot.img            │                            │ exec（普通进程启动）
 │  ⑥ 导出（SAF）/ 写分区（经②通道）   │                            ▼
@@ -206,7 +242,7 @@
 | `HomeViewModel` | L1 | 读内核状态、修补产物状态、AP 状态 | 状态仓 | UiState | — |
 | `PatchViewModel` | L1 | 修补向导状态机、日志流、错误面板 | L2 events | UiState + 用户动作 | — |
 | `PatchOrchestrator` | L2 | 八步流程编排、取消、回滚 | boot.img Uri + key | 产物路径 + report | 每步可分类型错误 |
-| `BootImageRepository` | L2 | 调引擎 bootimg 模块（JNI）：解包/回包、AVB 处理、格式识别、分区与槽位探测 | boot.img | 工作目录布局 + header 元数据 | 格式不支持 |
+| `BootImageRepository` | L2 | magiskboot（exec）解包/回包 + 自研 bootimg 交叉校验、AVB 区段保留、分区与槽位探测 | boot.img | 工作目录布局 + header/AVB 元数据 | 格式不支持 / magiskboot 失败→回退 |
 | `RcInjector` | L2 | 生成 `init.sproot.rc`、`init.rc` 追加 `import`（cpio 内操作） | unpack 目录 | 修改后的 ramdisk | 厂商 rc 结构不支持 |
 | `EngineRunner` | L2 | **JNI 调用** `libskrootpatch.so`（`nativeRunPatch`）、进度回调 + NDJSON 文件双写、退出码映射 | 内核路径 + key | ProgressEvent / Result | `UnsatisfiedLinkError` / 退出码 |
 | `ArtifactVerifier` | L2 | 产物断言（C1 §4） | 输入/输出内核 | 断言报告 | 断言失败=不导出 |
@@ -227,12 +263,12 @@
    └ PatchOrchestrator.run()                       [Kotlin, Dispatchers.IO]
      ├ 1 Preflight    ：ABI=arm64? 空间≥3×boot? 引擎/工具自身 sha256 自检（§5.2.1）
      ├ 2 AcquireInput ：SAF→私有 workdir/boot.img；读 ro.boot.slot_suffix 定槽位
-     ├ 3 Unpack       ：JNI nativeUnpack(boot.img) → kernel / ramdisk.cpio / dtb / header.json + AVB 标记
+     ├ 3 Unpack       ：magiskboot unpack boot.img → kernel / ramdisk.cpio / dtb（自研 bootimg 交叉校验产物）
      ├ 4 Inspect      ：引擎 nativeInspect（CONFIG_KALLSYMS / patched? / 版本域）
      ├ 5 Patch        ：JNI nativeRunPatch(in=kernel.raw, out=kernel.patched, key|gen-key, json=双写)
      ├ 6 Verify       ：ArtifactVerifier（等长、sha256≠、密钥内嵌、hook_table 5 项、prefix==key[0:16]）
-     ├ 7 RcInject     ：（条件性，D-14）nativeInjectRc：写 init.sproot.rc + init.rc 追加 import
-     ├ 8 Repack+Deliver：JNI nativeRepack → new-boot.img（AVB 策略）→ 导出(SAF) / 刷入（**转通道② root-exec**）
+     ├ 7 RcInject     ：magiskboot cpio 写 init.sproot.rc + init.rc import（**优先 init_boot 的 ramdisk**）
+     ├ 8 Repack+Deliver：magiskboot repack（原图作模板）→ new-boot.img（AVB 等长+区段断言）→ 导出/刷入（**通道②**）
      └ 收尾：成功→原子落盘 report + manifest；失败→保留 workdir + 首屏红色错误+完整日志
 ```
 
@@ -288,11 +324,21 @@ init（原厂）import init.sproot.rc（管理器在步 7 注入）
 
 | 阶段 | 时机 | 主体 | 关键动作 | `/data` 状态 |
 |---|---|---|---|---|
-| **T1 修补期** | 用户点修补 | 管理器（**无 root**） | 选 boot.img → 引擎 JNI 解包 → 引擎 patch → 取 48 字符 key（Keystore 存）→（D-14）写 rc → 引擎 repack（AVB 策略）→ 导出/刷入 | **完全不动**（只有 App 私有 workdir） |
+| **T1 修补期** | 用户点修补 | 管理器（**无 root**） | 选镜像 → 引擎 JNI 解包 → 引擎 patch kernel → 取 48 字符 key（Keystore 存）→ **RcInject 步骤写 ramdisk（优先 init_boot）** → 引擎 repack（AVB 策略）→ 导出/刷入 | **完全不动**（只有 App 私有 workdir） |
 | **T2 首启** | 刷入后第一次开机、打开管理器 | 管理器 → AP | 写临时 key 文件 → `apd deploy` → AP 自提权后落盘 `/data/adb/*`、`sproot/key`、隐藏 su → 删临时文件 | 就绪；**模块能力尚未生效** |
 | **T3 二次开机起** | 之后每次开机 | init + AP daemon | rc → post-fs-data → daemon → services/boot-completed | 稳态 |
 
 > **UI 必做**：T2 完成后明确提示「需重启一次，模块功能才会生效」；重启前模块页禁用安装按钮（DOC-05 §6.1 末段）。
+
+### 3.5.4 ⚠️ 密钥 ABI 注记（禁止跨体系套用）
+
+> **本项目的密钥 ABI 固定为「47 字符 + NUL」（对外展示 48 位）**：内核 shellcode 头部 48 字节 = `key[0:47] + '\0'`；`execve` 的 filename 与这 47 字符逐字节比对至 NUL（引擎 `engine/src/patch_do_execve.cpp`、`skroot_patch_main.cpp:312-317`；A1 §4.1）。
+>
+> **存在另一套不兼容 ABI**：`Skroot-Next` 风格 patcher 采用 **48 字节无 NUL、按实际长度比较**。二者**不可混用**：
+> - 用 Skroot-Next 风格 patched 镜像 + 本项目 47 字符密钥 → **提权静默失败**（多/少一字符即失配；内核无日志，现象为「su 静默返回、uid 仍非 0」）；
+> - 反之（本项目镜像 + Skroot-Next 的 48 字节密钥）同样失配。
+>
+> **纪律**：①**密钥不可跨体系套用**（本项目密钥只对本项目镜像有效）；②`SukeyProvider` 只生成/保存 47 字符语义密钥，对外按 48 位展示；③诊断页显示 `key ABI = 47+NUL`；④质测必须有「错体系密钥 → 提权失败且不崩溃、不刷错误日志」用例（task-7）。
 
 ### 3.6 应用级状态机与页面能力门禁（改造自 APatch 10 态）
 
@@ -559,7 +605,8 @@ fun HomeScreen(state: HomeUiState, onPatch: () -> Unit) {
 |---|---|---|---|---|
 | **`libskrootpatch.so`** | JNI `.so`（`jniLibs/arm64-v8a/`） | **App 进程内** | 内核 Image 字节 patch + 密钥生成（C1 契约） | 普通 App 权限，**无 root** |
 | **`libapd.so` → `/data/adb/apd`** | Rust 可执行（部署后落稳定路径） | 独立进程（init 拉起/管理器 `root-exec` 拉起） | 守护、模块、授权、部署、root 执行 | **root**（内部 `execve(key47)` 自提权） |
-| ~~magiskboot / kptools~~ | **不引入**（lead 已裁自研 bootimg） | — | — | — |
+| **magiskboot**（Magisk v31.1 官方 ARM64） | 独立 ELF（`jniLibs`/`assets` 落地后可执行） | App 进程 spawn 的子进程（**无 root**） | `unpack` / `repack` / `cpio`（打包主路径，§5.3.1） | 普通 App 权限（仅文件操作） |
+| ~~kptools~~ | **不引入**（仅离线参考源码） | — | — | — |
 
 > **反模式警戒**：不要试图用 `libskrootpatch.so` 承担特权行为（它不是特权执行者）；也不要用 AP 二进制做内核 patch（AP 无修补能力）。二者短信道、不同权限域。
 
@@ -567,15 +614,13 @@ fun HomeScreen(state: HomeUiState, onPatch: () -> Unit) {
 
 ```kotlin
 // EngineCapabilityProbe —— 结果落 logs/preflight-<ts>.log
-1. 资产存在：nativeLibraryDir/libskrootpatch.so 存在，size == binaries.json 记录值
-2. 架构正确：读 ELF header，e_machine == 0xB7(AArch64)，ELFCLASS64，ET_DYN
-3. 摘要正确：sha256(file) == binaries.json
-4. JNI 加载探针：System.loadLibrary("skrootpatch") 成功；
-   nativeVersion() 返回 engine_version / upstream_baseline（非空、与 binaries.json 一致）
-   - UnsatisfiedLinkError → 阻断修补，文案「修补组件不可用（架构/依赖不匹配）」+ 诊断导出
-5. 自检干跑：nativeSelftest() 返回 0（引擎内部做一次最小自检：符号表解析器/asmjit 初始化/临时目录可写）
-6. 【仅诊断模式】执行探针：exec nativeLibraryDir/libskrootpatch.so --selftest
-   - 失败分类 ENOEXEC/EACCES/ENOENT/超时；失败不影响 JNI 主路径
+1. 资产存在：`nativeLibraryDir/libskrootpatch.so`（引擎）与 `libmagiskboot.so`（打包工具）存在，size == binaries.json 记录值
+2. 架构正确：读 ELF header，两者均 `e_machine == 0xB7(AArch64)`，ELFCLASS64
+3. 摘要正确：sha256(file) == binaries.json（含 magiskboot 的官方来源版本号 Magisk v31.1）
+4. JNI 加载探针：System.loadLibrary("skrootpatch") 成功；nativeVersion() 与 binaries.json 一致
+5. 自检干跑：nativeSelftest() 返回 0
+6. **magiskboot 可执行探针**：exec `libmagiskboot.so`（无参数打印 usage）→ 期望 rc==0 或已知 usage rc；失败分类 ENOEXEC/EACCES/ENOENT/超时（此时按 §5.3 回退自研 bootimg，并置 fallback_used=true）
+7. 【仅诊断模式】exec `libskrootpatch.so --selftest`
 ```
 
 > **对 task-3 的明确要求**：①同库导出 JNI 入口（`System.loadLibrary("skrootpatch")` 可加载）+ `nativeVersion/nativeSelftest/nativeRunPatch`；②**同时**保留 CLI `main()`（诊断模式 + PC/CI 复用）；③NDK clang `aarch64-linux-android` 构建，CI 用 `readelf` 断言架构（RC §5.2 断言 1）；④JNI 层禁止抛 C++ 异常跨边界（`-fno-exceptions` + 错误码返回）。
@@ -587,36 +632,131 @@ fun HomeScreen(state: HomeUiState, onPatch: () -> Unit) {
 3. **线程**：`nativeRunPatch` 在 `Dispatchers.IO` 专用线程执行（引擎内部有阻塞 IO 与大量内存分配）；**并发保护**：进程级 `Mutex`，同一时刻只允许一次修补（引擎不是线程安全的）。
 4. **崩溃可观测**：JNI 入口外层记录 `state.json`（步骤、输入 sha256、时间戳）；App 启动时若发现 `state.json` 为「进行中」，展示「上次修补异常中断 + 日志/诊断包」，不静默。
 5. 完整性：随包 `binaries.json` 参与 §5.2.1 自检；缺件/摘要不符 → `E-PRE-BIN`。
-6. **构建期断言**（Gradle task，失败即 build fail）：`lib/arm64-v8a/libskrootpatch.so` 存在且 `readelf -h` 显示 `Machine: AArch64`；`assets/` 内不得出现任何 `.sh` 修补脚本或第三方 ELF（RC F2/F3 + lead「自研 bootimg」决议）。
+6. **构建期断言**（Gradle task，失败即 build fail）：`lib/arm64-v8a/libskrootpatch.so` 与 `lib/arm64-v8a/libmagiskboot.so` 均存在且 `readelf -h` 显示 `Machine: AArch64`；magiskboot 的 sha256 与「Magisk v31.1 官方 ARM64 release」记录一致；`assets/` 内不得出现任何 `.sh` 修补脚本；**不得出现 AIK 产物或非官方 Windows 版 magiskboot**（RC F2/F3 + 人类指令）。
 
-### 5.3 决策 D-2：bootimg 解包/重打包 = **引擎自研**（lead 已裁，替代 magiskboot/kptools）
+### 5.3 决策 D-2（v1.0.1 修订）：打包工具链 = **magiskboot（人类指令）+ 引擎 patch kernel**，自研 bootimg 转为交叉校验/回退
 
-> **lead 2026-11-08 决策**：修补引擎自研 bootimg 解析/重打包，替代 magiskboot；**SK 只 patch kernel 段、不改 ramdisk**（比 KSU 简单）。本节按此改写（v0.2 的「magiskboot 主选」已撤销）。
+> **人类新指令（2026-11-08，经 lead 转达）**：打包**用 magiskboot（ARM64）**，**禁用 AIK（Android.Image.Kitchen，不支持 Linux 6.0+ 内核）与非官方 Windows 版 magiskboot**。本节据此修订；v1.0「自研 bootimg 为唯一打包路径」作废（自研实现保留为交叉校验与回退）。
 
-| 方案 | 结论 | 理由 |
+| 方案 | 结论 | 说明 |
 |---|---|---|
-| **引擎自研 bootimg（选定）** | ✅ 纳入 `engine/`（与 SK patch 同一二进制/JNI） | ①无 GPL-3.0 传染（消除 D-3 的许可证阻塞）；②无外部二进制依赖（消除「缺件即失败」的 RC P0 类故障）；③解包/回包/校验都在同一进程内，错误码与进度可结构化（C1 契约）；④可用 `--json` 报告每步，质测可断言 |
-| magiskboot | ❌ 不引入 | GPL-3.0 + 外部 ELF + 不可审计；且其 cpio 能力仅在「需改 ramdisk」时才必要（见 D-14） |
-| kptools | ⚠️ 仅作**参考实现/离线校验**（不随 APK） | GPL-2.0 源码在手（`upstream/KernelPatch/tools/bootimg.c`），可用于对照解析结果；运行期不依赖 |
-| KSU `android-bootimg`（Rust crate） | ⚠️ 仅**参考设计**，不复制代码 | KSU §2.7/§5.1-③ 证明纯自研可行；其许可证需单独确认，本文不假定可直接 vendoring |
+| **magiskboot（打包主路径）** | ✅ **引入**：来自 **Magisk v31.1 官方 ARM64 构建**，作为独立可执行组件随 APK 分发 | `unpack` / `repack` / `cpio` 三条命令覆盖解包、回包、ramdisk 编辑；**原厂镜像作模板**（repack 保留原布局/AVB 区段）；许可证 GPL-3.0，按「独立程序聚合」处理（§5.3.2） |
+| **引擎（`libskrootpatch.so`）** | ✅ 保留：只负责 **kernel 段字节 patch**（SK shellcode）+ 密钥 | 不做 bootimg 结构解析（可由 magiskboot 承担），但保留最小 header 解析用于校验 |
+| **自研 bootimg** | ⚠️ **保留为交叉校验 / 回退** | ①交叉校验：独立解析 magiskboot 产物，断言结构/段偏移/AVB 区段；②回退：magiskboot 在特定机型失败时启用，并记录 `fallback_used=true` 供质测追踪 |
+| kptools | ❌ 不引入（仅离线参考 `upstream/KernelPatch/tools/bootimg.c`） | 避免第三套格式实现 |
+| **AIK（Android.Image.Kitchen）** | 🚫 **明令禁止** | 不支持 Linux 6.0+ 内核；且非 ARM64 机内工具 |
+| 非官方 Windows 版 magiskboot | 🚫 **明令禁止** | 来路不明、无校验、可能被植入；只用 Magisk 官方 release 产物 |
 
-**自研 bootimg 的最小能力集（task-3 交付）**
+#### 5.3.1 打包链（命令级，**唯一主路径**）
 
-| # | 能力 | 说明 | 依据 |
+```bash
+# 工作目录 work/，boot.img 为用户提供的原厂镜像（repack 的模板）
+# 1) 解包（magiskboot 在 APK 内以 libmagiskboot.so 形式落 nativeLibraryDir 后 exec）
+magiskboot unpack work/boot.img
+#   产物：kernel / ramdisk.cpio / dtb / header 等（按镜像实际内容）
+# 2) 引擎 patch kernel 段（JNI）：kernel → kernel.patched（等长，SK shellcode）
+#    同时输出 report.json（密钥/hook_table/hidden_dir_prefix）
+# 3) RcInject（D-14）：magiskboot cpio 向 ramdisk 加 2 个文件
+magiskboot cpio ramdisk.cpio "add 0644 init.sproot.rc work/init.sproot.rc"
+magiskboot cpio ramdisk.cpio "extract init.rc"        # 取原 init.rc
+#    末尾追加一行 import /init.sproot.rc 后回写：
+magiskboot cpio ramdisk.cpio "add 0644 init.rc work/init.rc.patched"
+# 4) 回包（以原厂 boot.img 为模板，保留段布局与 AVB 区段）
+magiskboot repack work/boot.img work/new-boot.img
+```
+
+**打包链验收断言（与 §5.4.1 AVB-1~AVB-4、§5.4 步⑧ 一致，硬门禁）**
+
+| # | 断言 | 判定 |
+|---|---|---|
+| PKG-1 | 产物 `new-boot.img` **长度严格等于目标分区大小**：`boot=100663296 B`、`init_boot=8388608 B`（**不是 ≤**） | 不等即失败（`E-AVB-20`） |
+| PKG-2 | 原厂镜像与产物的 **AVB footer + 内嵌 vbmeta 区逐字节保留**（对应区段 diff 为空） | diff 非空即失败（`E-AVB-19`） |
+| PKG-3 | 自研 bootimg **交叉解析**产物成功：`ANDROID!` 魔数、各段 offset+size 与 magiskboot 一致、`kernel` 段可再次 patch/回读 | 不一致即失败（`E-PKG-21`） |
+| PKG-4 | `magiskboot unpack new-boot.img` 可再次解包，`kernel` sha256 == `kernel.patched` | 失败即判「产物不可用」 |
+| PKG-5 | 命令文本中**不含** `vbmeta` / `disable-verity` / `disable-verification`（AVB-4 同源） | 静态检查 |
+
+> **回退规则**：若 magiskboot unpack/repack 在目标机型失败（rc≠0 或 PKG-3 不过），自动切**自研 bootimg 回退**路径并置 `fallback_used=true`、记录完整日志；回退产物**同样**必须通过 PKG-1/PKG-2/AVB 断言，否则不导出。
+
+#### 5.3.2 自研 bootimg 的最小能力集（交叉校验/回退用）
+
+| # | 能力 | 说明 |
+|---|---|---|
+| P1 | boot header v0–v4 解析/序列化 | `magic="ANDROID!"`、段 offset+size、页大小、os_version |
+| P2 | kernel 段取出 + 解压归一 | gzip / lz4 / 未压缩；记录原压缩类型以回填（引擎拒 `.gz` 直入，RC §2.3） |
+| P3 | 写回 kernel 段（等长） | SK patch 不改长度 |
+| P4 | repack（回退模式） | 段偏移按页对齐重排，输出合法 boot.img；受 PKG-1/PKG-2 硬约束 |
+| P5 | AVB 区段识别与**逐字节保留** | 定位 `AVBf` footer 与内嵌 vbmeta 区段，repack 时不改写 |
+| P6 | ramdisk cpio 增删（回退时） | RcInject 等价实现：写 `init.sproot.rc` + `init.rc` import（优先 init_boot） |
+| P7 | 分区/槽位探测 | `ro.boot.slot_suffix`、by-name、`init_boot` vs `boot` |
+
+**D-14 裁决落定（lead 2026-11-08：采纳解读 A，固定表述如下）**
+
+> 「引擎 patch kernel 段（SK shellcode）；**同一流水线的 RcInject 步骤**向 ramdisk 写入 `init.sproot.rc` + `init.rc` import 行。二者是流水线两个独立步骤，SK 内核运行时零 ramdisk 依赖。」
+
+落地约束（lead 明确，写死）：
+1. **SK 内核运行时**只依赖 kernel Image 内的五 hook/密钥，**不依赖 ramdisk 任何内容**——这点比 KSU 简单（KSU 需改 `init`→`init.real`）。
+2. 我们是**安装器**：在修补流水线内改 ramdisk 是允许且必要的（KSU 同样改 init）。
+3. **隐藏性约束**：ramdisk **只加 2 个文件**（`init.sproot.rc` + 一行 `import` 追加），**不碰 SELinux policy、不改 AVB 逻辑**；AVB 只按 §5.4.1 的显式策略处理。
+4. **RcInject 目标（D-12 裁决）**：本机存在 `init_boot.img`（8MB，ramdisk 形态）→ **优先注入 init_boot 的 ramdisk**（Android 13+ 通用 ramdisk 在 init_boot）；`boot.img` 的 ramdisk 作为回退；**实现中两者都探测并在 manifest 记录实际目标**。
+
+#### 5.3.3 许可证标注（**人类已定：自有代码 AGPL-3.0-only**；D-3 已裁）
+
+| 组件 | 许可证状态 | 处置 |
+|---|---|---|
+| **本项目自有代码**（管理器 App / 自研 bootimg / JNI 胶水 / 构建脚本 / 文档） | **AGPL-3.0-only**（SPDX） | `LICENSE` = AGPL-3.0 **全文**（含 SPDX 头）；`README` 许可段标注 `SPDX-License-Identifier: AGPL-3.0-only`；若人类后续允许升级版本，可改 `AGPL-3.0-or-later`（**默认 only**） |
+| **SKRoot 上游源码**（`abcz316/SKRoot-linuxKernelRoot`，vendored 到 `engine/`） | **proprietary（无 SPDX 声明）** | 本项目使用已获上游作者授权；**再许可风险见 §11**（授权未明确覆盖 AGPL 再分发时须剥离 `engine/`）；NOTICE 不声称其开源、不附其源码 |
+| **magiskboot**（Magisk v31.1 官方 ARM64 release 产物） | **GPL-3.0** | 独立可执行组件，「独立程序聚合」处理：APK `NOTICE` 标注来源（`topjohnwu/Magisk` v31.1）、GPL-3.0 声明与**可获取源码**链接；不改写/不链接其源码；保留原始二进制 + sha256。**GPL-3.0 与 AGPL-3.0 兼容**（AGPL-3.0 §13 第 2 段允许与 GPL-3.0 组合/链接），本项目按聚合处理 |
+| Kotlin / Compose / AndroidX / miuix | Apache-2.0 | Apache-2.0 与 AGPL-3.0 兼容；随 NOTICE 声明 |
+| asmjit（`engine/3rdparty/asmjit2-src`） | Zlib | 保留版权与许可声明（本地 `LICENSE.md` 已核实） |
+| capstone（`engine/3rdparty/capstone-5.0.7`） | BSD-3-Clause | 解包后核对包内 LICENSE.TXT 并随发布物附带声明 |
+| cJSON（`engine/3rdparty/cJSON`） | MIT | 保留版权与许可声明 |
+| **AP 二进制 `apd` 的 115 个 Rust 依赖** | 全部 permissive（MIT/Apache-2.0/Zlib/Unlicense/ISC/BSD-3/BSL-1.0/CC0/Unicode-3.0）**除 2 项 UNKNOWN** | 明细 `apd/THIRD_PARTY_LICENSES.md`；根 `NOTICE` §8；**`prop-rs`/`prop-rs-android` = UNKNOWN 阻断发布**（§11.4）；`extattr`(GPL-2.0-only) 已移除 |
+| KernelPatch `bootimg.c` / APatch / KernelSU | 各为 GPL-2.0 / GPL 系 | **仅参考、未复制代码**，不随包分发；如未来复制须按其 GPL 处理并做 AGPL 兼容性评估 |
+| AIK / 非官方 Windows magiskboot | — | **禁止使用**（人类指令） |
+
+> **结论**：自有代码定案 **AGPL-3.0-only**；第三方义务通过 `NOTICE` 履行；唯一未闭环项是 **SKRoot proprietary 部分的再许可**（§11，需人类/律师确认授权范围）。
+
+#### 5.3.4 仓根 `LICENSE` / `NOTICE`（**人类已定：AGPL-3.0-only，已落盘**）
+
+> 现状（v1.1）：仓库根已新增 **`LICENSE`（AGPL-3.0 全文 + SPDX 头）**、**`NOTICE`（第三方声明）**、**`README.md`（含许可段）**。这是发布门禁的硬要求。
+
+**① `LICENSE`（已完成）**
+
+| 项 | 内容 |
+|---|---|
+| 文件名 | 仓库根 `LICENSE` |
+| 内容 | 首行 `SPDX-License-Identifier: AGPL-3.0-only` → 版权行 → AGPL 权利/免责说明 → **AGPL-3.0 全文**（约 34 KB，自 SPDX 官方文本 `AGPL-3.0-only.txt` 逐字拷贝） |
+| 附加说明 | 文件头部含两段说明：①第三方组件不在本许可范围（见 `NOTICE`）；②`engine/` 的 SKRoot 派生部分再许可风险（见 §11） |
+| 版本选择 | **默认 `AGPL-3.0-only`**；若人类希望允许后续版本，改为 `AGPL-3.0-or-later` 并同步 `README`/`NOTICE`/SPDX 头 |
+
+**② `NOTICE`（已完成，必须与 APK 内 NOTICE 同内容）**
+
+| # | 组件 | 许可证 | 声明要点 |
 |---|---|---|---|
-| P1 | boot header v0–v4 解析/序列化 | `magic="ANDROID!"`、kernel/ramdisk/second/dtb 各段 offset+size、页大小、os_version | AOSP bootimg 规范；`upstream/KernelPatch/tools/bootimg.c` 可对照 |
-| P2 | kernel 段取出 + **解压归一** | gzip / lz4 / 未压缩；记录原压缩类型与参数以回填 | §5.4 步 3；引擎拒 `.gz` 直入（RC §2.3） |
-| P3 | 写回 kernel 段（**等长**） | SK patch 不改长度 → 原地覆盖 + 重算校验（如有） | A1 §1、C1 §2.1 |
-| P4 | repack | 段偏移按页对齐重排，输出 `ANDROID!` 合法的 boot.img | §5.4 步 8 |
-| P5 | **AVB footer 处理** | 识别尾部 `AVBf` footer；输出两种模式：①保留 footer 但失效（需 vbmeta 处理）②剥离 footer | lead 2026-11-08：AVB 已确认存在 |
-| P6 | （可选）ramdisk cpio 增删 | **仅当 D-14 判定需要 rc 注入时实现**（lead 明确「SK 不改 ramdisk」；但 AP 自启需要 rc，见 D-14） | E5、DOC-05 §5.1 |
-| P7 | 分区/槽位探测 | `ro.boot.slot_suffix`、`by-name` 映射、`init_boot` vs `boot` | §5.4 步 2、R15 |
+| N1 | **magiskboot**（Magisk v31.1 官方 ARM64） | **GPL-3.0** | 来源 URL + v31.1 + **可获取源码**链接（GPL §6 义务）；以**独立可执行程序**分发（聚合）；说明 **GPL-3.0 与 AGPL-3.0 兼容**（AGPL §13 第 2 段） |
+| N2 | Kotlin / Compose / AndroidX | Apache-2.0 | 版权归 JetBrains/AOSP 及贡献者；保留声明 |
+| N3 | miuix 0.9.4 | Apache-2.0 | 来源 URL |
+| N4 | asmjit | **Zlib** | 完整 zlib 声明三项限制（本地 `LICENSE.md` 已核实） |
+| N5 | capstone 5.0.7 | **BSD-3-Clause** | 保留版权/条件/免责；包内 LICENSE.TXT 解包后核对 |
+| N6 | cJSON | **MIT** | 版权行 + 许可声明 |
+| N7 | **SKRoot 上游源码（vendored）** | **proprietary（无 SPDX）** | 说明「已获作者授权、授权凭证人类持有、不声称开源」+ **⚠️ 再许可风险提示（指向 §11）** |
+| N8 | KernelPatch / APatch / KernelSU | GPL-2.0 / GPL 系 | **仅参考、未复制代码**；若未来复制须按其 GPL 处理并评估 AGPL 兼容性 |
+| N9 | AIK / 非官方 Windows magiskboot | — | **禁止使用** |
 
-**注意（lead 表述与 AP 自启的张力 → D-14）**：lead 决策「SK 只 patch kernel 段、不改 ramdisk」在**内核 patch 层面完全成立**（SK 五 hook 全在 kernel Image 内，与 ramdisk 无关）。但**AP 守护的自启动依赖 ramdisk 内的 `init.sproot.rc` + `init.rc import`**（DOC-05 §5.1/E5）。因此存在两条互斥解读：
-- **解读 A（推荐）**：引擎**只 patch kernel**；rc 注入由「引擎的 bootimg 模块」在同一流程内完成（P6 开启），即"SK 不改 ramdisk"指"SK 的内核补丁不依赖 ramdisk 改动"，而非"最终产物不改 ramdisk"。
-- **解读 B**：最终 boot.img 的 ramdisk 一字不改 → **AP 无法开机自启** → 模块/授权不可用（root 仅在有 AP 进程被手动拉起时可用）。
+**③ `README.md` 许可段（已完成）**
 
-→ 该点已列为 **§9 D-14**，需 lead 一句确认；本文实现按 A 预留、按 B 也能降级运行（UI 明示"模块能力需手动启动"）。
+- 明确 `SPDX-License-Identifier: AGPL-3.0-only`；
+- 指向 `LICENSE`（自有代码）与 `NOTICE`（第三方）；
+- 单列「⚠️ engine/ 再许可风险」一句 + 指向 §11；
+- 单列「刷机风险与能力边界」摘要（对应 §1.4）。
+
+**④ CI 断言（task-8 落地）**
+
+| 项 | 断言 |
+|---|---|
+| `newapp.yml` | APK 内 `NOTICE` 含 `magiskboot` + `GPL-3.0` + `v31.1`；含 SKRoot proprietary 段落 |
+| `release.yml` | 仓根 `LICENSE`/`NOTICE` 存在且非空；`LICENSE` 含 `SPDX-License-Identifier: AGPL-3.0-only` 且含「GNU AFFERO GENERAL PUBLIC LICENSE」正文 |
+| 变更纪律 | 新增第三方依赖 → 同步更新 `NOTICE`（PR 检查项）；**禁止**在 CI 中自动改写 `LICENSE` 正文 |
 
 ### 5.4 八步流程（可执行步骤 + 每步失败处理）
 
@@ -624,26 +764,56 @@ fun HomeScreen(state: HomeUiState, onPatch: () -> Unit) {
 
 | 步 | 动作 | 具体命令/断言 | 失败处理（用户可见） |
 |---|---|---|---|
-| **1 Preflight** | 环境 + 自身能力自检 | ①`Build.SUPPORTED_ABIS` 含 `arm64-v8a`；②`filesDir` 可用空间 ≥ 3×boot.img；③`binaries.json` 逐项 sha256 + ELF `e_machine=0xB7`（§5.2.1，**仅引擎 + AP 二进制**，无第三方工具）；④JNI `nativeVersion/nativeSelftest`；⑤创建 `logs/patch-<ts>.log` 并写入 cmd/env/cwd | 首屏红条 + 具名错误码（`E-PRE-01` ABI / `E-PRE-02` 空间 / `E-PRE-BIN` 二进制缺失或校验失败 / `E-PRE-03` JNI 加载失败），附「导出诊断」；**绝不进入下一步** |
-| **2 AcquireInput** | 取镜像到 staging + 指纹 | SAF `openInputStream(uri)` → `work/boot.img`（分块拷贝 + 流式 sha256）；记录 `ro.boot.slot_suffix`、`ro.product.device`、`ro.build.version.sdk`；**扫描尾部 AVB footer（`AVBf`）并记录 vbmeta 关联信息**；判定来源是 `boot` 还是 `init_boot` | `[E-IO-04] 无法读取所选文件（%s）`；`[E-IO-05] 剩余空间不足：需 %d MB，实有 %d MB` |
-| **3 Unpack** | 拆镜像 + **解压归一**（引擎 bootimg 模块） | JNI `nativeUnpack(work/boot.img, work/unpack/)` → `kernel`、`ramdisk.cpio`（若有）、`dtb*`、header 元数据 JSON；判断 `kernel` 是否已解压裸 Image：压缩魔数（`1f 8b` gzip / `04 22 4d 18` lz4）→ 解压为 `kernel.raw` 并**记录原压缩类型与参数** | `[E-IMG-06] 镜像格式无法解析（%s）`；`[E-IMG-07] 内核压缩格式不支持（%s）`；详细原因折叠块 |
+| **1 Preflight** | 环境 + 自身能力自检 | ①`Build.SUPPORTED_ABIS` 含 `arm64-v8a`；②`filesDir` 可用空间 ≥ 3×boot.img；③`binaries.json` 逐项 sha256 + ELF `e_machine=0xB7`（§5.2.1：**引擎 + magiskboot + AP 二进制**）；④JNI `nativeVersion/nativeSelftest` + magiskboot 可执行探针；⑤创建 `logs/patch-<ts>.log` 并写入 cmd/env/cwd | 首屏红条 + 具名错误码（`E-PRE-01` ABI / `E-PRE-02` 空间 / `E-PRE-BIN` 二进制缺失或校验失败 / `E-PRE-03` JNI/工具加载失败），附「导出诊断」；**绝不进入下一步** |
+| **2 AcquireInput** | 取镜像到 staging + 指纹 | SAF `openInputStream(uri)` → `work/boot.img`（分块拷贝 + 流式 sha256）；记录 `ro.boot.slot_suffix`、`ro.product.device`、`ro.build.version.sdk`、**分区精确字节数（boot=100663296 / init_boot=8388608）与 AVB 区段偏移**；**探测 `boot` 与 `init_boot` 两个分区**（A13+ 优先 init_boot，判据：init_boot 存在且含 ramdisk；决定 RcInject 目标并记入 manifest） | `[E-IO-04] 无法读取所选文件（%s）`；`[E-IO-05] 剩余空间不足：需 %d MB，实有 %d MB` |
+| **3 Unpack** | 拆镜像 + **解压归一**（magiskboot 主路径，自研 bootimg 交叉校验） | `magiskboot unpack work/boot.img` → `kernel`、`ramdisk.cpio`（若有）、`dtb*`；自研 bootimg 独立解析同一镜像做交叉校验（段 offset+size 必须一致）；判断 `kernel` 是否已解压裸 Image：压缩魔数（`1f 8b` gzip / `04 22 4d 18` lz4）→ 解压为 `kernel.raw` 并**记录原压缩类型与参数** | `[E-IMG-06] 镜像格式无法解析（%s）`；`[E-IMG-07] 内核压缩格式不支持（%s）`；magiskboot 失败 → 自动回退自研 bootimg（置 `fallback_used=true`） |
 | **4 Inspect** | 前置校验（APL §2.3-1 教训） | 引擎 `nativeInspect`：①必含 `CONFIG_KALLSYMS=y`；②`patched=false`（已修补则拒）；③内核版本落在引擎支持域（3.10~6.18，A1）；④记录 sha256 与大小 | 每项具名错误：`[E-IMG-08] 内核未开启 CONFIG_KALLSYMS`、`[E-IMG-09] 该镜像已被修补，请使用原厂 boot.img`、`[E-IMG-10] 内核版本 %s 不支持` |
 | **5 Patch** | 调 SK 引擎（**JNI 进程内**） | `nativeRunPatch(in = work/kernel.raw, out = work/kernel.patched, key = K \| null(gen), json = work/p.ndjson)`；进度回调 + NDJSON 双写；引擎内部仍按 C1 落 `report.json` | 退出码→中文映射（§5.5）；**同时**校验 C1 §3 铁律：rc≠0 时 `kernel.patched` 必须不存在（若存在 → `E-ENG-11` 引擎违约并删除） |
 | **6 Verify** | 产物断言（C1 §4 + RC §5.1-[5]） | ① `size(out)==size(in)`；② `sha256(out)!=sha256(in)`；③ out 内存在 48B 窗口 == `key[0:47]+NUL`；④ `report.hook_table` 含 5 个 hook 且地址非 0；⑤ `report.hidden_dir_prefix == key[0:16]`；⑥ `report.root_key == 传入 key`（防「刷了别人的 key」）；⑦ 引擎回读 `patched=true`（若引擎提供该能力，否则记 `skipped`） | 任一失败 → `[E-VER-12] 产物校验失败：<断言名>`，**删除产物、不导出、不回写**，保留 workdir |
-| **7 RcInject**（**条件性**：仅 D-14 解读 A） | ramdisk rc 注入（E5 划归管理器/引擎 bootimg 模块） | JNI `nativeInjectRc(unpack/, key16Independent)`：写 `init.sproot.rc`（内容见 DOC-05 §5.1，不含密钥）+ `init.rc` 末尾追加 `import /init.sproot.rc`；断言：cpio 内可见 `/init.sproot.rc` 且 `init.rc` 尾部含该行；原 `init.rc` 备份进 manifest | `[E-RC-17] rc 注入失败`；`[E-RC-18] 该机型 init.rc 结构不支持` → 降级「跳过 rc 注入」（内核 patch 仍生效，模块需手动启动，UI 明示） |
-| **8 Repack+Deliver** | 重打包与交付（成功判据=可验证事实） | JNI `nativeRepack(work/unpack/, out=new-boot.img)` → **AVB 策略二选一**（§5.4.1）；断言：存在、头部魔数 `ANDROID!`、size ≤ 目标分区 size、`sha256` 与 manifest 一致；交付按 **PatchMode 四模式**（§5.4.2） | `[E-PKG-13] 重打包失败/产物头非法`；`[E-DEL-14] 导出被取消`；`[E-FLS-15] 刷入失败（槽位 %s），已回滚`；`[E-FLS-16] 刷入后回读不一致，已尝试恢复备份` |
+| **7 RcInject**（**必做**，D-14 解读 A） | ramdisk rc 注入（magiskboot cpio）；**目标优先 `init_boot` 的 ramdisk，`boot.img` ramdisk 回退**（D-12） | `magiskboot cpio ramdisk.cpio "add 0644 init.sproot.rc …"` + extract/追加 `import /init.sproot.rc`/add 回写；断言：cpio 内可见 `/init.sproot.rc` 且 `init.rc` 尾部含该行；原 `init.rc` 备份进 manifest；**只动这 2 个文件，不碰 policy/AVB** | `[E-RC-17] rc 注入失败`；`[E-RC-18] 目标分区无 ramdisk 或 init.rc 结构不支持` → 按 D-12 回退另一分区；仍失败则报「该机型暂不支持 AP 自启」，内核 patch 仍可导出（UI 明示模块需手动启动） |
+| **8 Repack+Deliver** | 重打包与交付（成功判据=可验证事实） | `magiskboot repack work/boot.img work/new-boot.img`（**原图作模板**）+ 自研 bootimg 交叉校验（§5.3.1 PKG-1~PKG-5）；断言（**全部必须通过**）：① 存在且头部魔数 `ANDROID!`；② **产物长度严格等于目标分区大小**（`boot`=100663296 B / `init_boot`=8388608 B，**不是「≤」**）；③ **AVB footer + 内嵌 vbmeta 区逐字节保留**（与原厂镜像对应区段 diff 为空）；④ `sha256` 与 manifest 一致；交付按 **PatchMode 四模式**（§5.4.2） | `[E-PKG-13] 重打包失败/产物头非法`；`[E-PKG-21] 交叉校验不一致`；`[E-AVB-19] AVB 区段被改动`；`[E-AVB-20] 产物长度与分区不符（期望 %d，实际 %d）`；`[E-DEL-14] 导出被取消`；`[E-FLS-15] 刷入失败（槽位 %s），已回滚`；`[E-FLS-16] 刷入后回读不一致，已尝试恢复备份` |
 
-#### 5.4.1 AVB 处理（lead 2026-11-08：AVB 已确认存在）
+#### 5.4.1 AVB 处理（**lead 2026-11-08 结论，已推翻 v0.5 旧路径**）
 
-已确认事实（lead）：目标设备 boot.img 尾部有 **`AVBf` footer**，固件中存在 **`vbmeta.img`**。因此修补后的 boot.img 与原厂 vbmeta 不再匹配，必须处理。三条路径：
+**结论（写死）：AVB 不碰密码学，只保留语义。**
 
-| 路径 | 操作 | 适用 | 代价 |
-|---|---|---|---|
-| **A. vbmeta 解锁（主路径）** | 刷入前：`fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img` → 再刷 patched boot | 首次安装 / 有 PC 的场合 | 关闭 verity/verification（设备状态可见）；**与「全程手机本地」目标存在张力，需人类确认（→ D-15）** |
-| **B. 剥离 AVB footer（备选）** | repack 时去掉 `AVBf` footer 与相关对齐填充 → 产物无 AVB 签名 | 无 vbmeta 可刷 / 变砖救援 | bootloader 可能因「无 AVB 元数据」拒绝启动（机型相关，须真机验证） |
-| **C. 官方全量回滚** | 用固件包内 `flash.bat`（官方刷机脚本）回原厂 | 任何失败后的兜底 | 清数据；需 PC |
+| 事实 | 说明 |
+|---|---|
+| 三家实现（Magisk/KSU/APatch）都不重签 AVB | 靠**已解锁的 bootloader 跳过验证**，不做签名 |
+| vbmeta 对 boot 仅 **Chain descriptor（RSA4096）** | 真正的 **boot hash descriptor 在内嵌 vbmeta 里**（boot.img 尾部）；无魅族私钥不可能重签 |
+| 算法实为 **SHA256_RSA4096** | 我方无该私钥 → **任何「重签 AVB」的实现路径都不可行** |
+| `--disable-verification` 是**清数据来源** | 必须**禁止**（会导致用户数据被清） |
 
-**实现要求**：①步 2 必须记录「AVB 是否存在」；②步 8 产物命名区分 `-avb` / `-noavb`；③UI 在交付前必须明确展示三条路径与后果（禁止静默选 B）；④路径 A 的 fastboot 指令以文本形式给出（可复制），不在 App 内执行（App 无 fastboot 能力）。
+**刷入链（唯一主路径）**
+
+```bash
+# 仅刷 boot（双槽一次覆盖），然后重启；不触碰 vbmeta
+fastboot flash boot --slot=all sproot_patched_boot.img
+fastboot reboot
+```
+
+**明令禁止**（写进 UI 提示与质测用例，出现即判失败）：
+- `fastboot flash vbmeta ...`
+- `fastboot --disable-verity ...` / `fastboot --disable-verification ...`
+- 任何对 vbmeta / AVB 签名区的写入或重算
+
+**AVB 两条路径（收敛为 2）**
+
+| 路径 | 操作 | 结论 |
+|---|---|---|
+| **① 保留语义（唯一主路径）** | 产物与原厂镜像**等长**，AVB footer + 内嵌 vbmeta 区**逐字节原样保留**；bootloader 因已解锁而跳过验证 | ✅ 默认且唯一推荐；断言见步骤⑧ |
+| **② 剥离 footer（备选，仅救援）** | 去掉 `AVBf` footer 与对齐填充（产物变短）；适用于原厂镜像本身异常、或需要对比排障 | ⚠️ **风险**：产物不再与分区等长，可能被 bootloader 拒绝（机型相关），且**丢失去回滚校验依据**；默认隐藏，需用户显式选择并阅读警告 |
+
+**验收断言（质测可直接脚本化，纳入 §5.4 步⑧）**
+
+| # | 断言 | 判定 |
+|---|---|---|
+| AVB-1 | `stat -c%s new boot.img == 100663296`（boot）/ `== 8388608`（init_boot） | 硬断言，不等即失败 |
+| AVB-2 | 原厂镜像与产物的 `[size-fixed_avb_tail, size)` 区段逐字节相等（footer + 内嵌 vbmeta） | 硬断言，diff 非空即失败 |
+| AVB-3 | 产物头部 `ANDROID!` 魔数正确、kernel/ramdisk 段可被引擎重新解包 | 硬断言 |
+| AVB-4 | 刷入命令文本中**不含** `vbmeta` / `disable-verification` / `disable-verity` | 静态检查（UI/文档/脚本） |
+
+**实现要求**：① 步 2 记录原厂 boot/init_boot 的**精确字节长度与 AVB 区段偏移**；② 步 8 以「等长 + AVB 区段清零 diff」为硬门禁；③ UI 交付前展示「仅刷 boot、禁止 vbmeta 操作」的一键复制指令；④ 回滚路径见 §5.6-③。
 
 #### 5.4.2 交付模式（沿用 APatch `PatchMode` 四模式，A2 借鉴）
 
@@ -654,17 +824,30 @@ fun HomeScreen(state: HomeUiState, onPatch: () -> Unit) {
 | `INSTALL_TO_NEXT_SLOT` | 写备槽 + 切槽 | `root-exec` 执行 `bootctl set-active-boot-slot` + 写 `post_ota.sh`（开机成功 `mark-boot-successful` 自删） |
 | `UNPATCH` | 还原原厂 | 从内容寻址备份（sha1）写回 + 清理 AP（`apd undeploy --keep-modules`） |
 
-> 直刷三条（2/3/4）**全部走特权链**（`root-exec`），修补链本身只产 `new-boot.img`——这就是 §3.1.1 「两链唯一交点」。
+> 直刷三条（2/3/4）**全部走特权链**（`root-exec`），修补链本身只产 `new-boot.img`——这就是 §3.1.1 「两链唯一交点」。**所有直刷路径同样禁止触碰 vbmeta**（§5.4.1 禁令对 fastboot 与 dd 两条路同等生效）；PC 侧 fastboot 命令固定为 `fastboot flash boot --slot=all` / `fastboot flash init_boot --slot=all` + `reboot`。
 
 **rc 注入物的内容（固定模板，不含密钥）**：`init.sproot.rc` 只含 `on post-fs-data → exec /data/adb/apd post-fs-data --superkey-file /data/adb/sproot/key` 与 `service sproot_daemon`（`class late_start`、`user root`、不写 seclabel、`on boot start`），逐字模板与理由见 **DOC-05 §5.1**（本文不复制，避免双源漂移）。**约束**：①不内联密钥；②只引用 `/data` 下路径；③注入幂等（已存在则替换为同版本）；④失败可回滚（manifest 保存原 ramdisk 散列）。
 
-**取消与超时**：`PatchOrchestrator` 持有 `Process` 句柄（取消 `destroyForcibly()`）与每步超时（unpack 60s / patch 300s / rc+repack 90s / flash 120s）；取消后清理 staging、UI 明示「已取消，未产生任何镜像、设备未改动」。
+**取消与超时**：编排层持**取消令牌**（`AtomicBoolean`）；magiskboot 子进程可 `destroyForcibly()`，JNI 引擎在每个阶段边界检查令牌并返回 `E_CANCELLED`（内部码）；每步超时（unpack 60s / patch 300s / repack 90s）由编排层看门狗执行——JNI 内阻塞无法强杀，超时后置「修补组件可能无响应」并提示重启 App（native 崩溃风险已在 §5.2 说明）。取消后清理 staging、UI 明示「已取消，未产生任何镜像、设备未改动」。
 
-**日志落盘要求（RC F5）**：`filesDir/logs/patch-<yyyyMMdd-HHmmss>.log`，内容含：机型/内核/系统版本、每步 argv+cwd+env（脱敏：密钥替换为 `<KEY:len=48,sha256前8位>`）、stdout 与 stderr 分列、退出码、产物 sha256、耗时。日志保留最近 20 次，可一键导出 zip。
+**日志落盘要求（RC F5）**：`filesDir/logs/patch-<yyyyMMdd-HHmmss>.log`，内容含：机型/内核/系统版本、每步参数与环境（脱敏：密钥替换为 `<KEY:len=48,sha256前8位>`）、引擎进度事件、退出码、产物 sha256、耗时。日志保留最近 20 次，可一键导出 zip。
 
-**shell 与 busybox 处置（新链明确不用）**：不走 `boot_patch.sh`，不打包 busybox；解包/重打包/刷入全部是直接 `ProcessBuilder(listOf(...))` 或 `root-exec`。RC §四 已论证「最小可判定失败面越短越好」，且 `echo; exit $?` 类吞码 bug（RC P2）在脚本层无法根治——干脆去掉脚本层。
+**shell 与 busybox 处置（新链明确不用）**：不走 `boot_patch.sh`，不打包 busybox；打包/rc 注入用 **magiskboot 官方二进制**（exec），kernel patch 在 JNI 引擎内，刷入经 `root-exec`。RC §四 已论证「最小可判定失败面越短越好」，且 `echo; exit $?` 类吞码 bug（RC P2）在脚本层无法根治——干脆去掉脚本层（magiskboot 是程序而非脚本，其退出码直接透传）。
 
-### 5.5 引擎调用契约（与 C1 §1/§3 完全对齐，不新增协议）
+### 5.5 引擎契约（与 C1 §1/§3 语义完全对齐；JNI 主路径，CLI 仅诊断）
+
+**JNI 参数 ↔ C1 CLI 参数映射（同一份引擎实现，语义等价）**
+
+| C1 CLI（诊断/PC） | JNI（App 主路径） | 说明 |
+|---|---|---|
+| `--in <kernel>` | `nativeRunPatch(inPath, …)` 第 1 参 | 已解压裸 Image（非 `.img`/`.gz`） |
+| `--out <patched>` | 第 2 参 | 失败绝不产出（C1 §3） |
+| `--key <48字符>` / `--gen-key` | 第 3 参 `keyOrNull`（null = 生成） | 生成后由引擎写 `report.root_key` 并在返回值旁回传 |
+| `--json <ndjson>` | 第 4 参 `jsonPath`（可空）+ `onProgress` 回调 | **双通道**：回调实时、文件可回溯 |
+| `--workdir <dir>` | 第 5 参 `workDir`（可空） | 失败保留供诊断 |
+| 退出码 0/101/…/250 | **返回值 int**（同一枚举） | 不抛异常跨边界 |
+
+CLI 形态（**仅诊断/PC/CI 复用**，不参与 App 主路径）：
 
 ```text
 skroot-patch --in <kernel_image> --out <patched_kernel> (--gen-key | --key <48字符>)
@@ -698,7 +881,7 @@ skroot-patch --in <kernel_image> --out <patched_kernel> (--gen-key | --key <48�
 | `E-PRE-01` | 步 1 ABI/设备检查 | 本机架构不支持（需 arm64-v8a） | 否 |
 | `E-PRE-02` | 步 1 空间检查 | 存储空间不足（需 %d MB） | 是（清理后） |
 | `E-PRE-BIN` | 步 1 二进制自检 | 修补组件缺失或损坏（%s） | 否（需更新 App） |
-| `E-EXEC-03` | 步 1 可执行探针 | 本机禁止执行随包组件（已切换/未切换 JNI 模式） | 条件性 |
+| `E-PRE-03` | 步 1 JNI 加载/自检 | 修补组件不可用（架构/依赖不匹配） | 否（需更新 App） |
 | `E-IO-04/05` | 步 2 | 无法读取文件 / 空间不足 | 是 |
 | `E-IMG-06/07` | 步 3 | 镜像无法解析 / 内核压缩格式不支持 | 否（换镜像） |
 | `E-IMG-08/09/10` | 步 4 | 无 kallsyms / 已修补 / 版本不支持 | 否 |
@@ -725,7 +908,7 @@ skroot-patch --in <kernel_image> --out <patched_kernel> (--gen-key | --key <48�
 - A/B 设备走备槽：`bootctl set-active-boot-slot` 切备槽 + 写 `/data/adb/post-fs-data.d/post_ota.sh`，开机成功后 `bootctl mark-boot-successful` 并自删；失败重启自动回旧槽（APL §2.3-3 已验证的机制，直接复用）。
 - ⚠️ **不复用旧链的成功判定**：旧链 `boot_patch.sh:103-117` 的 `-b || -c && -f` 优先级坑 + else 分支静默跳过仍打印 "Successfully Flashed!"（RC F7）。新链刷入判据 = **回读 sha256 一致**（§5.4 步 8）。
 - 非 A/B 设备：**默认只导出镜像不直刷**，UI 明确提示「请联系 PC/fastboot 刷入或确认设备可回滚」，避免一次性变砖。
-- **AVB 失败回滚（lead 确认 AVB 存在）**：刷 patched boot 前后若设备拒绝启动（bootloader 校验 vbmeta），回滚三选一：①`fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img` 后重刷；②刷回 sha1 备份的原厂 boot（`UNPATCH`）；③官方固件包 `flash.bat` 全量回原厂（最彻底，清数据）。三条均写入 UI「救援指南」页（可复制指令）。
+- **AVB 失败回滚（lead 2026-11-08 结论：不碰 AVB 密码学）**：若刷入后设备拒绝启动，**不要**执行任何 vbmeta/disable-verification 操作（会清数据），按顺序：①`fastboot flash boot --slot=all <sha1 备份的原厂 boot.img>`（`UNPATCH`，最直接）；②若涉及 init_boot（A13+）同样 `fastboot flash init_boot --slot=all <原厂 init_boot.img>`；③官方固件包 `flash.bat` 全量回原厂（最彻底，清数据）。三条写入 UI「救援指南」页（可复制指令 + 明确「禁止 vbmeta 操作」警示）。
 - 刷入前二次确认：显示「当前槽位 / 目标分区 / 镜像 sha256 前 16 位 / 备份路径（sha1 索引）」。
 
 ### 5.7 错误可见性铁律（对 RC 已确证根因的逐条反制）
@@ -747,8 +930,8 @@ skroot-patch --in <kernel_image> --out <patched_kernel> (--gen-key | --key <48�
 
 | # | 铁律 | 对应 RC |
 |---|---|---|
-| L1 | **APK 二进制资产清单 + 构建期断言**：`binaries.json` 声明每个 native 资产的 `name/version/sha256/e_machine`；Gradle 任务在 `assemble` 前用 `readelf` 断言 `AArch64` 且文件存在，失败即 **build fail**（禁止 skip） | F2、F3、P0-a |
-| L2 | **禁止运行期/构建期把网络下载当交付**：所有入包可执行件要么入库、要么由本仓 CI 构建；下载只允许作为「带 sha256 校验且失败即 fail build」的辅助 | F3、P0-b |
+| L1 | **APK 二进制资产清单 + 构建期断言**：`binaries.json` 声明每个 native 资产的 `name/version/sha256/e_machine`（含 **magiskboot = Magisk v31.1 官方 ARM64**）；Gradle 任务在 `assemble` 前用 `readelf` 断言 `AArch64` 且文件存在，失败即 **build fail**（禁止 skip） | F2、F3、P0-a |
+| L2 | **禁止把「运行期网络下载」当交付**：入包可执行件（引擎/magiskboot/AP）要么由本仓 CI 构建，要么由 CI 从**官方固定版本**拉取并做 sha256 校验（失败即 fail build）；**运行期零下载** | F3、P0-b、R21 |
 | L3 | **入口能力自检，缺件即阻断**：点击修补的第一件事是 §5.2.1 自检（存在/架构/摘要/可执行/JNI 加载），失败给出「缺什么、期望在哪、怎么办」，**不进流程、不落任何产物** | F1、P0-a、P0-b |
 | L4 | **非必需资产解耦**：`kpimg` 这类「仅用于展示元信息」的资产不入包、不参与流程；SK 链不需要它（新 `boot_patch.sh` 已无 `-k kpimg`） | F4、P3 |
 | L5 | **日志即产物 + 面板常驻**：日志写文件（非内存）、stdout/stderr 分列、失败后 UI 停留在错误行、可复制/可导出；错误面板由**状态机**驱动（`FAILED` 态常驻），**不依赖 `patching/patchdone` 这类瞬态布尔** | F5、P1、F11 |
@@ -757,7 +940,7 @@ skroot-patch --in <kernel_image> --out <patched_kernel> (--gen-key | --key <48�
 **补充硬约束（来自 lead 2026-11-08 全员通报，已并入本文）**
 
 1. 架构必须规定「APK 内二进制资产清单 + 构建期断言」→ L1/L2（§5.2 实现要点 5）。
-2. 修补执行层定为 aarch64-android `.so` + JNI **或**严格校验的 `nativeLibraryDir` 可执行 → §5.2 双形态。
+2. 修补执行层定为 **aarch64-android JNI `.so`（主路径）**；子进程可执行仅作诊断/回退 → §5.2。
 3. 每步能力自检与错误可见性 → §5.2.1 + §5.4 步 1 + L3/L5。
 4. 10 条规避项（RC §三 F1–F11）逐条落位见 §7-RC 对照表。
 
@@ -789,8 +972,8 @@ IDLE ──选镜像──> INPUT_READY ──开始──> PREFLIGHT ─> UNPAC
 
 | # | 借鉴项 | 来源证据 | 在 SPRoot 的落地 |
 |---|---|---|---|
-| B1 | 管理器是**纯用户态 App**，修补在机内完成（选 boot.img → 拆 → patch → 重打 → 导出/刷入） | APL §2.1（AP 全链路）；KSU 同为机内修补形态（细节以 `docs/research/kernelsu-architecture.md` 为准） | §5.4 七步链 |
-| B2 | **native 可执行文件藏进 jniLibs**（`lib*.so` 实为 ELF），运行期用 `nativeLibraryDir` 绝对路径 exec | APL §2.2 层 2；`PatchesViewModel.kt:86-113`；**KSU 同款**（`libksud.so`，KSU 调研 §5.1-①） | §5.2 落地步骤 |
+| B1 | 管理器是**纯用户态 App**，修补在机内完成（选 boot.img → 拆 → patch → 重打 → 导出/刷入） | APL §2.1（AP 全链路）；KSU §0-1 同为机内修补 | §5.4 八步链 |
+| B2 | **native 资产随 APK 分发**：KSU 用 `libksud.so`（一次性工具 exec）；SPRoot 用 `libskrootpatch.so`（JNI 进程内）+ `libmagiskboot.so`（打包工具 exec）+ `libapd.so`→稳定路径 | APL §2.2 层 2；KSU §5.1-①；`PatchesViewModel.kt:86-113`（旧链 symlink 反例） | §5.2 资产表 |
 | B9 | **全参数化修补命令 + 内容寻址备份 + type-safe 路由** | KSU 调研 §5.1-②④⑤（`--partition/--backup/--no-install`；`ksu_backup_<sha1>`；`NavKey` 路由） | §5.4（分区显式/自动备份）、§5.6-③（sha1 备份）、§4.4（miuix-nav 路由） |
 | B3 | **修补产物与原厂备份分离**，卸载可还原 | APL §2.3-2（`ori.img`） | §5.6-③ |
 | B4 | **A/B 备槽安装 + `mark-boot-successful` 自删** | APL §2.3-3（`post_ota.sh`+`bootctl`） | §5.6-③ 原样复用 |
@@ -810,7 +993,7 @@ IDLE ──选镜像──> INPUT_READY ──开始──> PREFLIGHT ─> UNPAC
 | M5 | 修补用 shell 脚本（`boot_patch.sh`）当主链 | `set -x` 淹没关键错误；脚本失败对 UI 只呈现一个 rc | Kotlin 编排（每步类型化错误），脚本仅作参考实现 |
 | M6 | 复用 20 个 JNI supercall（APL §3.4） | SK 无对应内核接口，且 JNI 让崩溃不可隔离 | 只保留「提权」一条通道（子进程/execve）；授权走 apd 文件 |
 | M7 | KPM 嵌入（`-M/-E`）与 KPM 页 | SK 无内核运行时载体（A1 §1、B1 文档结论） | 删除 KPM 能力；模块页只保留 APM |
-| M8 | 修补 UI 只展示一块滚动日志文本 | 旧路线"闪退感"的直接来源 | 七步状态灯 + 常驻错误面板 + 日志落盘（§5.7） |
+| M8 | 修补 UI 只展示一块滚动日志文本 | 旧路线"闪退感"的直接来源 | 八步状态灯 + 常驻错误面板 + 日志落盘（§5.7） |
 | M9 | 修补写回原文件（上游引擎原地写） | 破坏原厂镜像、无法二次尝试 | 引擎 `--out` 显式输出（C1 §1）；作业副本隔离（§5.6-②） |
 | M10 | **shell 脚本 + busybox 当主链**（`boot_patch.sh`） | RC P2：`echo; exit $?` 吞退出码、abort 用 `exit 0`、检查顺序覆盖 rc——脚本层是错误失真的放大器 | **彻底去脚本层**：Kotlin 直接调工具（§5.4 总原则），不打包 busybox（RC §四） |
 | M11 | **能力被 `BuildConfig.DEBUG` 绑死**（`SKKeyProvider.kt:26` release 恒 null） | RC P0-c：release 包永不修补且无提示 | 密钥路径与构建类型解耦；CI 断言 release 包可完成一次修补 |
@@ -823,9 +1006,9 @@ IDLE ──选镜像──> INPUT_READY ──开始──> PREFLIGHT ─> UNPAC
 | 维度 | KernelSU（实测） | AP（本地实证） | SPRoot 决策 |
 |---|---|---|---|
 | 管理器栈 | Kotlin 2.4.20 + Compose BOM `2026.09.00` + Material3 `1.5.0-alpha28` + **Miuix 0.9.4** + `miuix-nav`；compileSdk/targetSdk 37，**minSdk 31** | Kotlin + Compose Material3 | **Kotlin 2.4.20 + Compose BOM 2026.08.00 + miuix 0.9.4 + miuix-nav**，minSdk 26，material3 保持 1.4.0（exclude，§4.2/§4.6-U2） |
-| 特权执行者 | `libksud.so`（Rust CLI）经 `nativeLibraryDir` 的绝对路径 **exec**，argv+stdout/stderr 通信 | `apd`（Rust）+ JNI supercall | **双形态**：引擎走 `libskrootpatch.so` exec（与 KSU 同构，§5.2-形态A）；持久特权走 `/data/adb/apd`（稳定路径，§3.5） |
-| boot.img 解包/回包 | **纯 Rust 自研**（`android-bootimg` crate），APK 里**没有** magiskboot/kptools | 外挂 kptools（构建期下载） | **引擎自研（C++/JNI，lead 已裁）**，无第三方 ELF（§5.3） |
-| 修补命令 | 单命令全参数化：`boot-patch -b/-o/--kmi/--partition/-m/-u/-f/--backup/--no-install` | shell 脚本 `boot_patch.sh` | 全参数化由 Kotlin 编排（§5.4）；**采纳 KSU 三个参数语义**：分区显式指定、强制备份、只改配置不重注入（→ §5.4/§8 D-13） |
+| 特权执行者 | `libksud.so`（Rust CLI）经 `nativeLibraryDir` 的绝对路径 **exec**，argv+stdout/stderr 通信 | `apd`（Rust）+ JNI supercall | **JNI 引擎（修补，进程内）+ `/data/adb/apd`（特权，稳定路径）**；引擎不承担特权（§5.2） |
+| boot.img 解包/回包 | **纯 Rust 自研**（`android-bootimg` crate），APK 里**没有** magiskboot/kptools | 外挂 kptools（构建期下载） | **magiskboot（Magisk v31.1 官方 ARM64）+ 自研 bootimg 交叉校验/回退**（人类指令，§5.3） |
+| 修补命令 | 单命令全参数化：`boot-patch -b/-o/--kmi/--partition/-m/-u/-f/--backup/--no-install` | shell 脚本 `boot_patch.sh` | 全参数化由 Kotlin 编排 + JNI（§5.4）；**采纳 KSU 三个参数语义**：分区显式指定、强制备份、只改配置不重注入（→ §5.4/§9 D-13） |
 | root 授权 | **无交互预授权**：`/data/adb/ksu/.allowlist`（内核持久化，二进制 magic）；未授权 su 直接拒绝、只记 sulog | 内核 kstorage + JNI 授权 | **用户态 allow_list（E4）+ socket SO_PEERCRED**；同样**无交互弹窗**（SK 零常驻内核，无 pending 队列）→ 记为已接受的 UX 限制（§6.3 注） |
 | 管理器自身 root | `ksud debug su`（libsu `Shell.Builder.build(libksud.so,"debug","su")`） | `truncate` supercall shell | **`apd root-exec`**（唯一入口，§3.5.2） |
 | 模块 | `/data/adb/modules` + module.prop + installer.sh（Magisk 语义） | `/data/adb/ap/` + apd | 沿用 apd（DOC-05），语义与 KSU/Magisk 同构 |
@@ -864,25 +1047,29 @@ IDLE ──选镜像──> INPUT_READY ──开始──> PREFLIGHT ─> UNPAC
 | # | 风险 | 触发条件 | 影响 | 缓解 | 归属 |
 |---|---|---|---|---|---|
 | R1 | **引擎 arm64 交叉编译失败/体积超标**（asmjit+capstone 依赖） | NDK 工具链不兼容、asmjit 在 arm64 主机异常 | 无引擎可用=项目阻塞 | task-3 先出可复现编译命令与产物校验；失败即回退「引擎用 x86 预构建只做离线验证 + 手机侧另寻实现」 | task-3 |
-| R2 | **boot.img/AVB 格式覆盖不足**（boot header v4、vendor_boot、`init_boot`、异形 ramdisk、厂商校验） | 目标机型（魅族 21 等）分区/AVB 布局非标准 | 解包失败或刷入后不开机 | 自研 bootimg 按 AOSP 规范实现 + 首批机型真机矩阵；AVB 三路径（§5.4.1）明确展示；失败有 sha1 备份回滚 | 架构/task-3/qa |
-| R3 | **自研 bootimg 的工程量与正确性**（替代成熟 magiskboot/kptools 的风险） | 自研解析/回包有 bug | 产物结构损坏 → 不开机 | ①以 `upstream/KernelPatch/tools/bootimg.c`（GPL-2.0 参考）做对照测试；②单元测试覆盖 header v0–v4 样本；③「解包→原样回包」应先字节一致（除对齐填充）作为回归基线；④真机小范围先验证 | task-3/qa |
+| R2 | **boot.img/AVB 格式覆盖不足**（boot header v4、`init_boot`、异形 ramdisk、厂商校验） | 目标机型（魅族 21 等）分区布局非标准 | 解包失败或刷入后不开机 | **主路径用 magiskboot v31.1（格式覆盖最广）+ 自研 bootimg 交叉校验**；首批机型真机矩阵；**AVB 只保留语义（§5.4.1），等长 + 区段 diff 双硬门禁**；失败有 sha1 备份回滚 | 架构/task-3/qa |
+| R3 | **打包链正确性**（magiskboot 与自研 bootimg 双实现一致性） | 两实现解析/回包结果不一致 | 产物结构损坏 → 不开机 | ①magiskboot 用 Magisk v31.1 官方 ARM64 + sha256 锁定（构建期断言）；②**交叉校验硬门禁**（§5.3.1 PKG-1~PKG-5）；③「解包→原样回包」必须字节一致（含 AVB 区段）作为回归基线；④真机小范围先验证；⑤SK 引擎许可证已解决（proprietary + 作者授权，§5.3.3） | task-3/qa |
+| R21 | **magiskboot GPL-3.0 合规** | 随 APK 分发第三方 GPL 程序 | 合规风险 | 按「独立程序聚合」：APK `NOTICE` 标注来源/v31.1/GPL-3.0/源码链接；不改写其源码、不与其链接；保留原始二进制 + sha256；**禁用 AIK 与非官方 Windows 版**（§5.3.3） | task-8/人类 |
 | R4 | **首装鸡生蛋**：刷入需要 root，而 root 来自刷入 | 新用户首次安装 | 无法完成闭环 | 三条降级路径：①有 PC 时 fastboot 刷导出的 img（不作为主推但保留）②已有 Magisk/其他 root 时直接 dd ③A/B 备槽 + 回滚（§5.6-③）；UI 明确「本 App 不联网、不代刷，需你确认设备可回滚」 | 架构 |
 | R5 | **miuix 实验性 API 变更** | 升级 miuix | UI 返工 | 版本钉死 + design system 门面（§4.6-R1） | task-4 |
-| R6 | **工具链新版本兼容**（AGP 9.5.1 / Kotlin 2.4.21 / compileSdk 37） | CI 环境 | 构建红 | CI 冒烟先行（task-8）；Gradle/AGP/JDK 成对锁定 | task-8 |
+| R6 | **工具链新版本兼容**（AGP 9.4.1 / Kotlin 2.4.20 / compileSdk 37） | CI 环境 | 构建红 | CI 冒烟先行（task-8）；Gradle/AGP/JDK 成对锁定（与 app-client 定版一致） | task-8 |
 | R7 | **密钥安全**：日志/备份/崩溃上报泄露 48 位密钥 | 任何字符串拼接失误 | 权限被他人获得 | 密钥只在 `SukeyProvider` 与引擎 argv 出现（argv 在 /proc 可见——**已知弱点**，见 D-4）；日志脱敏白名单；卸载清 Keystore | 架构/task-4 |
 | R8 | **CMP 与 AndroidX Compose 混用** | 引入第三方 Compose 库 | 编译/运行时崩 | §4.2 约束 + CI 依赖审查 | task-4/task-8 |
 | R9 | **内核支持域窄**（SK 依赖 kallsyms/CFI/华为 HKIP 绕过） | 冷门内核 | 大量机型不支持 | 引擎退出码→人话映射 + 「机型不支持」诚实提示 + 支持矩阵文档 | task-3/qa |
 | R10 | **旧路线失败根因已确证**（RC）：引擎从未入包 + 错误被吞 | 已发生 | 项目一度误判「SK 机制不可行」 | 本文 §5.7 六条铁律逐条反制；RC §三 F1–F11 逐项落位见表 7.1 | ✅ 已闭环（本文） |
 | R11 | **kernel 压缩格式导致重打包尺寸/偏移变化**（`Image.gz`/`Image.lz4`） | 解包产物 `kernel` 是压缩态，而引擎只吃**已解压裸 Image** | patch 后体积变化 → 重打包偏移/校验和变化 → 刷入后不开机 | §5.4 步 3 显式「解压归一 + 记录原压缩参数」；repack 后做「大小 ≤ 分区、头魔数、sha256 记录」三重断言；首批真机各机型验证（→ D-10） | task-3/qa |
-| R12 | **子进程 exec 受限**（Android 10+ 私有目录禁 exec） | **已基本消解**：引擎走 JNI、无第三方工具；仅「诊断模式」需 exec | 诊断模式不可用（不影响主路径） | 诊断模式失败仅记录；主路径 JNI（§5.2） | task-3 |
+| R12 | **子进程 exec 受限**（Android 10+ 私有目录禁 exec） | 影响 magiskboot（主路径工具）与「诊断模式」引擎 | magiskboot 无法执行 → 打包不可用（可回退自研 bootimg） | magiskboot 从 `nativeLibraryDir` 绝对路径 exec（KSU 同款已证）；失败自动回退自研 bootimg 并告警（§5.3.1 回退规则） | task-3/task-5 |
 | R13 | **能力被 `BuildConfig.DEBUG` 绑死**（RC P0-c：release 密钥恒 null） | 任何「debug 才启用」的开关 | release 包功能缺失且静默 | `SukeyProvider` 不读 `BuildConfig.DEBUG`；CI 增加 release 包端到端 case（RC §5.2 断言 6） | task-4/task-8 |
 | R14 | **UI 日志随页面/状态卸载**（RC P1 的机制） | 日志状态用瞬态布尔驱动 | 用户看不到错误 | §5.7-L5：状态机 `FAILED` 常驻 + 日志落盘 + 独立 LogViewer | task-4 |
-| R15 | **`init_boot` 与 `boot` 分区拆分**（Android 13+ ramdisk 迁到 init_boot） | 目标机型为 A13+ | 选错镜像 → rc 注入到没有 ramdisk 的 boot.img，开机不拉起 AP（但内核已 patch 成功，root 可用、模块不可用） | 步 2 记录分区来源与 `ro.build.version.sdk`；步 7 断言「unpack 出的确有 ramdisk.cpio」否则给 `E-RC-18` 并建议改用 init_boot；UI 双镜像引导（→ D-10/D-12） | task-3/task-5/qa |
+| R15 | **`init_boot` 与 `boot` 分区拆分**（Android 13+ ramdisk 迁到 init_boot） | 目标机型为 A13+ | 选错目标 → rc 注入到无 ramdisk 的分区，开机不拉起 AP（内核 patch 成功、root 可用、模块不可用） | **已裁（D-12）**：步 2 同时探测两者；步 7 **优先 init_boot 的 ramdisk、boot 回退**，实际目标记入 manifest；两者皆无则报 E-RC-18 并明示 | task-3/task-5/qa |
 | R16 | **rc 注入厂商兼容性**（`init.rc` 结构非标准、`import` 位置、second_stage 校验） | 厂商定制 ROM（魅族 21 等） | 开机不执行 AP → 模块能力全失效 | 注入点=文件尾部（最小侵入）+ 原文件入 manifest；失败可「跳过注入」；真机矩阵优先魅族 21（DOC-05 R1 同源风险） | task-5/qa |
-| R17 | **AVB 与「无 PC」目标的张力**：主刷入路径需 `fastboot ... flash vbmeta`（PC） | 首次安装 | 「手机本地」只能覆盖修补，不能覆盖首次刷入 | 明确产品口径（D-15）：修补 100% 本地；首次刷入接受「一次性 PC/fastboot」；App 内提供可复制指令 + 校验（sha256/等长） | leader/人类 |
+| R17 | **AVB 刷入路径被误用**（历史上曾有 vbmeta/disable-verification 方案，已推翻） | 任何 vbmeta 写入或 `--disable-verification` 都会**清数据/触发 bootloader 状态变更** | 用户数据丢失、设备状态异常 | **已裁（lead 2026-11-08）**：唯一主路径 `fastboot flash boot --slot=all`；**禁止**任何 vbmeta/disable-verity/disable-verification；产物必须等长 + AVB 区段逐字节保留（§5.4.1 AVB-1~AVB-4 硬断言）；UI/文档/脚本静态检查禁词 | ✅ 已裁 |
 | R19 | **CI 唯一构建源带来的反馈延迟** | 本地禁止编译（人类硬规则） | 每个改动要等 CI 反馈，AI 无法本地验证 | §8：CI 分 job + 失败即早停；本地仅跑静态检查（`ktlint`/`cargo check` 不允许产出 APK）；每轮改动附「CI 预期结果」清单 | task-8 |
 | R20 | **Keystore/密码入私仓的安全边界** | 方案 A（人类批准） | 仓库泄露即签名权泄露 | 仅 private 仓库；`keystore.properties` 不入公开镜像；CI secrets 仅 release job 使用；轮换预案 | 人类/task-8 |
 | R18 | **管理器误当 root 提供者**（绕过 root-exec 自行提权） | 开发者图省事 | 密钥暴露面扩散、审计缺失 | 代码评审门禁：`grep -r "execve\|Runtime.exec(\"su\")\|ProcessBuilder(\"su\")"` 在 newapp 中必须 0 命中（除 root-exec 封装外） | 架构/task-4 |
+| R22 | **密钥 ABI 混用**（本项目 47+NUL vs `Skroot-Next` 48 字节无 NUL） | 用户拿另一分支 patched 镜像套本项目密钥（或反之） | **提权静默失败**（无崩溃、无内核日志，极难排查） | §3.5.4 醒目注记 + `SukeyProvider` 只存 47 字符语义密钥 + 诊断页显示 `key ABI = 47+NUL`；质测强制用例「错体系密钥 → 提权失败且静默」；Release Notes/FAQ 写明「密钥不可跨体系套用」 | 架构/task-4/task-7 |
+| R23 | **`engine/` 再许可合规风险**（SKRoot proprietary 移植 + 整仓 AGPL-3.0 发布） | 人类授权未明确覆盖「可按 AGPL 再分发」 | 公开发布即构成对 proprietary 部分的越权许可 | §11.2 三种处置；**未确认前公开发布物必须剥离 `engine/`**；`release.yml` 加发布物清单门禁；`engine/` 派生文件不加 SPDX/AGPL 头 | 人类/律师 + task-8 |
+| R24 | **apd 依赖 UNKNOWN 许可**（`prop-rs` / `prop-rs-android` 0.2.0，git 依赖，无 LICENSE） | 上游不补许可 | `resetprop` 相关发布物法律状态不明 | **已缓解（lead 裁决）**：做成可选 feature `resetprop`（默认开）；`--no-default-features` 产出干净构建；`apd.yml` 每次编译校验该路径；**公开版走 --no-default-features**；人类待办：授权或自研替代（§11.4.4） | 人类 + task-6 |
 
 ### 7.1 RC §三 十项规避清单（F1–F11）落位对照
 
@@ -890,54 +1077,205 @@ IDLE ──选镜像──> INPUT_READY ──开始──> PREFLIGHT ─> UNPAC
 |---|---|---|
 | F1 | 缺件被静默跳过 → 需入口能力自检（存在/可执行/架构） | §5.2.1、§5.4 步 1、L1/L3 |
 | F2 | 引擎交付形态与契约脱节 → 定为 JNI 主路径 + CI 断言架构 | §5.2（JNI 为主）、§5.2 实现要点 6、L1 |
-| F9 | 私有目录 exec 被拦 → 引擎走 JNI、无第三方工具；仅诊断模式需 exec 目标在 nativeLibraryDir | §5.2 资产表、R12 |
-| F3 | 构建期网络下载当交付 → 禁 skip-on-failure | §5.7-L2、R3 |
+| F3 | 构建期网络下载当交付 → 禁 skip-on-failure（magiskboot 由 CI 按 sha256 拉官方 release，失败即 fail build） | §5.7-L2、R21 |
 | F4 | 非必需资产（kpimg）硬依赖 → 降级为 optional | §5.7-L4 |
 | F5 | 失败无日志落盘、面板卸载 → 日志即产物 | §5.4「日志落盘要求」、L5、R14 |
 | F6 | `echo; exit $?` 吞码、abort 用 exit 0 → 去脚本层 | §5.4「shell 与 busybox 处置」、L6 |
 | F7 | 未校验产物就宣布成功 → 成功判据=可验证事实 | §5.4 步 6/8、§5.6-③ 注、L6 |
 | F8 | 能力被 DEBUG 绑死 → release 可用 | R13 |
-| F9 | `filesDir` 内 exec 被拦 → exec 目标须在 `nativeLibraryDir` | §5.2 形态 A 实现要点 2、R12 |
-| F9 | `filesDir` 内 exec 被拦 → exec 目标须在 `nativeLibraryDir` | §5.2 形态 A 实现要点 2、R12 |
+| F9 | `filesDir` 内 exec 被拦 → **magiskboot**（打包主路径工具）与诊断模式引擎的 exec 目标须在 `nativeLibraryDir`；补丁引擎走 JNI | §5.2 资产表、R12 |
 | F10 | 壳层传参歧义（`sh -c` vs 直传）→ 单一调用路径 | §5.2 实现要点 3、§5.4 总原则 |
 | F11 | 日志/环境不可复现 → 记录 cmdline/env/cwd、stderr 分列 | §5.4「日志落盘要求」 |
 
 ---
 
-## 8. 待决项（需 leader/人类裁决或专项调研）
+## 8. 构建与产物策略（**CI 唯一可信构建源**）
+
+> **人类硬规则（2026-11-08）**：**禁止本地编译 APK / 镜像**，所有构建统一走 GitHub Actions。本节为实施基线。
+
+### 8.1 原则
+
+| # | 原则 | 落地 |
+|---|---|---|
+| G1 | **单一可信构建源 = CI**：任何交付物（APK / 引擎 .so / AP 二进制 / 镜像）只能由 CI 产出，本地不得作为交付来源 | 仓库内不放 `app-debug.apk`/`*.so` 二进制产物；`.gitignore` 显式忽略构建输出 |
+| G2 | **本地只做静态检查** | 允许：`ktlint`/`detekt`/`cargo check`/`clang-tidy` 等**不产出交付物**的检查；禁止：`assembleDebug`/`cargo build --release` 产物入库或分发 |
+| G3 | **产物可追溯** | 每个 artifact 名含 `版本号 + git commit short + run id`；同时产出 `SHA256SUMS` |
+| G4 | **失败即早停** | 构建矩阵按「静态检查 → 引擎 → AP → APK → 签名」顺序，前面失败不跑后面（省时间、错误清晰） |
+| G5 | **不可信输入不参与构建** | 所有第三方二进制（若有）必须 sha256 固定；网络下载仅作辅助且失败即 fail（RC F3） |
+| G6 | **分支策略：`v2` 为唯一开发分支**（lead 2026-11-08 决定） | `main` 是旧代码 + app-client 早期推送，**不作为测试/构建对象**；所有 workflow 的 push/PR 触发只监听 `v2`（及 tag） |
+
+### 8.2 CI 工作流清单（GitHub Actions）
+
+| 工作流 | 触发 | 产出 | 关键断言 | 归属 |
+|---|---|---|---|---|
+| `ci-static.yml` | PR / push | 无产物（只报告） | ktlint/detekt、`cargo fmt --check`/`clippy`、`clang-format --dry-run`；依赖解析 `checkDebugAarMetadata`（防 U1/U2） | task-8 |
+| `engine.yml` | `engine/**` 变更 | `libskrootpatch.so`（arm64）+ `skroot-patch`（x86-64 诊断） | `readelf -h` 断言 `Machine: AArch64`；`--selftest` 返回 0；导出符号清单；sha256。**依赖 apt 包 `qemu-user`（提供 `qemu-aarch64`，可运行静态 arm64 产物）做契约自检**——⚠️ 不要写成 `qemu-user-static`（ubuntu-latest 上无安装候选，这正是首次 CI 失败原因） | task-3/8 |
+| `magiskboot.yml`（新） | 版本/来源变更时 | `libmagiskboot.so`（arm64） | 来源固定 **Magisk v31.1 官方 ARM64 release**；sha256 校验；`readelf -h` 断言 AArch64；**禁止** AIK / 非官方 Windows 版（人类指令） | task-3/8 |
+| `apd.yml` | `app/apd/**` 变更 | `libapd.so`（arm64） | `file`/`readelf` 断言 aarch64；`--version` 冒烟（qemu 或静态解析）；`--locked` 构建 | task-6/8 |
+| `newapp.yml` | `newapp/**` 变更 | `app-debug.apk` / `app-release.apk`（签名） | `aapt2 dump badging` 断言 minSdk/compileSdk/ABI；`apksigner verify`；APK 内含 `lib/arm64-v8a/libskrootpatch.so` **与 `libmagiskboot.so`** 断言；`NOTICE` 含 magiskboot GPL-3.0 声明 | task-4/8 |
+| `release.yml` | tag `v*` | Release assets + SHA256SUMS | 上述全部 + 版本号与 tag 一致 | task-8 |
+
+> **产物依赖顺序**：`engine.yml` / `magiskboot.yml` / `apd.yml` 的 artifact 需要被 `newapp.yml` 消费（`actions/download-artifact` 或 release 资产）。**禁止**在 `newapp.yml` 里现场编译 Rust/C++（避免工具链漂移与时间不可控）。
+
+### 8.3 产物管理与发布
+
+| 项 | 规格 |
+|---|---|
+| Artifacts | CI 保留 30 天；命名 `sproot-<component>-<version>-<commit8>-<runid>` |
+| 校验 | 每次构建产出 `SHA256SUMS`；APK 另附 `apksigner verify --print-certs` 输出 |
+| 发布 | 仅 tag 触发 `release.yml`；Release Notes 含：版本、commit、引擎/AP 版本、支持的 kernel 区间、已知机型限制 |
+| 版本绑定 | `version.properties` 里的 `versionCode/versionName` 在 CI 中由 tag 校验（不一致即 fail） |
+
+### 8.4 密钥与签名（方案 A：keystore 入 private 仓库，人类已批准）
+
+| 项 | 做法 | 风险控制 |
+|---|---|---|
+| keystore | `sproot-release.jks`（人类已生成于 `~/.ssh/`）提交进 **private 仓库** | 仅 private 仓库；公开镜像/分叉不得包含 |
+| 密码 | `keystore.properties`（不入库？→ 方案 A 明确允许入私仓）由 CI 从仓库读取 | 建议仍用 Actions Secrets 覆盖仓库内值（双保险）；`SPROOT_SIGNING.md` 记录轮换步骤 |
+| 签名校验 | CI 内 `apksigner verify --strict` + 打印证书指纹 | 指纹与人类登记值比对 |
+| 泄露预案 | 立即轮换 keystore + 重新发布；旧版本标注撤销 | 人类决策 |
+
+### 8.5 风险（本地不可验证）
+
+| # | 风险 | 缓解 |
+|---|---|---|
+| C1 | AI/开发者**无法本地验证编译结果**，编译错误只能等 CI 反馈 | 每轮变更前先跑「静态检查 + 依赖解析」最小 job；PR 描述里写「CI 预期通过项」；失败日志贴回上下文 |
+| C2 | CI 环境与真机差异（NDK/SDK 版本） | 工具链版本在仓库锁定（Gradle wrapper、`ndkVersion`、rust-toolchain.toml）；CI 镜像版本随 PR 显式升级 |
+| C5 | **AGP 9 新 DSL（`newDsl`）与 KGP 的已知冲突**（首次 CI 构建失败原因，lead 2026-11-08 已修 `gradle.properties` 并推 v2 重跑） | `gradle.properties` 中的开关配置入库并附注释；CI 失败首查 `gradle.properties` 与 AGP/KGP 版本对；把「最小 Android 工程能 assembleDebug」作为 M1 门禁（避免后续所有 job 被同一问题反复阻塞） |
+| C3 | 首次 CI 全绿前的「盲改」成本 | 先建最小骨架（仅编译一个空 APK）打通流水线，再逐步加断言（里程碑 M1） |
+| C4 | Release 构建无人本地试装 | Release 也必须由 CI 出；真机安装验证列入 qa 门禁（task-7） |
+
+---
+
+## 9. 待决项（需 leader/人类裁决或专项调研）
 
 | ID | 事项 | 选项 | 建议 | 裁决人 | 阻塞谁 |
 |---|---|---|---|---|---|
 | D-1 | 新工程 `compileSdk` 下限 | 37 / 更低 | **37**（miuix `minCompileSdk=37` 硬要求）；**已随 app-client 定版落定**（AGP 9.4.1 / Kotlin 2.4.20 / compileSdk 37 / minSdk 26 / Gradle 9.7.1 / JDK 21） | ✅ 已定 | — |
-| D-2 | magiskboot 引入与许可证 | magiskboot 主选（GPL-3.0）+ kptools 辅（GPL-2.0）/ 仅 kptools + 自研 cpio | **magiskboot 主选**（E5 要求 rc 注入，cpio 编辑不可绕过）；前提是 D-3 判为开源可分发 | leader + 架构 | task-3/task-5 |
-| D-3 | 项目整体许可证策略 | 开源（GPL 兼容）/ 闭源分发 | 若闭源，则**禁止**打包 GPL 二进制 → 必须自研 bootimg/cpio（工量↑），且 kptools 亦受限；**建议开源托管** | 人类 | 全部打包工作 |
+| D-2 | **打包工具链**（人类新指令 2026-11-08） | 自研 bootimg / magiskboot / 两者结合 | **✅ 已定**：**引入 magiskboot（Magisk v31.1 官方 ARM64）**作打包主路径（unpack/repack/cpio），**原图作模板**；自研 bootimg 保留为交叉校验/回退；**禁用 AIK 与非官方 Windows 版**（§5.3） | ✅ 人类已定 | task-3/task-5 |
+| D-3 | **许可证策略** | 开源 / 闭源 | **✅ 已定（人类 2026-11-08）**：自有代码 = **AGPL-3.0-only**（SPDX）；仓根 `LICENSE` 全文 + `NOTICE` + `README` 许可段已落盘；**遗留：`engine/` 为 SKRoot proprietary 移植，再许可范围需人类/律师确认**（§11.2：未覆盖则发布前剥离） | ✅ 人类已定 + ⚠️ 再许可待确认 | 发布门禁 |
 | D-4 | ~~密钥经 `argv` 传给引擎~~ **已解决** | — | 改为「临时 0600 文件 + 用后即删」（DOC-05 §4.2）；`root-exec --superkey-file` 同样走文件；**密钥不进 argv** | ✅ 架构已定 | — |
 | D-5 | 首装刷入路径的产品口径 | 仅导出镜像 / 支持直刷（经 root-exec，需已有 root/AP）/ 引导 fastboot | **导出为默认，直刷为高级选项**（风险与体验平衡） | leader + 人类 | task-5 |
 | D-6 | 目标机型首批清单 | 魅族 21（已知）+ 其他 | 需人类给首批 3~5 台；否则 R15/R16 无法收敛 | 人类 | qa/task-3 |
 | D-7 | 模块页 v0.1 是否保留 | 保留（AP 子命令透视）/ 先只读状态 | **保留只读 + 安装/启停**，卸载与动作脚本下版 | leader | task-4/task-6 |
 | D-8 | miuix 组件 API 细节 | 调研文件/自测 | 以 `docs/research/miuix-integration.md` + 首次真机截图回归为准 | research/task-4 | task-4 |
 | D-9 | ~~引擎最终形态裁定~~ **已定（lead 2026-11-08）** | JNI 进程内为主，子进程为诊断/回退 | **落定**：`libskrootpatch.so` JNI 主路径；CLI `main()` 保留供诊断/PC/CI（§5.2） | ✅ lead 已裁 | task-3 按此实现 |
-| D-10 | kernel 压缩态处理 + 镜像来源 | ①解压后 patch 再按原参数压回（默认）②要求用户提供已解压镜像 ③引擎扩展支持压缩态 | **①**；同时需确认 magiskboot unpack 是否已解压 kernel；首批机型验证重打包后尺寸 | 架构 + task-3 | task-3/task-5 |
+| D-10 | kernel 压缩态处理 + 镜像来源 | ①打包链内解压→patch→按原参数压回（默认）②要求用户提供已解压镜像 ③扩展支持压缩态 | **①**（magiskboot 主路径内置解压/回压；自研 bootimg 回退时同样实现）；首批机型验证重打包后尺寸 | 架构 + task-3 | task-3/task-5 |
 | D-11 | 是否保留「自定义 48 位密钥」入口 | 只自动生成 / 允许用户输入（强校验） | **允许输入但默认生成**（密钥即隐藏目录，用户自定义可能撞弱口令 → 加熵提示） | leader | task-4 |
-| D-12 | `init_boot` 场景的镜像引导 | 只接受 boot.img / 同时支持 boot.img 与 init_boot.img（A13+）/ 自动探测 | **自动探测 + 明确提示**：A13+ 机型 ramdisk 在 `init_boot`，需用户提供该分区镜像（否则 rc 注入失败、模块不可用）；内核 patch 仍在 boot.img | leader + task-5 | task-5/qa/task-7 |
+| D-12 | `init_boot` 场景的镜像引导 | 只接受 boot.img / 同时支持 boot.img 与 init_boot.img（A13+）/ 自动探测 | **已裁（lead 2026-11-08）**：本机 `init_boot.img`（8MB，ramdisk 形态）存在 → **RcInject 优先 init_boot 的 ramdisk**（A13+ 通用 ramdisk 在 init_boot），`boot.img` ramdisk 回退；**实现中两者都探测并在 manifest 记录实际目标** | ✅ lead 已裁 | task-3/task-5/task-7 |
+| **D-13** | 采纳 KSU 三个修补参数语义 | 采纳 / 不采纳 | **采纳**：①`--partition` 显式指定目标分区（不猜）②`--backup` 强制备份 ③`--no-install` 只改配置不重注入；在 Kotlin 编排层实现（引擎 CLI 可增可选参数） | 架构（已建议） | task-3/task-5 |
+| **D-14** | **rc 注入是否做**（lead「SK 不改 ramdisk」与 AP 自启的张力） | A：流水线内 RcInject（magiskboot cpio）/ B：最终镜像 ramdisk 一字不改，AP 不自启 | **✅ 已裁（lead 2026-11-08：采纳 A）**：固定表述「引擎 patch kernel 段；**同一流水线的 RcInject 步骤**写 ramdisk（`init.sproot.rc` + `init.rc` import）；两步骤独立，SK 内核运行时零 ramdisk 依赖」。隐藏性：ramdisk 只加 2 文件、不碰 policy、不改 AVB 逻辑 | ✅ lead 已裁 | task-3/task-5 |
+| **D-15** | **AVB/首次刷入与「无 PC」目标** | ①接受首次刷入需 PC ②尝试纯手机路径 ③卡刷包兜底 | **✅ 已裁（lead 2026-11-08，AVB 结论更新）**：MVP 首次刷入必须 PC，命令**仅** `fastboot flash boot --slot=all` + `reboot`；**禁止任何 vbmeta / disable-verity / disable-verification**（清数据来源）；「全程无 PC」列 **P2 增量**（应用内 dd 需已 root/Shizuku）；修补本身 100% 本地 | ✅ lead 已裁 | task-5/qa |
+| **D-16** | 卡刷包（APK 兼作 recovery zip）是否本期做 | 做 / 不做 | **做**（成本低、救援价值高）；依赖 CI 产出 update-binary（§8.2 可加 job） | leader | task-8 |
 
 ---
 
-## 9. 交付拆解与依赖关系（与任务板对齐）
+## 10. 交付拆解与依赖关系（与任务板对齐）
 
 | 任务 | 与本方案的关系 | 关键依赖 |
 |---|---|---|
 | task-1（本文） | 架构基线 | — |
 | task-2 | 根因已确证并已并入本文（§5.7/§7.1/A-18~A-22）；剩余：给最小可验证链 | ✅ 已消费其结论 |
-| task-3 | 落地 §5.2/§5.3 的二进制产物（引擎 + magiskboot + kptools）+ `--selftest` + `engine_run()` 双入口 | 依赖 D-2/D-3/D-9/D-10 |
-| task-4 | 落地 §4（miuix）与 §3.1 L1/L2 骨架（含常驻错误面板/日志页/部署向导） | 依赖 D-1、§4.2 依赖矩阵、R13/R14/R18 |
-| task-5 | 落地 §5.4 八步链（含 rc 注入）+ §3.5.3 首装三段式 | 依赖 task-3 产物 + D-5/D-12 |
+| task-3 | 落地 §5.2/§5.3：引擎 = **JNI 主路径 + CLI 诊断**；**magiskboot v31.1 集成（exec）** + **自研 bootimg 交叉校验/回退**（等长保留/压缩归一/RcInject）+ 12 退出码 | 依赖 D-2/D-9/D-10（D-2/D-3 已裁） |
+| task-4 | 落地 §4（miuix）与 §3.1 L1/L2 骨架 + §3.6 状态机/能力门禁 + 常驻错误面板/日志页 | 依赖 D-1、§4.2 依赖矩阵、R13/R14/R18 |
+| task-5 | 落地 §5.4 八步链（RcInject 必做，优先 init_boot）+ §5.4.1 AVB + §3.5.3 首装三段式 | 依赖 task-3 产物 + D-5/D-12/D-15（D-12/D-15 已裁） |
 | task-6 | 落地 §3.1 L4（本文已消费其 NEW-DOC-05 结论，含 E1–E5） | ✅ 已对齐（DOC-05 v1.0 草案） |
-| task-7 | 把 §5.6/§5.7/§7.1/§5.8/§3.5 转成测试项 | 本文 + RC §5.2 断言表 + DOC-05 §9 |
-| task-8 | CI：依赖解析冒烟 + 引擎/magiskboot 构建 + **架构/断网/入包断言** + APK 签名 | §4.6-R3、§5.7-L1/L2、A-22 |
-| task-9（新） | 契约 v1.1 正文（E1–E5 修订） | 本文 §6.4 作为差异依据；与 DOC-05 §4.6 同源 |
+| task-7 | 把 §5.6/§5.7/§7.1/§5.8/§3.5/§3.6 转成测试项；**新增密钥 ABI 错配用例（§3.5.4/R22）** | 本文 + RC §5.2 断言表 + DOC-05 §9 |
+| task-8 | **CI 唯一构建源**（§8）：`ci-static/engine/magiskboot/apd/newapp/release` 六工作流 + 架构/断网/入包断言 + 签名 + **LICENSE/NOTICE 断言（§5.3.4④/§11.3）** | §4.6-R3、§5.7-L1/L2、A-22、A-30 |
+| task-9（新） | 契约 v1.1 正文（已 FROZEN；本文 §6.4 为差异依据） | ✅ 已冻结（2026-11-08 21:23） |
 
-**建议的里程碑顺序**：M1 = 工程能编译出 miuix 一屏（task-4+task-8）→ M2 = 引擎/magiskboot arm64 产物 + 静态校验（task-3）→ M3 = 八步链打通（task-5）→ M4 = 真机刷入/回滚（task-5+qa）→ M5 = 首次部署 T2 + 授权与模块（task-5+task-6）。
+**建议的里程碑顺序**：M1 = 最小 CI 流水线跑通（空 APK 可编译，task-4+task-8）→ M2 = 引擎 arm64/JNI 产物 + 自研 bootimg 单测（task-3）→ M3 = 八步链打通（task-5）→ M4 = 真机刷入/AVB/回滚（task-5+qa）→ M5 = 首次部署 T2 + 授权与模块（task-5+task-6）。
+
+---
+
+## 11. 许可与合规（**AGPL-3.0 定案 + SKRoot 再许可风险**）
+
+> 依据：人类 2026-11-08 决定「自有代码用 **AGPL-3.0**」；lead 要求同时标注 `engine/` 的再许可风险。本节是**发布前必读**。
+
+### 11.1 现状（已落盘）
+
+| 文件 | 内容 | 状态 |
+|---|---|---|
+| 仓库根 `LICENSE` | SPDX 头 `AGPL-3.0-only` + 说明 + **AGPL-3.0 全文**（≈34 KB，自 SPDX 官方文本拷贝） | ✅ 已落盘 |
+| 仓库根 `NOTICE` | 第三方声明：magiskboot（GPL-3.0，源码链接）、Kotlin/Compose/AndroidX/miuix（Apache-2.0）、asmjit（Zlib）、capstone（BSD-3）、cJSON（MIT）、**SKRoot（proprietary + 风险提示）**、KernelPatch/APatch/KernelSU（仅参考未复制）、禁用项（AIK/非官方 magiskboot） | ✅ 已落盘 |
+| 仓库根 `README.md` | 项目简介 + **许可段（SPDX `AGPL-3.0-only`）** + 再许可风险提示 + 风险与能力边界摘要 + 目录说明 | ✅ 已落盘 |
+
+**许可兼容性结论**：
+- **AGPL-3.0-only 与 GPL-3.0 兼容**：AGPL-3.0 §13 第 2 段明确允许与 GPL-3.0 作品链接/组合；magiskboot 仍按「独立程序聚合」分发（不链接、不改写），双保险。
+- Apache-2.0 / MIT / BSD-3 / Zlib 均可与本项目 AGPL-3.0 组合分发，但**必须保留其声明**（`NOTICE`）。
+- **GPL-2.0-only 与 AGPL/GPL-3.0 不兼容**（例如若未来复制 KernelPatch 的 `bootimg.c`，会引入冲突）→ 因此本项目只「参考」不「复制」；若必须复制，需改用 `GPL-2.0-or-later` 或放弃该代码。
+
+### 11.2 ⚠️ 核心风险：`engine/` 的再许可（必须由人类/律师确认）
+
+**事实**：
+- `engine/` 是**移植自 SKRoot 上游源码**（`abcz316/SKRoot-linuxKernelRoot`，**proprietary，无 LICENSE/SPDX**）。
+- 本仓库整体声明 **AGPL-3.0-only** = 等于把 `engine/` 这部分也按 AGPL 对外授权。
+- 人类答复是「我有作者授权，可以调用它」——**「可调用」≠「可再许可/可按 AGPL 对外分发」**。
+
+**三种处置（按授权范围选择）**：
+
+| 情形 | 判定 | 处置 |
+|---|---|---|
+| **A. 授权文本明确覆盖「可再许可 / 可按 AGPL（或任意 OSI 许可）分发」** | 合规 | 保持现状：整仓 AGPL-3.0；`NOTICE` 第 7 条保留「已获授权」陈述（不附授权原文） |
+| **B. 授权只覆盖「调用/修改/自用」，未覆盖再分发再许可** | **不完全合规** | **公开发布前必须把 `engine/` 从发布物中剥离**：①仓库转为 private，或 ②公开仓用 `engine/` 的**二进制/接口占位**（`libskrootpatch.so` 由 CI 从私有源构建），源码不公开；自研部分（管理器/打包链/文档）仍可按 AGPL 公开 |
+| **C. 仅以二进制形式分发 engine，主张不构成衍生作品** | 法律定性不确定 | 需律师意见；在结论出来前按 B 处理（更保守） |
+
+**工程侧强制约束（立项即生效，不依赖法律结论）**：
+1. `engine/` 目录**不得**出现在对外发布物（Release source tarball / 公开镜像）中，除非 A 条件成立。
+2. CI 的 `release.yml` 增加「发布物清单检查」：若 `engine/` 源码被打包进发布物，**必须**同时存在人类签署的授权确认记录（否则 fail）。
+3. 任何 `engine/` 派生代码的文件头**不得**自行加 `SPDX-License-Identifier: AGPL-3.0` 声明（会构成对外授权声明）——保持无 SPDX，由根 `LICENSE` 的例外说明（§11.2）承接。
+4. `NOTICE` 第 7 条与 `LICENSE` 头部说明必须**同步更新**（CI 断言：两处均含 `proprietary` 与 `SKRoot`）。
+
+### 11.3 发布前检查清单（Release 门禁，逐项打勾）
+
+- [ ] 仓库根 `LICENSE` 为 AGPL-3.0 全文且含 SPDX 头；`NOTICE` 与 APK 内一致
+- [ ] `README` 许可段 SPDX 标识正确（`AGPL-3.0-only`）
+- [ ] **SKRoot 再许可授权已确认**（A 情形）或 **`engine/` 已从发布物剥离**（B/C 情形）
+- [ ] magiskboot：来源 v31.1 / GPL-3.0 / 源码链接 / sha256 齐全且未修改
+- [ ] capstone 包内 LICENSE.TXT 已核对并附带
+- [ ] 无 GPL-2.0-only 代码被复制进仓库（KernelPatch/APatch/KernelSU 仅参考）
+- [ ] 发布物不含真实用户密钥、不含 keystore/密码
+- [ ] Release Notes 含「刷机风险与能力边界」摘要（§1.4）与准确 fastboot 命令
+- [ ] **AP 二进制 `apd` 的 Rust 依赖已闭环**：`apd/THIRD_PARTY_LICENSES.md` 已更新；`extattr`（GPL-2.0-only）确认已移除；**`prop-rs` / `prop-rs-android`（UNKNOWN）已解决或含 resetprop 的构建不发布**（§11.4）
+
+### 11.4 apd（AP 二进制）Rust 依赖合规（115 个，2 项阻断）
+
+> 来源：`apd/THIRD_PARTY_LICENSES.md`（sys-guard 生成，`Cargo.lock` + `cargo metadata --filter-platform aarch64-linux-android`，v2 commit `8b28e87`）。根 `NOTICE` §8 已汇总。
+
+**11.4.1 汇总（按项计次）**：MIT 100 · Apache-2.0 88 · Zlib 5 · Unlicense 5 · ISC 2 · LLVM-exception 2 · BSD-3-Clause 1 · BSL-1.0 1 · CC0-1.0 1 · Unicode-3.0 1 · **UNKNOWN 2**。合计 115 包；**除标记项外全部宽松许可，与 AGPL-3.0 兼容**。
+
+**11.4.2 已消除不兼容**：`extattr 1.0.0`（crates.io，**GPL-2.0-only**，与 AGPL-3.0 不兼容）→ 已用 raw `libc` 的 `lsetxattr/lgetxattr` 等价替换（`apd/src/restorecon.rs`，wire 行为不变），并从 `Cargo.toml`/`Cargo.lock` 移除。**该项已闭环，保留记录供审计**。
+
+**11.4.3 ⚠️ 阻断项：2 个 UNKNOWN（`prop-rs` / `prop-rs-android` 0.2.0）**
+
+| 项 | 事实 | 影响 |
+|---|---|---|
+| 来源 | git：`AndroidPatch/restprops` rev `6f57231…` | — |
+| 许可 | **UNKNOWN**：上游仓库无 LICENSE 文件、`Cargo.toml` 无 `license` 字段 | 法律状态不明 = 不得对外分发 |
+| 用途 | `resetprop` 功能（bionic property area 操作） | 不易直接替换；移除会破坏模块生态脚本兼容 |
+| 检测盲区 | `quality/static/check_licenses.py` 只校验 `LICENSES.md` 指纹，**查不到 UNKNOWN** | 必须人工清单勾选 |
+
+**处置（三选一，需人类/architect 决策）**：
+1. **向上游作者要求补 LICENSE 或书面授权**（推荐；与 SKRoot 授权凭证一并归档）；
+2. **自研最小替代**（仅需 bionic property area 读写；task-6 评估工期）；
+3. 移除 `resetprop` 功能（**不建议**，破坏模块兼容）。
+
+**门禁**：闭环前**含 `resetprop` 的发布物不得公开发布**；`apd/Cargo.toml` 已标注 `license = "AGPL-3.0-only"`（与根 LICENSE 一致）。
+
+**11.4.4 工程处置（lead 2026-11-08 夜间裁决，✅ 已落地于 v2）**
+
+裁决：**不删 resetprop、不阻塞开发**；把 `prop-rs`/`prop-rs-android` 做成**可选 feature**，为发布侧留干净路径。
+
+| 项 | 实现（v2 HEAD 实况） | 验收 |
+|---|---|---|
+| `apd/Cargo.toml` | `[features] default = ["resetprop"]`、`resetprop = ["dep:prop-rs", "dep:prop-rs-android"]`；两个 crate 均声明为直接依赖且 `optional = true`（同一 git rev，Cargo 去重为单实例） | `cargo metadata` 显示 features 正确；`cargo tree --no-default-features` 下 `prop-rs` 0 命中 |
+| 代码条件编译 | `apd/src/resetprop.rs` 改为 **façade**：`#[cfg(feature="resetprop")] #[path="resetprop_prop_rs.rs"]` 编译真实实现；`#[cfg(not(...))]` 编译 **stub**，调用该子命令时**显式报「feature 未启用」**（不静默降级）。`cli.rs` 的 argv0 分派与 `Commands::Resetprop` 无需改动（façade 保持同一 API） | `cargo check` 默认与 `--no-default-features` **均通过**（本地 WSL 在 `05e626a` 上实测两次 Finished） |
+| CI 防腐化 | `apd.yml` 每次执行 `cargo check --locked --no-default-features --target aarch64-linux-android`（**仅编译校验，不替换发布产物**） | CI 每次跑该步；失败即红 |
+| 发布策略 | **对外公开发布必须用 `--no-default-features` 构建**（依赖树不含 UNKNOWN）；默认构建（含 resetprop）仅限内部/自用，**不作为 release candidate** | Release Notes 标注构建 feature 集；`release.yml` 校验产物来源 |
+
+> 说明：`prop-rs` 与 `prop-rs-android` 是同一 `AndroidPatch/restprops` 仓库内的两个 crate（同 rev）。v2 当前把两者都声明为直接 optional 依赖并在 feature 中逐一声明——与 lead 的 `dep:prop-rs` 写法一致，比「只 gate 直接依赖、靠传递消失」更显式，二者行为等价。
+
+**仍未闭环（人类 2026-11-09 待办）**：`prop-rs` **授权 / 自研替代 二选一**，与 SKRoot 授权一并归档；在此之前的对外发布一律走 `--no-default-features`。
 
 ---
 
@@ -971,15 +1309,32 @@ IDLE ──选镜像──> INPUT_READY ──开始──> PREFLIGHT ─> UNPAC
 | A-24 | rc 注入物模板（`init.sproot.rc` 全文 + `import` 追加位置 + 不写 seclabel 的理由 + `class late_start` 选择） | `docs/NEW-DOC-05-模块与守护方案.md` §5.1 |
 | A-25 | 引擎侧提权实现事实：do_execve filename 逐字节 strcmp、47+NUL 落盘、失败静默 | `engine/src/patch_do_execve.cpp:76-98`、`engine/src/skroot_patch_main.cpp:312-317`（经 DOC-05 §4.1/附录 A 索引，本文未另行反汇编复核） |
 | A-26 | **KSU 架构实测**：管理器薄壳 + `libksud.so`（Rust）exec、无 magiskboot/kptools（自研 Rust `android-bootimg`）、`boot-patch` 全参数化、无交互预授权 allowlist、`ksu_backup_<sha1>` 内容寻址备份、`boot-patch-v2` 未接；含「5 借鉴 + 3 改造」清单 | `docs/research/kernelsu-architecture.md` §0/§2/§3/§5（基线 `730f6446`） |
-| A-27 | **契约 v1.1 三方会签 + 两条边界**（修补链/特权链分离；`libskrootpatch.so` 与 `libapd.so` 职责不可互换）；lead 2026-11-08 通报 | lead 团队消息（2026-11-08）——**非文件证据，属决议记录**；契约正文由 task-9 落盘 |
-| A-28 | **app-client 工具链定版**：AGP 9.4.1 / Kotlin 2.4.20 / compileSdk 37 / minSdk 26 / Gradle 9.7.1 / JDK 21 | lead 2026-11-08 通报（app-client 已按 miuix 调研结论定版） |
+| A-27 | **契约 v1.1 三方会签 + 两条边界**（修补链/特权链分离；`libskrootpatch.so` 与 `libapd.so` 职责不可互换）；lead 2026-11-08 通报 | lead 团队消息（2026-11-08）——**非文件证据，属决议记录**；契约正文由 task-9 落盘（**已 FROZEN 2026-11-08 21:23**） |
+| A-28 | **app-client 工具链定版**：AGP 9.4.1 / Kotlin 2.4.20 / compileSdk 37 / minSdk 26 / Gradle 9.7.1 / JDK 21 | lead 2026-11-08 通报（newapp 骨架已落盘） |
+| A-29 | **APatch 管理器实测**：10 态状态机 + 页面能力门禁、`PatchMode` 四模式、`ori.img` 闭环、superkey-as-argv 反模式、双路径拼串反模式、KPM 双视图、APK 兼卡刷包 | `docs/research/apatch-manager-architecture.md` §1.3/§2.2/§3.2/§5.1/§5.2（基线 `e8e4651c`） |
+| A-30 | **人类硬规则**：禁止本地编译 APK/镜像，构建统一走 GitHub Actions；keystore 入 private 仓库（方案 A） | 人类指令（lead 2026-11-08 转达）——决议记录，无文件证据 |
+| A-31 | **AVB 结论（2026-11-08 更新，推翻 v0.5 旧路径）**：三家实现均不重签 AVB，靠解锁 bootloader 跳过验证；vbmeta 对 boot 仅 **Chain descriptor（RSA4096）**，boot hash descriptor 在**内嵌 vbmeta**，算法 **SHA256_RSA4096**，无魅族私钥不可重签；**`--disable-verification` 是清数据来源，禁用**。刷入仅 `fastboot flash boot --slot=all` + reboot；禁止任何 vbmeta/disable-verity/disable-verification | lead 2026-11-08 通报（**结论记录**；真机复核 footer 偏移与分区尺寸 100663296/8388608） |
+| A-32 | **lead 四项裁决（2026-11-08）**：D-14 采纳解读 A（引擎 patch kernel + 同流水线 RcInject 写 ramdisk，两独立步骤，SK 运行时零 ramdisk 依赖；ramdisk 只加 2 文件、不碰 policy、不改 AVB 逻辑）；D-15 MVP 首次刷入必须 PC；D-12 `init_boot.img`（8MB）存在→RcInject 优先 init_boot、boot 回退；D-3 改为「人类已获作者授权」（见 A-34） | lead 团队消息（**决议记录**，无文件证据） |
+| A-34 | **D-3 许可证定论（人类 2026-11-08）**：「我有作者授权，可以调用它」→ SKRoot 源码 proprietary（无 SPDX），本项目使用已获上游作者授权（授权记录由人类持有，不入库），无开源阻塞 | 人类答复（经 lead 转达，**决议记录**） |
+| A-35 | **engine CI 依赖更正**：`engine.yml` 需 apt 安装 **`qemu-user`**（提供 `qemu-aarch64`，可运行静态 arm64 产物）；**不是 `qemu-user-static`**（ubuntu-latest 无安装候选，首次 CI 失败原因） | lead 2026-11-08 通报（**更正记录**） |
+| A-36 | **人类新指令（2026-11-08）**：打包**用 magiskboot（ARM64）**，**禁用 AIK（Android.Image.Kitchen，不支持 Linux 6.0+ 内核）与非官方 Windows 版 magiskboot**；magiskboot 作独立可执行组件（「独立程序聚合」+ NOTICE，GPL-3.0 不传染） | 人类指令（经 lead 转达，**决议记录**） |
+| A-37 | **magiskboot 来源锁定**：Magisk **v31.1** 官方 ARM64 release 产物；sha256 记录于 `binaries.json`；构建期 `readelf` 断言 AArch64 | 人类指令 + CI 规格（版本号由人类指定） |
+| A-38 | **人类许可决定（2026-11-08）**：自有代码 = **AGPL-3.0**（默认 `AGPL-3.0-only`）；要求 LICENSE 落全文而非仅名字；README 加许可段 | 人类指令（经 lead 转达，**决议记录**） |
+| A-39 | **⚠️ `engine/` 再许可风险**：`engine/` 移植自 SKRoot 上游（proprietary、无 LICENSE）；整仓 AGPL 发布 = 对其再许可；人类「可调用」授权未必然覆盖「可改许可对外分发」→ 未覆盖时须剥离 `engine/` 或改二进制分发（法律定性待确认） | lead 2026-11-08 风险提示（**决议记录**）；§11.2 三种处置 |
+| A-40 | **密钥 ABI 双体系**：本项目 = **47 字符 + NUL**（对外展示 48 位）；`Skroot-Next` 风格 = **48 字节无 NUL、按实际长度比较** → **不可混用**，错配表现为提权静默失败 | lead 2026-11-08 调研通报（**结论记录**）；本文 §3.5.4 + R22 |
+| A-41 | **仓根合规文件已落盘**：`LICENSE`（SPDX `AGPL-3.0-only` + AGPL-3.0 全文，34 KB 自 SPDX 官方文本）、`NOTICE`（第三方清单 + SKRoot 风险 + 禁用项 + 发布检查清单）、`README.md`（许可段 + 风险摘要） | 本工作区文件（2026-11-08 创建） |
+| A-42 | **apd Rust 依赖清单**：`apd/THIRD_PARTY_LICENSES.md`（115 个 Android 目标传递依赖，`Cargo.lock` + `cargo metadata --filter-platform aarch64-linux-android`，commit `8b28e87`）；全部 permissive 除：`extattr`（GPL-2.0-only，已移除并等价替换）、`prop-rs`/`prop-rs-android`（UNKNOWN，**阻断发布**） | sys-guard 2026-11-08 交付；根 `NOTICE` §8 + 本文 §11.4 |
+| A-43 | **v2 apd feature 隔离实况**（commit `d45822b` / `05e626a`）：`Cargo.toml` features `default=["resetprop"]` + 两 crate optional；`resetprop.rs` façade + `resetprop_prop_rs.rs`；`apd.yml` 有 `cargo check --no-default-features --target aarch64-linux-android`；本地 `cargo check` 默认与 `--no-default-features` 均 Finished | 本工作区 WSL 实测（2026-11-08）+ `origin/v2` |
+| A-33 | **构建与分支**：人类硬规则「禁止本地编译，统一 GitHub Actions」；`v2` 为唯一开发分支（`main` 为旧代码，不作测试对象）；首次 CI 失败根因 = AGP9 `newDsl` × KGP 冲突，lead 已修 `gradle.properties` | lead 团队消息（**决议记录**）；workflow YAML 由 task-8 落盘 |
 
 ## 附录 B · 与其它任务的边界（避免越界写盘）
 
 - 本文只写 `docs/NEW-DOC-01-*`；**不修改** `engine/`（task-3）、`newapp/`（task-4/5/8）、`docs/NEW-DOC-02/03/05/06`（task-2/3/6/7）。
-- 本文对 task-6（apd/守护）只定义**接口边界**（§3.1 L4 + §3.3-B），不定义其实现细节。
-- 本文对 task-7（质测）只提交**可测断言**（§5.6/§5.7/§5.8），不写测试用例正文。
+- 本文对 task-6（apd/守护）只定义**接口边界**（§3.1 L4 + §3.5），其实现细节与部署清单以 `docs/NEW-DOC-05-模块与守护方案.md` 为准。
+- 本文对 task-7（质测）只提交**可测断言**（§3.6/§5.6/§5.7/§5.8/§8.2），不写测试用例正文。
+- 本文对 task-8（CI）给出**目标流水线规格**（§8），具体 workflow YAML 由 task-8 编写。
+- 调研输入（只读引用，不改写）：`docs/research/{patch-failure-rootcause,miuix-integration,kernelsu-architecture,apatch-manager-architecture}.md`。
 
 ---
 
-*完 · 架构（architect） · 2026-11-08 · v0.1 草案（待合并 docs/research/* 三个调研文件后升 v1.0）*
+*完 · 架构（architect） · 2026-11-08 · **v1.1.2 定稿**（新增：密钥 ABI 注记 §3.5.4/R22、刷机风险与能力边界 §1.4、仓根 LICENSE/NOTICE/README、§11 许可与合规（AGPL-3.0-only + `engine/` 再许可风险）、§11.4 apd Rust 依赖合规与 2 项 UNKNOWN 阻断/R24）*
