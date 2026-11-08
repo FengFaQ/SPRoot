@@ -300,10 +300,44 @@ UI 铁律：**原始码与可读文案同时展示**（错误区"错误码"字�
 > `install_status` 为 **v2 待定**占位（客户端容忍缺失）。排序按 `id` 字典序稳定；stdout 纯 JSON 数组，
 > 日志只走 stderr/logcat；无模块时输出 `[]` + exit 0。
 
-**写操作（子命令待 AP 定稿，客户端已按此接线）**：
-- `apd module install <zip路径> [--json]`：App 先把用户选的 zip 复制到私有 cache 并校验 PK 头/大小，再传绝对路径；超时 300s；
-- `apd module uninstall <id> [--json]`；`apd module enable|disable <id>`；
-- 全部经 `root-exec`；`--json` 输出 schema 未定稿期间，客户端**只依赖 exit code**，并把原始 stdout/stderr 常驻展示（不猜进度字段）。
+**写操作（子命令已由 sys-guard 定稿，v2 `af55f55` / CI 42490703820；详见 NEW-DOC-05 §3.1.2）**：
+- `apd module install <zip路径> --json`：App 先把用户选的 zip 复制到私有 cache 并校验 PK 头/大小，再传绝对路径；超时 300s。
+  成功：`{"ok":true,"id","name","version","versionCode","metamodule","enabled","update_pending","active_after_reboot","changed","previous_version","uncompressed_bytes","avb_untouched"}`；
+  失败：`{"ok":false,"code":<exit>,"id","error"}`，**exit code = code**。
+- `apd module uninstall <id> --json`：`{"ok":true,"id","remove_pending","applied_after_reboot","avb_untouched"}`；不存在 → **110**。
+- `apd module enable|disable <id>`；全部经 `root-exec`。
+- 两阶段语义（解包 → `modules_update/<id>`，**下次 post-fs-data 原子生效**）：UI 明确展示 `update_pending` / `active_after_reboot` / `remove_pending`，不谎称"立即生效"。
+- 客户端解析：`MiniJson.objectOf` 取扁平字段（上面 schema 全扁平，够用）；`ok=false` 时用 `error` 文案 + 退出码映射，原始 stdout/stderr 常驻可复制。
+
+#### 7A.1.1 安装/卸载失败 → 中文可操作提示（G-04 延伸）
+
+实现：`core/ModuleFailureHints.kt`。输入 = exit code + apd 原始 stdout/stderr（**不依赖 JSON schema**），
+输出 = 「可能原因 / 建议动作 / 依据」三元组，UI 逐条常驻展示。退出码优先（契约 §8.5），其次关键字匹配：
+
+| 触发 | 可能原因 | 建议动作 |
+|---|---|---|
+| exit=2 | AP 用法错误 | 视为客户端 bug，上报原始输出（勿重试） |
+| exit=110 | 目标模块不存在 | 刷新列表确认 ID；手动删除过则重启 AP |
+| exit=111 | zip 损坏 | 重新下载并校验 sha256 |
+| exit=112 | module.prop 缺失/字段非法 | zip 根目录直接含 module.prop；id 只含字母数字与 `_`/`-` |
+| exit=113 | 不安全 zip（zip-slip/符号链接） | 已拒绝安装；换可信来源 |
+| exit=114 | 超限（zip>512MiB / 解压>1GiB / 条目>10万） | 精简模块或换更小版本 |
+| exit=115 | 磁盘空间不足 | 清理 /data（预留 2 倍解压体积） |
+| exit=116 | 模块 ID 冲突 | 先卸载同 ID 或改 module.prop 的 id |
+| exit=120 | 模块安装脚本失败 | 模块自身脚本问题：查看原始 stderr/日志，联系作者 |
+| exit=121 | 解包/IO（含 booting 门禁） | 设备完整启动后重试 |
+| exit=122 | state 写入失败 | 重新部署 AP / 检查 /data 权限 |
+| exit=124 | 超时 | 检查空间后重试；持续超时上报 |
+| exit=125 | 密钥无效/内核静默拒绝 | 重新「修补 → 刷入」；不自动重试 |
+| exit=126 / 127 | 不可执行 / 命令不存在 | 「设置 → AP 部署」重新部署 |
+| 输出含 `module.prop` | 模块包缺 module.prop | 确认 zip 根目录直接含 module.prop（不是套文件夹） |
+| `already exists` / `duplicate` / `conflict` | 模块 ID 冲突 | 先卸载同 ID 或改 module.prop 的 id |
+| `no space` / `ENOSPC` | 空间不足 | 清理 /data（预留 2 倍解压体积） |
+| `permission denied` / `EACCES` / `EPERM` | 权限不足（FS/SELinux） | 确认 AP 已部署且内核已修补；刚刷机先重启 |
+| `avc: denied` / `selinux` | SELinux 拒绝 | 收集完整 avc 行上报，重新部署/修补 |
+| `bad zip` / `corrupt` / `End of central directory` | zip 损坏 | 重新下载并校验 sha256 |
+| `not found` / `no such file` | 目标不存在 | 刷新列表确认 ID；重启 AP |
+| 其他 | 未识别失败 | 保留原始输出上报，**不猜测** |
 
 客户端解析规则（`core/Modules.kt`）：
 - **容忍缺字段**：缺失显示 "—"，未知字段忽略；
@@ -371,6 +405,13 @@ CI 行为（硬失败）：
 4. 升级 native 必须**显式修改 native.lock.json 并单独 commit**（可审计、可回溯）。
 
 > 效果：同一 commit + 同一 lock ⇒ 同一 sha256 的 APK，满足 T8 与 release 门禁的按 commit 断言。
+
+### 7A.6 产物可复现（T8，按 qa 容差口径）
+
+- **native 字节一致**：由 `app/native.lock.json` 保证（run_id + sha256 精确锁定，见 §7A.5）。
+- **APK 条目内容一致**：CI 构建时设置 `SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)`（commit 时间基准）；
+  签名块与 zip 时间戳不可避免带来整体字节差异，qa 的 `compare_ci_runs.py` 采用「逐条目内容一致」容差判定，
+  因此**不追求 APK 字节完全一致**，只要求：native sha256 一致 + APK 内条目内容一致 + 版本/签名一致。
 
 ---
 

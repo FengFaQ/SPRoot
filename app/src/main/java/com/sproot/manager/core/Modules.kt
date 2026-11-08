@@ -65,7 +65,7 @@ data class ModuleInfo(
     }
 }
 
-/** 模块操作（列表/安装/卸载/启停）统一结果；成功失败都带原始输出 */
+/** 模块操作（列表/安装/卸载/启停）统一结果；成功失败都带原始输出与中文可操作提示 */
 data class ModulesResult(
     val ok: Boolean,
     val exitCode: Int,
@@ -73,10 +73,25 @@ data class ModulesResult(
     val modules: List<ModuleInfo> = emptyList(),
     val rawStdout: String = "",
     val rawStderr: String = "",
+    val hints: List<ModuleFailureHints.Hint> = emptyList(),
+    val parsed: Map<String, String> = emptyMap(),
 ) {
     companion object {
-        fun failure(exitCode: Int, message: String, stdout: String, stderr: String): ModulesResult =
-            ModulesResult(false, exitCode, message, emptyList(), stdout, stderr)
+        fun failure(
+            exitCode: Int,
+            message: String,
+            stdout: String,
+            stderr: String,
+            operation: String,
+        ): ModulesResult = ModulesResult(
+            ok = false,
+            exitCode = exitCode,
+            message = message,
+            modules = emptyList(),
+            rawStdout = stdout,
+            rawStderr = stderr,
+            hints = ModuleFailureHints.analyze(exitCode, stdout, stderr, operation),
+        )
     }
 }
 
@@ -92,7 +107,7 @@ object ModuleRepository {
         val result = run(context, superKey, listOf("module", "list", "--json"), timeoutSec = 60)
         val stdout = result.stdout
         if (result.timedOut) {
-            return ModulesResult.failure(ApdClient.EXIT_TIMEOUT, "apd module list 超时（124）：AP 未在 60s 内返回", stdout, result.stderr)
+            return ModulesResult.failure(ApdClient.EXIT_TIMEOUT, "apd module list 超时（124）：AP 未在 60s 内返回", stdout, result.stderr, "读取列表")
         }
         if (result.exitCode != ApdClient.EXIT_OK) {
             val message = when (result.exitCode) {
@@ -103,7 +118,7 @@ object ModuleRepository {
                 else -> "apd module list 失败（exit=${result.exitCode}）"
             }
             AppLog.error(TAG, "$message；stdout=${stdout.take(500)}")
-            return ModulesResult.failure(result.exitCode, message, stdout, result.stderr)
+            return ModulesResult.failure(result.exitCode, message, stdout, result.stderr, "读取列表")
         }
         val parsed = MiniJson.arrayOfObjects(stdout).map { ModuleInfo.fromMap(it) }
         if (parsed.isEmpty()) {
@@ -117,6 +132,13 @@ object ModuleRepository {
                     modules = emptyList(),
                     rawStdout = stdout,
                     rawStderr = result.stderr,
+                    hints = listOf(
+                        ModuleFailureHints.Hint(
+                            cause = "apd 输出与客户端 schema 不一致",
+                            action = "把原始输出发给开发者（客户端按 sys-guard 定稿的 v1 schema 解析；可能是 apd 版本不一致，先重新部署 AP）",
+                            basis = "JSON 解析失败",
+                        ),
+                    ),
                 )
             }
         }
@@ -136,6 +158,9 @@ object ModuleRepository {
             message = if (ok) "已${if (enable) "启用" else "禁用"} $moduleId" else result.describe(),
             rawStdout = result.stdout,
             rawStderr = result.stderr,
+            hints = if (ok) emptyList() else ModuleFailureHints.analyze(
+                result.exitCode, result.stdout, result.stderr, if (enable) "启用" else "禁用",
+            ),
         )
     }
 
@@ -150,16 +175,21 @@ object ModuleRepository {
             listOf("module", "install", zip.absolutePath, "--json"),
             timeoutSec = 300,
         )
-        val ok = !result.timedOut && result.exitCode == ApdClient.EXIT_OK
-        val parsedMessage = MiniJson.objectOf(result.stdout)["message"]
-            ?: MiniJson.objectOf(result.stdout)["status"]
+        val obj = MiniJson.objectOf(result.stdout)
+        val serverOk = obj["ok"]?.toBooleanStrictOrNull()
+        val ok = !result.timedOut && result.exitCode == ApdClient.EXIT_OK && serverOk != false
         val message = when {
             result.timedOut -> "安装超时（124）：apd 未在 300s 内完成，请查看日志"
-            ok -> "安装完成${parsedMessage?.let { "：$it" } ?: ""}"
-            result.exitCode == ApdClient.EXIT_ESCALATION -> "安装失败：密钥无效或需重新修补（125），不自动重试"
-            result.exitCode == ApdClient.EXIT_NOT_FOUND -> "安装失败：AP 不存在（127），需先部署"
-            result.exitCode == ApdClient.EXIT_NOT_EXECUTABLE -> "安装失败：AP 不可执行（126），需重新部署"
-            else -> "安装失败（exit=${result.exitCode}）：${result.stderr.take(500).ifBlank { "无 stderr" }}"
+            ok -> buildString {
+                append("安装完成")
+                obj["id"]?.let { append("：id=").append(it) }
+                obj["version"]?.let { append("，version=").append(it) }
+                obj["active_after_reboot"]?.let { append("，重启后生效=").append(it) }
+                obj["update_pending"]?.let { append("，update_pending=").append(it) }
+                obj["avb_untouched"]?.let { append("，AVB 未触碰=").append(it) }
+            }
+            else -> "安装失败（exit=${result.exitCode}）：" +
+                (obj["error"] ?: result.stderr.take(500).ifBlank { "无 stderr" })
         }
         AppLog.info(TAG, "module install exit=${result.exitCode} ok=$ok")
         return ModulesResult(
@@ -168,20 +198,38 @@ object ModuleRepository {
             message = message,
             rawStdout = result.stdout,
             rawStderr = result.stderr,
+            hints = if (ok) emptyList() else ModuleFailureHints.analyze(
+                if (result.timedOut) ApdClient.EXIT_TIMEOUT else result.exitCode,
+                result.stdout, result.stderr, "安装",
+            ),
+            parsed = obj,
         )
     }
 
     /** 卸载模块（root-exec） */
     fun uninstall(context: android.content.Context, superKey: String, moduleId: String): ModulesResult {
         val result = run(context, superKey, listOf("module", "uninstall", moduleId), timeoutSec = 120)
-        val ok = !result.timedOut && result.exitCode == ApdClient.EXIT_OK
+        val obj = MiniJson.objectOf(result.stdout)
+        val ok = !result.timedOut && result.exitCode == ApdClient.EXIT_OK && obj["ok"]?.toBooleanStrictOrNull() != false
         AppLog.info(TAG, "module uninstall $moduleId → exit=${result.exitCode} ${result.describe()}")
         return ModulesResult(
             ok = ok,
             exitCode = if (result.timedOut) ApdClient.EXIT_TIMEOUT else result.exitCode,
-            message = if (ok) "已卸载 $moduleId" else result.describe(),
+            message = when {
+                result.timedOut -> "卸载超时（124）"
+                ok -> buildString {
+                    append("已卸载 $moduleId")
+                    obj["remove_pending"]?.let { append("（remove_pending=").append(it).append("）") }
+                    obj["applied_after_reboot"]?.let { append("，重启后生效=").append(it) }
+                }
+                else -> "卸载失败（exit=${result.exitCode}）：" + (obj["error"] ?: result.describe())
+            },
             rawStdout = result.stdout,
             rawStderr = result.stderr,
+            hints = if (ok) emptyList() else ModuleFailureHints.analyze(
+                result.exitCode, result.stdout, result.stderr, "卸载",
+            ),
+            parsed = obj,
         )
     }
 

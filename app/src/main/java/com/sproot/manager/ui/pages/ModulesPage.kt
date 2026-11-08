@@ -263,6 +263,28 @@ fun ModulesPage(modifier: Modifier = Modifier) {
                         VSpacer(6)
                         InfoRow("操作结果", it)
                     }
+                    // 中文可操作提示（G-04 延伸）：原始码/原始输出 + 可能原因 + 建议动作
+                    result?.hints?.takeIf { it.isNotEmpty() }?.let { hints ->
+                        VSpacer(8)
+                        hints.forEachIndexed { index, hint ->
+                            InfoRow(
+                                label = "可能原因 ${index + 1}",
+                                value = hint.cause + "\n建议：" + hint.action + "\n依据：" + hint.basis,
+                                valueColor = MiuixTheme.colorScheme.onSurfaceContainer,
+                            )
+                            VSpacer(4)
+                        }
+                    }
+                    // 安装/卸载返回的结构化字段（apd --json 定稿：ok/id/version/update_pending/…）
+                    result?.parsed?.takeIf { it.isNotEmpty() }?.let { fields ->
+                        VSpacer(6)
+                        fields.forEach { (key, value) ->
+                            if (key != "error") InfoRow(key, value, monospace = true)
+                        }
+                        fields["error"]?.let {
+                            InfoRow("error", it, valueColor = MiuixTheme.colorScheme.error)
+                        }
+                    }
                     result?.takeIf { !it.ok }?.let {
                         VSpacer(8)
                         InfoRow("错误", it.message, valueColor = MiuixTheme.colorScheme.error)

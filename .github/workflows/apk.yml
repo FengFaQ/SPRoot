@@ -132,7 +132,14 @@ jobs:
           echo "NOTICE bytes=$(stat -c %s "$A/NOTICE")"
 
       - name: Build release APK
-        run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
+        env:
+          SOURCE_DATE_EPOCH: ${{ github.event.head_commit.timestamp }}
+        run: |
+          # T8（产物可复现）：把 commit 时间固定为构建时间基准；
+          # native 字节一致由 app/native.lock.json 保证；APK 采用 qa 的「逐条目内容一致」容差判定。
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
+          ./gradlew :app:assembleRelease --no-daemon --stacktrace
       - name: Verify APK signature
         run: |
           set -e
