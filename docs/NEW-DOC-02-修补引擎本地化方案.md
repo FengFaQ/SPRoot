@@ -136,16 +136,18 @@ llvm-strip --strip-all <build>/jni/libskpatchjni.so
 
 | 产物 | 路径 | 大小 | sha256（前 32 位） | 类型 |
 |---|---|---|---|---|
-| 静态可执行 | `engine/dist/libskrootpatch-arm64-exec.so` | **2,909,504 B** | `e94a8186163b77180d7eb8f80ee74ff9` | `ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped` |
-| JNI 共享库 | `engine/dist/libskpatchjni-arm64.so` | **2,975,528 B** | `a55c6ed08c37cb25f27e532dd2e16dc9` | `ELF 64-bit LSB shared object, ARM aarch64, dynamically linked`（NEEDED 仅 `libm.so/libdl.so/libc.so`） |
+| 静态可执行（工具/排障，**不进 APK**） | `engine/dist/skroot-patch-arm64`（源码产物 `build/arm64/exec/skroot-patch`） | **2,909,504 B** | `e94a8186163b77180d7eb8f80ee74ff9` | `ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped` |
+| **JNI 共享库（APK 内 `libskrootpatch.so`）** | `engine/dist/libskrootpatch-arm64-jni.so`（源码产物 `build/arm64/jni/libskrootpatch.so`） | **2,975,560 B** | `f0cc70861b9003b4df487bd88b8355a2` | `ELF 64-bit LSB shared object, ARM aarch64, dynamically linked`，`SONAME=libskrootpatch.so`，NEEDED 仅 `libm.so/libdl.so/libc.so`，导出 `Java_me_sproot_patch_NativeEngine_patch/engineVersion` |
+
+> **命名约定（与 app-client 对齐，重要）**：APK `jniLibs/arm64-v8a/libskrootpatch.so` 必须是**JNI 共享库**（ET_DYN，`System.loadLibrary("skrootpatch")`）；独立可执行文件改名 `skroot-patch`（裸名），**绝不放进 jniLibs**，避免"名字像库实为 ET_EXEC、loadLibrary 必崩"的混淆。
 
 > 注：以上为**本地参考构建**（同一脚本、同一 NDK）。按人类规则「禁止本地编译产物作为交付」，正式交付物只取 CI artifacts（§5）。含 bootimg 功能后体积较首版 +15.5 KB。
 
 完整摘要见 `engine/dist/SHA256SUMS`：
 
 ```
-e94a8186163b77180d7eb8f80ee74ff9b5464492b8c35bbc1012b3a6c0ce3005  libskrootpatch-arm64-exec.so
-a55c6ed08c37cb25f27e532dd2e16dc9f6729592efc8c4876fafc8244310831a  libskpatchjni-arm64.so
+e94a8186163b77180d7eb8f80ee74ff9b5464492b8c35bbc1012b3a6c0ce3005  skroot-patch-arm64
+f0cc70861b9003b4df487bd88b8355a2a58132c9c64ceacff74cd50f470e4711  libskrootpatch-arm64-jni.so
 ```
 
 ELF 证据链（`readelf`）：
@@ -183,12 +185,12 @@ error: executable's TLS segment is underaligned: alignment is 8 (skew 0),
 
 ### 4.1 形态 A（推荐主形态）：JNI 共享库
 
-- 产物：`libskpatchjni-arm64.so` → 放 `newapp/src/main/jniLibs/arm64-v8a/libskpatchjni.so`
+- 产物：`libskrootpatch.so` → 放 `newapp/src/main/jniLibs/arm64-v8a/libskrootpatch.so`
 - Java 侧：
 
 ```kotlin
 object NativeEngine {
-    init { System.loadLibrary("skpatchjni") }
+    init { System.loadLibrary("skrootpatch") }
     // 返回 DOC-C1 §3 退出码；进度从 jsonSink（NDJSON）轮询，密钥从 <out>.report.json 读
     external fun patch(inPath: String, outPath: String, key: String?, jsonSink: String?, workdir: String?): Int
     external fun engineVersion(): String
@@ -202,7 +204,7 @@ object NativeEngine {
 
 ### 4.2 形态 B（备选/排障）：静态可执行文件
 
-- 产物：`libskrootpatch-arm64-exec.so` → 放 `jniLibs/arm64-v8a/libskrootpatch.so`
+- 产物：`skroot-patch`（**裸名，不进 jniLibs**）；如需随 APK 分发再额外命名 `libskrootpatchexec.so`（仅 exec、永不 loadLibrary），二选一不得同名
 - 必须满足三条，否则 ENOEXEC/EACCES：
   1. `android { packaging { jniLibs { useLegacyPackaging = true } } }`（或 `android:extractNativeLibs="true"`），让文件被解压到 `nativeLibraryDir` 且带可执行位（旧工程已有此配置 `app/app/build.gradle.kts:129-131`）；
   2. **直接 exec `nativeLibraryDir` 下的真实路径**：`ProcessBuilder("$nativeLibraryDir/libskrootpatch.so", "--in", …)`；
@@ -278,6 +280,8 @@ tasks.named("preBuild") { dependsOn(copyEngine, assertEngine) }
 | A5 JNI 形态 | `DYN`、导出 `Java_..._patch`、`spr_engine_run` 已解析、仅系统库依赖 | §4.1 |
 | A6 契约退出码 | `--help` rc=0；缺参 rc=101；输入不存在 rc=102；`--key short` rc=101；`.img` 输入 rc=102 | C1 §1/§3 |
 | A6d 铁律 | rc≠0 时 `--out` **不存在** | C1 §3 行为铁律 |
+| **A7 T-12 强断言** | 合成 boot.img：extract→mutate→repack→**回读 kernel 段 sha256 == patch 输出 sha256**（不是只比长度）+ 产物等长 + `AVBf` footer 逐字节保留 | 防「repack 静默用原始 kernel」；**CI 每次必跑**（不依赖真机样本） |
+| A7b 反例保护 | 若回读 sha256 ≠ patch 输出 → 直接 FAIL | 阻断级测试项 T-12 |
 
 实测日志摘录（qemu-user，2026-11-08）：
 
@@ -401,12 +405,14 @@ cp kernel.patched kernel
 
 ### 7.4 AVB 与刷入链（**结论已按专项调查修正**）
 
-事实层（实测）：
+事实层（实测，**含魔数坑**）：
 ```
 boot.img: header v4, kernel@0x1000 raw 33,892,864 B, ramdisk_size=0
 尾部:     AVBf footer @100,663,232（末 64B, 大端）
           original_image_size=33,898,496  vbmeta_offset=33,898,496  vbmeta_size=2,496
 文件长:   100,663,296 = fastboot 分区大小（余下为 0 填充）
+⚠️ **魔数坑**：AVB footer 的魔数是 **`AVBf`**（小写 f），不是 `AVB0`；`AVB0` 是 vbmeta 镜像（独立 `vbmeta.img`）的魔数。
+   判断"boot.img 是否带 AVB"必须用 `tail[-64:-60] == b"AVBf"`；用 `AVB0` 判断会把**有签名的原厂镜像误报为无 AVB**（本组已踩）。
 独立 vbmeta.img: 12,288 B, magic AVB0, 算法 SHA256_RSA4096
 ```
 

@@ -75,8 +75,8 @@ jobs:
       - name: ELF assertions — 架构/静态性/TLS 对齐（防宿主 x86-64 回归）
         run: |
           set -euo pipefail
-          E=engine/android/build/arm64/exec/libskrootpatch.so
-          J=engine/android/build/arm64/jni/libskpatchjni.so
+          E=engine/android/build/arm64/exec/skroot-patch
+          J=engine/android/build/arm64/jni/libskrootpatch.so
           for f in "$E" "$J"; do
             test -f "$f" || { echo "MISSING $f"; exit 1; }
             file "$f" | grep -q 'ARM aarch64' || { echo "NOT AArch64: $f"; exit 1; }
@@ -95,7 +95,7 @@ jobs:
       - name: Contract assertions (qemu-user 真实执行 arm64 产物)
         run: |
           set -euo pipefail
-          E=engine/android/build/arm64/exec/libskrootpatch.so
+          E=engine/android/build/arm64/exec/skroot-patch
           Q="$(command -v qemu-aarch64-static || command -v qemu-aarch64 || true)"
           if [ -z "$Q" ]; then
             echo "::warning::qemu 不可用，跳过运行时契约自检（ELF 架构断言已在上一 step 通过）"
@@ -114,7 +114,7 @@ jobs:
         if: hashFiles('samples/meizu21/boot.img') != ''
         run: |
           set -euo pipefail
-          E=engine/android/build/arm64/exec/libskrootpatch.so
+          E=engine/android/build/arm64/exec/skroot-patch
           Q="$(command -v qemu-aarch64-static || command -v qemu-aarch64 || true)"
           if [ -z "$Q" ]; then
             echo "::warning::qemu 不可用，跳过运行时契约自检（ELF 架构断言已在上一 step 通过）"
@@ -160,8 +160,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
-          cp engine/android/build/arm64/exec/libskrootpatch.so out/
-          cp engine/android/build/arm64/jni/libskpatchjni.so   out/
+          cp engine/android/build/arm64/exec/skroot-patch      out/
+          cp engine/android/build/arm64/jni/libskrootpatch.so  out/
+          cp engine/android/build/arm64/ENGINE-META.txt        out/
+          cp engine/android/build/arm64/SYMBOLS-libskrootpatch.txt out/ 2>/dev/null || true
           if [ -f dist/magiskboot ]; then cp dist/magiskboot out/; fi
           if [ -f dist/magiskboot-meta.txt ]; then cp dist/magiskboot-meta.txt out/; fi
           (cd out && sha256sum *.so > SHA256SUMS && cat SHA256SUMS)

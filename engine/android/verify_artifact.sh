@@ -10,8 +10,8 @@
 set -uo pipefail
 
 ROOT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/build/arm64}"
-EXEC="$ROOT/exec/libskrootpatch.so"
-JNI="$ROOT/jni/libskpatchjni.so"
+EXEC="$ROOT/exec/skroot-patch"
+JNI="$ROOT/jni/libskrootpatch.so"
 QEMU="$(command -v qemu-aarch64-static || command -v qemu-aarch64 || true)"
 NDK="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-/opt/android-ndk/android-ndk-r27c}}"
 READELF="$(command -v readelf || echo "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf")"
@@ -42,7 +42,7 @@ fi
 
 # A5 JNI 形态：导出入口符号 + 只依赖系统库
 if [[ -f "$JNI" ]]; then
-  if "$READELF" -h "$JNI" | grep -q 'DYN'; then pass "A5 引擎 .so 为共享库（DYN）"; else fail "A5 .so ELF 类型错误"; fi
+  if "$READELF" -h "$JNI" | grep -q 'DYN'; then pass "A5 libskrootpatch.so 为共享库（DYN，可 System.loadLibrary）"; else fail "A5 JNI 产物不是 ET_DYN（不能 loadLibrary）"; fi
   syms="$("$READELF" -sW --dyn-syms "$JNI" 2>/dev/null)"
   # 注意：不能写 `echo "$syms" | grep -q ...` —— pipefail 下 grep -q 提前退出会让
   # 写端拿到 SIGPIPE(141)，把「找到」误判成失败（本脚本已踩过此坑）
@@ -78,6 +78,78 @@ if [[ -n "$QEMU" && -f "$EXEC" ]]; then
   [[ $rc -eq 102 ]] && pass "A6f 拒绝 .img 明文输入 rc=102（调用方须先 unpack 解压）" || fail "A6f .img 拒绝逻辑 rc=$rc"
 else
   echo "SKIP  A6 契约自检（无 qemu-aarch64，可 apt install qemu-user-static）"
+fi
+
+# ---------------- A7：T-12 强断言（合成 boot.img，无需真机样本）-----------------
+# 防止「repack 静默用原始 kernel / 只比长度不比内容」类回归。
+# 强判据：repack 后**回读 kernel 段 sha256 必须等于 patch 输出 sha256**（不是只比长度）。
+if [[ -n "$QEMU" && -f "$EXEC" ]] && command -v python3 >/dev/null; then
+  echo "--- A7 T-12 强断言（合成 boot.img：extract → mutate → repack → 回读 sha256）---"
+  T="$(mktemp -d)"
+  python3 - "$T" <<'SYNTH'
+import struct, sys, os
+d = sys.argv[1]
+PS = 4096
+kernel = bytes((i * 37 + 11) & 0xFF for i in range(65536))   # 确定性伪随机 kernel payload
+hdr = bytearray(PS)
+hdr[0:8] = b'ANDROID!'
+struct.pack_into('<I', hdr, 8, len(kernel))
+struct.pack_into('<I', hdr, 12, 0)
+struct.pack_into('<I', hdr, 16, 0x1c00017a)
+struct.pack_into('<I', hdr, 20, 1584)
+struct.pack_into('<I', hdr, 40, 4)
+struct.pack_into('<I', hdr, 1580, 0)
+img = bytes(hdr) + kernel
+orig_size = len(img)
+vbmeta = bytes(range(256))
+footer = bytearray(64)
+footer[0:4] = b'AVBf'
+struct.pack_into('>II', footer, 4, 1, 0)
+struct.pack_into('>Q', footer, 12, orig_size)
+struct.pack_into('>Q', footer, 20, orig_size)
+struct.pack_into('>Q', footer, 28, len(vbmeta))
+part = 98304
+img = img + vbmeta
+img = img + b'\x00' * (part - 64 - len(img)) + bytes(footer)
+open(os.path.join(d, 'boot.img'), 'wb').write(img)
+open(os.path.join(d, 'kernel.expect'), 'wb').write(kernel)
+mut = bytearray(kernel); mut[1234] ^= 0xFF; mut[60000] ^= 0x55
+open(os.path.join(d, 'kernel.mutated'), 'wb').write(bytes(mut))
+print('synthetic boot.img', len(img), 'kernel', len(kernel))
+SYNTH
+  rc=0
+  "$QEMU" "$EXEC" --bootimg extract-kernel --in "$T/boot.img" --out "$T/kernel.out" --quiet || rc=1
+  if [[ $rc -eq 0 ]] && [[ "$(sha256sum < "$T/kernel.out")" == "$(sha256sum < "$T/kernel.expect")" ]]; then
+    pass "A7a extract-kernel 解出的 kernel 与内嵌 payload 逐字节一致"
+  else
+    fail "A7a extract-kernel 结果与 payload 不一致"
+  fi
+  "$QEMU" "$EXEC" --bootimg repack --in "$T/boot.img" --kernel "$T/kernel.mutated" --out "$T/new-boot.img" --quiet || rc=1
+  "$QEMU" "$EXEC" --bootimg extract-kernel --in "$T/new-boot.img" --out "$T/kernel.readback" --quiet || rc=1
+  if [[ "$(sha256sum < "$T/kernel.readback")" == "$(sha256sum < "$T/kernel.mutated")" ]]; then
+    pass "A7b **T-12 强断言**：repack 后回读 kernel sha256 == patch 输出 sha256"
+  else
+    fail "A7b T-12 失败：repack 后回读 kernel != patch 输出（补丁被静默丢弃）"
+  fi
+  if python3 - "$T" <<'CHK'
+import sys, os
+d = sys.argv[1]
+a = open(os.path.join(d, 'boot.img'), 'rb').read()
+b = open(os.path.join(d, 'new-boot.img'), 'rb').read()
+ok = (len(a) == len(b)
+      and a[-64:-60] == b'AVBf' and b[-64:-60] == b'AVBf'
+      and a[-64:] == b[-64:]
+      and a[4096:4096 + 65536] != b[4096:4096 + 65536])
+sys.exit(0 if ok else 1)
+CHK
+  then
+    pass "A7c repack 产物等长 + AVBf footer 逐字节保留 + kernel 段确有改动"
+  else
+    fail "A7c AVB/长度断言失败"
+  fi
+  python3 -c "import shutil,sys; shutil.rmtree(sys.argv[1], ignore_errors=True)" "$T"
+else
+  echo "SKIP  A7 T-12 强断言（需 qemu + python3）"
 fi
 
 # ---------------- Tier B：真修补产物字节级断言（需一份真 arm64 内核 Image）-----
