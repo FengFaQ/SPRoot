@@ -539,7 +539,7 @@ object PatchPipeline {
                         )
                         if (!avbRetry.ok) {
                             finishFailure(
-                                "AVB 结构不合规（回滚自启后仍未通过：${avbRetry.code}）",
+                                "${avbRetry.describe}（${avbRetry.code}，回滚自启后仍未通过）",
                                 avbRetry.detail,
                                 avbRetry.code,
                             )
@@ -557,7 +557,7 @@ object PatchPipeline {
                         avbLengthEqual = avbCheck.lengthEqual,
                         avbVbmetaEqual = avbCheck.vbmetaEqual,
                     )
-                    finishFailure("AVB 结构不合规（${avbCheck.code}）", avbCheck.detail, avbCheck.code)
+                    finishFailure("${avbCheck.describe}（${avbCheck.code}）", avbCheck.detail, avbCheck.code)
                     return
                 }
             } else {
@@ -600,6 +600,8 @@ object PatchPipeline {
                 artifactSha256 = outSha,
                 artifactBytes = newBoot.length(),
                 kernelEqualLength = true,
+                audit = "AVB=${state.value.avbStatus}；rc_injected=${state.value.rcInjected}；" +
+                    "rc_target=${state.value.rcTarget}；rc_source=${state.value.rcSource}；rc_reason=${state.value.rcReason}",
             )
             AppLog.info(TAG, "==== 修补成功 ==== 产物=${exported.displayPath} sha256=$outSha")
             logStageDurations()
@@ -750,17 +752,15 @@ object PatchPipeline {
             )
         }
         // AVB-3
+        val problem = inputFooter.vbmetaProblem()
         val start = inputFooter.vbmetaStart()
-        if (start == null) {
-            AppLog.warn(
-                TAG,
-                "AVB footer 字段异常（vbmeta_offset=${inputFooter.vbmetaOffset}, " +
-                    "vbmeta_size=${inputFooter.vbmetaSize}, len=${inputFooter.fileLength}）→ AVB-3 降级为 WARN",
-            )
+        if (problem != null || start == null) {
+            val why = problem ?: "vbmeta 区段无法定位"
+            AppLog.warn(TAG, "AVB-3 降级为 WARN：$why")
             return AvbCheck(
                 ok = true,
-                code = "AVB-3-SKIP",
-                describe = "AVB footer 字段越界/为 0，AVB-3 未执行（已记录原因，不静默跳过）",
+                code = "AVB-3-WARN",
+                describe = "AVB-3 未执行（$why，已记录 WARN，不静默跳过）",
                 detail = "",
                 footerPresent = true,
                 lengthEqual = true,

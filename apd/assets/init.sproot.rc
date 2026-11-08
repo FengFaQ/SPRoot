@@ -21,7 +21,10 @@ on post-fs-data
     mkdir /data/adb/sproot 0700 root root
     # 密钥文件由 apd deploy 写入（0600）。此处只建目录，绝不写密钥。
 
-service sproot-apd /data/adb/apd daemon --superkey-file /data/adb/sproot/superkey
+# ⚠️ 参数顺序（clap）：--superkey-file 是 apd 的**顶层**参数，必须写在子命令 daemon 之前。
+#    写成 `apd daemon --superkey-file ...` 会被 clap 判为 unexpected argument（rc=2），
+#    daemon 根本起不来；RcInject 按本文件原文注入，故顺序在这里就是最终生效顺序。
+service sproot-apd /data/adb/apd --superkey-file /data/adb/sproot/superkey daemon
     class late_start
     user root
     group root

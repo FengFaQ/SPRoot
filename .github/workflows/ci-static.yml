@@ -1,32 +1,19 @@
 # SPRoot 静态质量门禁（D7）
 #
-# 目的：把 quality/static/ 下的脚本纳入 v2 push 必跑（与 apk/apd/engine/licenses/release 五个工作流不重复）：
+# 目的：v2 每次 push 都跑 quality/static/ 下的静态检查脚本（与 apk/apd/engine/licenses/release
+# 五个工作流不重复：本工作流只做「源码静态一致性」，不构建任何产物、不下载 artifact）：
 #   - check_licenses.py    许可标注漂移（LIC-DRIFT）
-#   - check_error_codes.py 错误码表一致性（qa 产出后自动生效）
-#   - verify_patch.py      修补产物静态校验（支持 --help 自检）
+#   - check_error_codes.py 错误码表一致性（docs §6.1 ↔ Models.kt/ApdClient.kt）
+#   - verify_patch.py --help  修补产物校验脚本自检（argparse 契约可用）
 #
-# 约定：
-#   * 脚本存在即必须跑通（退出码 != 0 → 本工作流红）；
-#   * 脚本尚未就绪 → ::warning:: 但不红（不阻塞其他开发，但会在日志里显式记录缺口）。
+# 约定：三个脚本**必须存在且必须跑通**（缺失或退出码 != 0 → 本工作流红）。
 name: ci-static
 
 on:
   push:
     branches: [ "v2" ]
-    paths:
-      - 'quality/static/**'
-      - 'quality/**'
-      - 'docs/**'
-      - 'LICENSE'
-      - 'LICENSES.md'
-      - 'NOTICE'
-      - 'app/src/**'
-      - 'engine/**'
-      - '.github/workflows/ci-static.yml'
   pull_request:
-    paths:
-      - 'quality/static/**'
-      - '.github/workflows/ci-static.yml'
+    branches: [ "v2" ]
   workflow_dispatch:
 
 concurrency:
@@ -51,42 +38,33 @@ jobs:
       - name: Python syntax check (quality/static)
         run: |
           set -e
-          if [ -d quality/static ]; then
-            python3 -m compileall -q quality/static
-            echo "compileall OK"
-          else
-            echo "::error::quality/static 目录不存在"; exit 1
-          fi
+          [ -d quality/static ] || { echo "::error::quality/static 目录不存在"; exit 1; }
+          python3 -m compileall -q quality/static
+          echo "compileall OK"
 
-      - name: check_licenses.py (LIC-DRIFT, 必须通过)
+      - name: check_licenses.py (LIC-DRIFT)
         run: |
           set -e
-          if [ -f quality/static/check_licenses.py ]; then
-            python3 quality/static/check_licenses.py
-            echo "check_licenses.py PASS"
-          else
-            echo "::error::quality/static/check_licenses.py 缺失（许可门禁脚本必须存在）"; exit 1
-          fi
+          [ -f quality/static/check_licenses.py ] || {
+            echo "::error::quality/static/check_licenses.py 缺失（补丁链必须保留许可门禁）"; exit 1; }
+          python3 quality/static/check_licenses.py
+          echo "check_licenses.py PASS"
 
-      - name: check_error_codes.py (错误码一致性)
+      - name: check_error_codes.py (G-04 错误码一致性)
         run: |
           set -e
-          if [ -f quality/static/check_error_codes.py ]; then
-            python3 quality/static/check_error_codes.py
-            echo "check_error_codes.py PASS"
-          else
-            echo "::warning::quality/static/check_error_codes.py 尚未就绪（不计红，日志记录缺口）"
-          fi
+          [ -f quality/static/check_error_codes.py ] || {
+            echo "::error::quality/static/check_error_codes.py 缺失（错误码门禁不可缺）"; exit 1; }
+          python3 quality/static/check_error_codes.py
+          echo "check_error_codes.py PASS"
 
       - name: verify_patch.py --help (脚本自检)
         run: |
           set -e
-          if [ -f quality/static/verify_patch.py ]; then
-            python3 quality/static/verify_patch.py --help
-            echo "verify_patch.py --help PASS"
-          else
-            echo "::warning::quality/static/verify_patch.py 尚未就绪（不计红，日志记录缺口）"
-          fi
+          [ -f quality/static/verify_patch.py ] || {
+            echo "::error::quality/static/verify_patch.py 缺失（产物校验器不可缺）"; exit 1; }
+          python3 quality/static/verify_patch.py --help > /dev/null
+          echo "verify_patch.py --help PASS"
 
       - name: Summary
         if: always()

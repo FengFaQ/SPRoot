@@ -74,7 +74,7 @@ object RcInject {
         # SPRoot AP daemon — builtin fallback（权威模板缺失，需修 CI 打包）
         on post-fs-data
             mkdir /data/adb/sproot 0700 root root
-        service sproot-apd /data/adb/apd daemon --superkey-file /data/adb/sproot/superkey
+        service sproot-apd /data/adb/apd --superkey-file /data/adb/sproot/superkey daemon
             class late_start
             user root
             group root

@@ -112,7 +112,9 @@ object ApdClient {
             val bin = apdBinary(context)
             val keyFile = writeKeyFile(context, superKey)
             try {
-                val argv = mutableListOf(bin.absolutePath, "root-exec", "--superkey-file", keyFile.absolutePath)
+                // --superkey-file 是 apd 顶层参数（clap）：必须放在子命令 root-exec 之前，
+                // 否则 `apd root-exec --superkey-file ...` 会以 rc=2（unexpected argument）直接失败。
+                val argv = mutableListOf(bin.absolutePath, "--superkey-file", keyFile.absolutePath, "root-exec")
                 uid?.let { argv += listOf("--uid", it.toString()) }
                 sContext?.let { argv += listOf("--scontext", it) }
                 timeoutSec?.let { argv += listOf("--timeout", it.toString()) }

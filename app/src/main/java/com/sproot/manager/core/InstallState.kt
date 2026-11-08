@@ -82,13 +82,22 @@ object InstallState {
         save(context, load(context).copy(status = Status.PATCHING, updatedAt = System.currentTimeMillis(), note = "修补开始"))
     }
 
+    /**
+     * @param audit 审计摘要（AVB 断言结论 / rc 注入结果），写入持久化 note 供 qa 从他处断言；
+     *              为空时只写「导出成功，等待刷入」。
+     */
     fun markPatchedPendingFlash(
         context: Context,
         artifactDisplayPath: String,
         artifactSha256: String,
         artifactBytes: Long,
         kernelEqualLength: Boolean,
+        audit: String? = null,
     ) {
+        val note = buildString {
+            append("导出成功，等待刷入")
+            if (!audit.isNullOrBlank()) append("；").append(audit)
+        }.take(400)
         save(
             context,
             load(context).copy(
@@ -98,7 +107,7 @@ object InstallState {
                 artifactBytes = artifactBytes,
                 kernelEqualLength = kernelEqualLength,
                 updatedAt = System.currentTimeMillis(),
-                note = "导出成功，等待刷入",
+                note = note,
             ),
         )
     }
