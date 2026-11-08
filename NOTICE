@@ -79,12 +79,15 @@
 | `prop-rs` | 0.2.0 | **UNKNOWN** | git（`AndroidPatch/restprops` @ `6f57231…`） | 上游仓库**无 LICENSE 文件**、`Cargo.toml` 无 `license` 字段 |
 | `prop-rs-android` | 0.2.0 | **UNKNOWN** | git（同上） | 同上；为 **`resetprop`** 功能依赖（bionic property area 操作），不易替换 |
 
-**处置（三选一，由项目所有人 + architect 决策）**：
-1. **向上游作者要求补 LICENSE 文件或书面授权**（推荐；与 SKRoot 授权凭证一并归档保管）；
-2. 自研最小替代（仅需 bionic property area 读写，工作量中等，可评估）；
-3. 移除 `resetprop` 功能（破坏模块生态脚本兼容，**不建议**）。
+**工程处置（已落地，2026-11-08，lead 裁决）**：不删 `resetprop`、不阻塞开发，改为**可选 feature 隔离**：
+- `apd/Cargo.toml`：`[features] default = ["resetprop"]`、`resetprop = ["dep:prop-rs", "dep:prop-rs-android"]`，两个 crate 均 `optional = true`；
+- `apd/src/resetprop.rs` 改为 façade：启用 feature 时编译真实实现（`resetprop_prop_rs.rs`）；`--no-default-features` 时编译 stub，遇到该子命令**显式报「feature 未启用」**（不静默降级）；
+- `.github/workflows/apd.yml` 每次 CI 执行 `cargo check --locked --no-default-features --target aarch64-linux-android`（**仅编译校验，不替换发布产物**），防止干净路径腐化；
+- **发布策略：对外公开发布必须使用 `--no-default-features` 构建**（依赖树内不含 UNKNOWN）；默认构建（含 resetprop）仅限内部/自用，不作为 release candidate。
 
-**门禁**：闭环前，含 `resetprop` 的发布物**不得公开发布**。注意 `quality/static/check_licenses.py` 只校验 `LICENSES.md` 指纹，**检查不到本类 UNKNOWN** → 必须在人工发布清单中勾选（见 `docs/NEW-DOC-01` §11.3 / §11.4）。
+**仍未闭环（人类 2026-11-09 待办）**：`prop-rs` **授权或自研替代 二选一**，与 SKRoot 授权一并归档。
+
+**门禁**：闭环前，**含 `resetprop`（默认 feature）的产物不得公开发布**；`quality/static/check_licenses.py` 只校验 `LICENSES.md` 指纹、**检查不到 UNKNOWN**，必须在人工发布清单中勾选（见 `docs/NEW-DOC-01` §11.3 / §11.4）。
 
 ## 免责声明
 
