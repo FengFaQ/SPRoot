@@ -79,6 +79,7 @@ data class PatchUiState(
     val rcInjected: Boolean = false,
     val rcTarget: String = "",
     val rcReason: String = "",
+    val rcSource: String = "",
     val reportPath: String? = null,
     val logPath: String? = null,
     val rootKey: String? = null,

@@ -387,16 +387,18 @@ object PatchPipeline {
                 rcInjected = rcResult!!.injected,
                 rcTarget = rcResult!!.target,
                 rcReason = rcResult!!.reason,
+                rcSource = rcResult!!.source,
             )
             AppLog.info(
                 TAG,
-                "自启注入：" + if (rcResult!!.injected) {
-                    "已注入 rc（target=${rcResult!!.target}，幂等命中=${rcResult!!.idempotentHit}）" +
-                        "——注意：rc 已注入 ≠ 已开启自启；需 AP 部署完成并写入 " +
-                        "/data/adb/sproot/superkey（0600）后，开机才会真正拉起 AP daemon"
-                } else {
-                    "未注入（原因=${rcResult!!.reason}，不影响产物合规；可手动启动 AP）"
-                },
+                "rc_injected=${rcResult!!.injected}, rc_target=${rcResult!!.target}, " +
+                    "rc_source=${rcResult!!.source}, rc_reason=${rcResult!!.reason}, " +
+                    "rc_idempotent_hit=${rcResult!!.idempotentHit}" +
+                    (if (rcResult!!.injected) {
+                        "（rc 已注入 ≠ 已开启自启：需 AP 部署完成并写入 /data/adb/sproot/superkey(0600) 后，开机才会拉起 AP daemon）"
+                    } else {
+                        "（不影响产物合规，可手动启动 AP）"
+                    }),
             )
 
             // ---------- ⑦ 重打包 ----------
@@ -499,7 +501,13 @@ object PatchPipeline {
                     AppLog.warn(TAG, "AVB-2 等长冲突：回滚 rc 注入并重新 repack（rc_injected=false, reason=avb_length_conflict）")
                     val rolledBack = RcInject.rollback(workDir!!, File(workDir, "ramdisk.cpio"))
                     if (rolledBack) {
-                        rcResult = RcInject.Result(false, rcTarget, "avb_length_conflict", false)
+                        rcResult = RcInject.Result(
+                            injected = false,
+                            target = rcTarget,
+                            reason = "avb_length_conflict",
+                            idempotentHit = false,
+                            source = rcResult?.source ?: RcInject.TEMPLATE_SOURCE,
+                        )
                         state.value = state.value.copy(rcInjected = false, rcReason = "avb_length_conflict")
                         val repack2 = MagiskBoot.exec(context, listOf("repack", "boot.img"), workDir!!) { line ->
                             AppLog.debug("magiskboot", line)

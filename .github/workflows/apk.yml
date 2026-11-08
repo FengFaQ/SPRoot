@@ -102,6 +102,21 @@ jobs:
           done
           sha256sum "$DEST"/*.so
 
+      - name: Copy authoritative rc template into APK assets
+        run: |
+          set -eu
+          SRC=apd/assets/init.sproot.rc
+          DEST=app/src/main/assets/init.sproot.rc
+          if [ ! -f "$SRC" ]; then echo "::error::缺少权威 rc 模板 $SRC"; exit 1; fi
+          mkdir -p app/src/main/assets
+          cp -f "$SRC" "$DEST"
+          echo "rc template copied: $(stat -c %s "$DEST") bytes"
+          grep -q "service sproot-apd" "$DEST" || { echo "::error::rc 模板缺 service sproot-apd"; exit 1; }
+          grep -q "sys.boot_completed" "$DEST" || { echo "::error::rc 模板缺 boot_completed 触发器"; exit 1; }
+          grep -q "oneshot" "$DEST" || { echo "::error::rc 模板缺 oneshot（防 bootloop）"; exit 1; }
+          grep -q "disabled" "$DEST" || { echo "::error::rc 模板缺 disabled（防 bootloop）"; exit 1; }
+          echo "rc template content checks OK"
+
       - name: Assemble NOTICE assets (single source of truth)
         run: |
           set -eu
@@ -200,7 +215,7 @@ jobs:
             echo "::error::APK 内出现已作废的 libskpatchjni.so"; exit 1
           fi
           # NOTICE / 许可证断言：第三方声明与 GPL-3.0、AGPL-3.0 全文必须随包
-          for asset in assets/NOTICE assets/licenses/NOTICE assets/licenses/LICENSE assets/licenses/GPL-3.0.txt assets/licenses/AGPL-3.0.txt assets/NOTICE-APK.md; do
+          for asset in assets/NOTICE assets/init.sproot.rc assets/licenses/NOTICE assets/licenses/LICENSE assets/licenses/GPL-3.0.txt assets/licenses/AGPL-3.0.txt assets/NOTICE-APK.md; do
             if unzip -l "$APK" | grep -q "$asset"; then
               echo "OK $asset present"
             else

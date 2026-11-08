@@ -250,9 +250,9 @@ fun PatchPage(modifier: Modifier = Modifier) {
                             InfoRow(
                                 "开机自启（AP daemon）",
                                 if (state.rcInjected) {
-                                    "已注入 rc（target=${state.rcTarget}）—— **尚未生效**：" +
-                                        "需 AP 部署完成并把密钥写入 /data/adb/sproot/superkey（0600）后，开机才会真正拉起 AP；" +
-                                        "在此之前可手动启动 AP"
+                                    "已注入开机自启模板（target=${state.rcTarget}，来源=${state.rcSource}）—— " +
+                                        "**待 AP 部署完成后生效**：AP 部署需写入 /data/adb/sproot/superkey（0600）；" +
+                                        "在此之前自启不会工作（可手动启动 AP）"
                                 } else {
                                     "未注入（target=${state.rcTarget}，原因=${state.rcReason}）—— 产物仍合规，可手动启动 AP"
                                 },

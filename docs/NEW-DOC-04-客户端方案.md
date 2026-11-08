@@ -440,11 +440,13 @@ CI 行为（硬失败）：
 4. **刷入执行**：首阶段保持"导出 + 人工 fastboot"；后续若接入 AP 内刷入（`dd`/`mtd`），必须走 root-exec 且带 bootloop 守卫。
 5. **真机验证**：`PatchPipeline` 的 magiskboot 解包/回压序列需在魅族 21 的 boot.img 上实测（CI 只能验证编译）；失败时错误区/日志/工作目录三件套可直接取证。
 6. **文档缺口**：`NEW-DOC-04` 之后若 UI 大改，需同步更新 §3 与 §4 阶段图。
-7. **D1 自启链（未闭合，措辞已保守处理）**：当前 `RcInject` 只注入 rc 框架（`on post-fs-data` 建目录 + `import /init.sproot.rc`），**不含 apd daemon 启动行**——密钥绝不能写进 ramdisk 里的 rc（明文泄露）。正确形态（待 sys-guard 权威模板）：
-   - AP deploy 把密钥写入固定受保护路径 `/data/adb/sproot/superkey`（0600，root only）；
-   - rc 用固定路径引用：`exec /data/adb/apd daemon --superkey-file /data/adb/sproot/superkey`；
-   - UI 文案已改为「**已注入 rc（尚未生效）**……需 AP 部署完成后才会开机拉起 AP」，日志同口径，不误导用户。
-   拿到模板后客户端只按原文注入，不自行改写。
+7. **D1 自启链（模板已落地，语义仍保守）**：权威 rc 模板 = **`apd/assets/init.sproot.rc`**（lead 落地，commit `6c4e751`），客户端**只做「读模板原文 → 写入 ramdisk」**，不自行改写：
+   - CI 构建时把 `apd/assets/init.sproot.rc` 复制到 `app/src/main/assets/`，并校验模板含 `service sproot-apd`、`property:sys.boot_completed`、`oneshot`、`disabled`；APK 断言 `assets/init.sproot.rc` 必须存在；
+   - 注入到 ramdisk：`/init.sproot.rc` = 模板原文；`/init.rc` 确保 `import /init.sproot.rc`（幂等）；
+   - 日志记录 `rc_injected / rc_target / rc_source / rc_reason / rc_idempotent_hit`；`rc_source` 应为 `apd/assets/init.sproot.rc`；
+   - 模板安全设计（不在客户端改写）：密钥不入 rc（只引用 `/data/adb/sproot/superkey`）、`oneshot+disabled`（最坏自启失效，不会 bootloop）、`override` 幂等、`seclabel` 留空待真机 avc 结论；
+   - **仍缺一块（非客户端）**：`apd deploy` 尚未实现把密钥写入 `/data/adb/sproot/superkey`（0600），因此当前注入后 daemon 会因读不到 key 安全退出；
+   - UI 文案：「**已注入开机自启模板（target=…，来源=…）—— 待 AP 部署完成后生效**」，日志同口径，不显示"自启已开启"。
 
 ---
 
