@@ -12,6 +12,7 @@
 
 #include "patch_pipeline.h"
 #include "bootimg.h"
+#include "spr_sha256.h"
 #include "analyze/base_func.h"
 #include "analyze/symbol_analyze.h"
 #include "analyze/init_cred_searcher.h"
@@ -121,6 +122,9 @@ struct EngineState {
     std::string kernel_version = "unknown";
     std::vector<char> file_buf;
     size_t input_size = 0;
+    size_t output_size = 0;
+    std::string input_sha256;
+    std::string output_sha256;
     J hook_table = J::array();
     std::vector<std::string> errors;
     size_t cfi_patch_count = 0;
@@ -128,24 +132,30 @@ struct EngineState {
 };
 
 static J build_report(const EngineOptions& opt, const EngineState& st, const std::string& root_key) {
-    J input; input.set("path", opt.in_path).set("size", static_cast<long long>(st.input_size));
-    J output; output.set("path", opt.out_path);
+    // C1 §2.3：input/output 均含 path/sha256/size（qa 门禁用其做等长与产物一致性断言）
+    J input; input.set("path", opt.in_path).set("sha256", st.input_sha256)
+              .set("size", static_cast<long long>(st.input_size));
+    J output; output.set("path", opt.out_path).set("sha256", st.output_sha256)
+                .set("size", static_cast<long long>(st.output_size));
     J key_spec;
     key_spec.set("charset", "A-Za-z0-9").set("length", 48).set("stored_len", 47)
             .set("source", opt.key_from_user ? "user" : "gen");
     J errors = J::array();
     for (auto& e : st.errors) errors.push(e);
     J rep;
+    // hook_table 必须原样内联为数组（旧写法把 cJSON* 隐式转成 bool → "hook_table": true，qa 会判失败）
+    J hooks = J::array();
+    if (cJSON* arr = st.hook_table.raw()) {
+        const cJSON* it = nullptr;
+        cJSON_ArrayForEach(it, arr) { hooks.push(J(cJSON_Duplicate(it, 1))); }
+    }
     rep.set("engine_version", "1.0.0")
        .set("upstream_baseline", "943382cd")
        .set("input", std::move(input))
        .set("output", std::move(output))
        .set("kernel_version", st.kernel_version)
        .set("key_spec", std::move(key_spec))
-       .set("hook_table", [&st]() -> cJSON* {
-            cJSON* r = st.hook_table.raw();
-            return r ? cJSON_Duplicate(r, 1) : cJSON_CreateArray();
-        }())
+       .set("hook_table", std::move(hooks))
        .set("hidden_dir_prefix", root_key.substr(0, 16))
        .set("errors", std::move(errors));
     return rep;
@@ -340,6 +350,7 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
     emit_progress("read_input", 0, "path=" + opt.in_path);
     st.file_buf = read_file_buf(opt.in_path);
     st.input_size = st.file_buf.size();
+    st.input_sha256 = spr::sha256_hex(st.file_buf);
     if (st.file_buf.empty()) return fail(E_INPUT, "E102: fail to open/read input", opt.in_path);
     emit_progress("read_input", 5, "size=" + std::to_string(st.input_size));
 
@@ -351,8 +362,13 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
             return fail(E_KALLSYMS, "E201: failed to analyze kernel symbols", "CONFIG_KALLSYMS missing or unsupported layout");
         sym = symbol_analyze.get_symbol_offset();
         KernelVersionParser kv(st.file_buf);
-        // KernelVersionParser 无直接字符串接口时退化为按符号存在性判断版本段（见 3) 中的分支）
-        emit_progress("parse_kallsyms", 15, "symbols parsed");
+        {   // C1 §2.3：kernel_version 必须是真实版本串（qa/审计依赖），解析失败才回落 unknown
+            std::string ver = kv.get_kernel_version();
+            if (!ver.empty()) st.kernel_version = ver;
+            std::string tag = kv.get_kernel_tag();
+            emit_progress("parse_kallsyms", 15, "symbols parsed, version=" + st.kernel_version +
+                                                     (tag.empty() ? "" : ", tag=" + tag));
+        }
     }
 
     // 3) 关键符号必选集（C1 §4 / A1 §3）
@@ -435,6 +451,8 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
         }
         std::string werr;
         std::string content(patched.data(), patched.size());
+        st.output_size = patched.size();
+        st.output_sha256 = spr::sha256_hex(patched);
         if (!write_file_atomic(opt.out_path, content, werr))
             return fail(E_WRITE, "E240: output write failed", werr);
     }

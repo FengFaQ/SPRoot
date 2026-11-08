@@ -1,0 +1,121 @@
+# engine.yml — SPRoot SK 修补引擎 arm64 交叉编译与产物断言
+#
+# 依据：docs/NEW-DOC-02-修补引擎本地化方案.md §5
+# 目的：根治旧链路「宿主 x86-64 ELF 冒充 Android 产物」的病根（见 NEW-DOC-03）。
+#       本工作流是引擎产物的**唯一合法来源**：本地不产出交付物，产物一律从 CI artifacts 取。
+#
+# 产物：
+#   skroot-engine-arm64/libskrootpatch.so       静态可执行（ELF ET_EXEC，AArch64）
+#   skroot-engine-arm64/libskpatchjni.so        共享库 + JNI（AArch64，仅依赖系统 libc/libm/libdl）
+#   skroot-engine-arm64/SHA256SUMS
+#
+# 断言（任一失败即红）：
+#   1) file 显示 ARM aarch64
+#   2) readelf -h e_machine = AArch64（0xB7）
+#   3) 可执行形态无 PT_INTERP、无 NEEDED（静态，不依赖宿主 glibc）
+#   4) PT_TLS p_align = 0x40（API<29 编出会 p_align=8 → bionic 启动 abort，实测见文档 §3.2）
+#   5) qemu-user 执行契约：--help rc=0、缺参数 rc=101(E_USAGE)、输入不存在 rc=102(E_INPUT)、
+#      rc!=0 时不得产出 --out（C1 §3 失败不落盘铁律）
+#   6) 若仓库内存在 samples/meizu21/boot.img：跑通 unpack→patch→repack 全链并核对
+#      kernel sha256（回归真实内核，防止引擎改动打穿实机）
+name: engine-arm64
+
+on:
+  push:
+    branches: [main, v2, 'feat/**']
+    paths: ['engine/**', '.github/workflows/engine.yml']
+  pull_request:
+    paths: ['engine/**']
+  workflow_dispatch:
+
+concurrency:
+  group: engine-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install NDK r27c
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          mkdir -p "$HOME/ndk" && unzip -q /tmp/ndk.zip -d "$HOME/ndk"
+          echo "ANDROID_NDK_HOME=$HOME/ndk/android-ndk-r27c" >> "$GITHUB_ENV"
+
+      - name: Install qemu-user-static (契约自检)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static
+
+      - name: Build arm64 artifacts (exec + JNI)
+        run: bash engine/android/build_arm64.sh both
+
+      - name: ELF assertions — 架构/静态性/TLS 对齐（防宿主 x86-64 回归）
+        run: |
+          set -euo pipefail
+          E=engine/android/build/arm64/exec/libskrootpatch.so
+          J=engine/android/build/arm64/jni/libskpatchjni.so
+          for f in "$E" "$J"; do
+            test -f "$f" || { echo "MISSING $f"; exit 1; }
+            file "$f" | grep -q 'ARM aarch64' || { echo "NOT AArch64: $f"; exit 1; }
+            readelf -h "$f" | grep -q 'AArch64'      || { echo "e_machine != AArch64: $f"; exit 1; }
+            test -x "$f"                              || { echo "not executable: $f"; exit 1; }
+          done
+          # 静态可执行：无宿主动态解释器、无 NEEDED
+          ! readelf -lW "$E" | grep -q INTERP  || { echo "has PT_INTERP (宿主 glibc 解释器)"; exit 1; }
+          ! readelf -dW "$E" | grep -q NEEDED  || { echo "has NEEDED (非静态)"; exit 1; }
+          # TLS 对齐（API>=29 才为 0x40）
+          test "$(readelf -lW "$E" | awk '/TLS/{print $NF}')" = "0x40" || { echo "PT_TLS p_align != 0x40"; exit 1; }
+          # JNI 只允许系统库
+          bad="$(readelf -dW "$J" | grep NEEDED | grep -vE 'libc\.so|libm\.so|libdl\.so|liblog\.so' || true)"
+          test -z "$bad" || { echo "JNI 存在非系统依赖: $bad"; exit 1; }
+
+      - name: Contract assertions (qemu-user 真实执行 arm64 产物)
+        run: |
+          set -euo pipefail
+          E=engine/android/build/arm64/exec/libskrootpatch.so
+          Q=qemu-aarch64-static
+          $Q "$E" --help > /tmp/help.txt 2>&1; grep -q 'SPRoot patch engine' /tmp/help.txt
+          set +e
+          $Q "$E" >/dev/null 2>&1;                          rc=$?; test $rc -eq 101 || { echo "E_USAGE rc=$rc"; exit 1; }
+          rm -f /tmp/noout.img
+          $Q "$E" --in /tmp/__missing__ --out /tmp/noout.img --gen-key >/dev/null 2>&1; rc=$?; test $rc -eq 102 || { echo "E_INPUT rc=$rc"; exit 1; }
+          test ! -e /tmp/noout.img || { echo "失败却产出 --out（违反 C1 §3 铁律）"; exit 1; }
+          set -e
+          echo "qemu contract: 101/102 + no-output-on-failure OK"
+
+      - name: Bootimg chain regression（有样本才跑）
+        if: hashFiles('samples/meizu21/boot.img') != ''
+        run: |
+          set -euo pipefail
+          E=engine/android/build/arm64/exec/libskrootpatch.so
+          Q=qemu-aarch64-static
+          WORK=$(mktemp -d)
+          $Q "$E" --bootimg info --in samples/meizu21/boot.img | tee "$WORK/info.txt"
+          grep -q 'header_version=4' "$WORK/info.txt"
+          grep -q 'compression=raw'  "$WORK/info.txt"
+          grep -q 'kernel: offset=4096 size=33892864' "$WORK/info.txt"
+          $Q "$E" --bootimg extract-kernel --in samples/meizu21/boot.img --out "$WORK/kernel"
+          echo "4d445384c046f2ba2de856b3215de8d2be83a9ccad115948a34471cde3098481  $WORK/kernel" | sha256sum -c -
+          KEY=ABCdef0123456789ABCdef0123456789ABCdef0123456789
+          $Q "$E" --in "$WORK/kernel" --out "$WORK/kernel.patched" --key "$KEY" --json "$WORK/ev.ndjson" --workdir "$WORK/w"
+          test "$(stat -c%s "$WORK/kernel")" = "$(stat -c%s "$WORK/kernel.patched")"
+          $Q "$E" --bootimg repack --in samples/meizu21/boot.img --kernel "$WORK/kernel.patched" --out "$WORK/new-boot.img"
+          test "$(stat -c%s "$WORK/new-boot.img")" = "$(stat -c%s samples/meizu21/boot.img)"
+          echo "bootimg chain OK: kernel 等长 + boot.img 等长"
+
+      - name: Stage artifacts + checksums
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp engine/android/build/arm64/exec/libskrootpatch.so out/
+          cp engine/android/build/arm64/jni/libskpatchjni.so   out/
+          (cd out && sha256sum *.so > SHA256SUMS && cat SHA256SUMS)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: skroot-engine-arm64
+          path: out/
+          retention-days: 30

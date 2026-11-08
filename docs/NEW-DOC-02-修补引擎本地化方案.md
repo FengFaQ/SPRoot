@@ -15,12 +15,12 @@
 | 项 | 结论 |
 |---|---|
 | 旧病根 | 唯一产物 `engine/src/skroot-patch` 是**宿主 x86-64 glibc 动态 ELF**（`e_machine=0x3E`、带 `PT_INTERP=/lib64/ld-linux-x86-64.so.2`），并且从未进 APK。详见 NEW-DOC-03。 |
-| 本方案 | `engine/android/build_arm64.sh` 用 **NDK r27c clang 18.0.3** 交叉编译同一份 C++ 源码，产出 **AArch64** 两种形态：①静态可执行 `libskrootpatch.so`（2,893,952 B）②JNI 共享库 `libskpatchjni.so`（2,958,000 B）。两者均已实测通过 ELF/契约断言。 |
+| 本方案 | `engine/android/build_arm64.sh` 用 **NDK r27c clang 18.0.3** 交叉编译同一份 C++ 源码（含新增内置 bootimg 处理），产出 **AArch64** 两种形态：①静态可执行 `libskrootpatch.so`（2,909,504 B）②JNI 共享库 `libskpatchjni.so`（2,975,528 B）。两者均通过 ELF/契约断言。 |
 | 关键坑（已实测） | NDK 静态可执行文件必须用 **`ANDROID_API>=29`** 编译，否则 `PT_TLS p_align=8`，bionic 启动即 abort；API≥29 才输出 `p_align=0x40`。 |
-| 无真机验证 | 已建立 `verify_artifact.sh`：Tier A（ELF/契约，qemu-user 可跑，**当前 ALL PASS**）+ Tier B（真内核 Image 的等长/密钥内嵌/hook 落位断言，待样本镜像）。 |
+| 无真机验证 | `verify_artifact.sh`：Tier A（ELF/契约，qemu-user 可跑，**ALL PASS**）+ Tier B（真内核字节级断言）。**已用魅族 21 官方 boot.img 全链实测**：抽 kernel sha256 与 qa ground truth 一致、补丁 rc=0、等长、可确定性复现、重打包等长。 |
 | 推荐集成 | **主形态 JNI（`libskpatchjni.so` + `System.loadLibrary`）**，次形态静态 exec（从 `nativeLibraryDir` 真实路径 exec，**禁止** symlink 到 `filesDir`）。 |
 | 实测编译耗时 | 全量 100+ TU，12 核并行 **18 秒**（`make objs`，见 §3.4）。 |
-| 未完成 | ①GitHub Actions 实际运行链接（本机无仓库推送凭据，工作流文件已就绪）②样本内核 Image 字节级断言（下载进行中，见 §6.3）。 |
+| 未完成 | ①`engine.yml` 已在工作区就绪并待推 v2 触发 run（本机不产出交付物，交付物只认 CI artifacts）②AVB/vbmeta 刷入策略待独立子智能体结论后落实现（§7.3）。 |
 
 ---
 
@@ -128,20 +128,22 @@ $NDKB/aarch64-linux-android29-clang++ -shared -static-libstdc++ -o <build>/jni/l
 llvm-strip --strip-all <build>/jni/libskpatchjni.so
 ```
 
-**asmjit / capstone 如何编**：两者都是**源码内编**（非预编译库），asmjit 只编 `asmjit/arm/*` + `asmjit/core/*`（**裁掉 x86 后端可省 ~200 KB**，当前 Makefile 仍包含 x86 源，见 §9-R3），capstone 只编 `arch/AArch64` + 公共 `cs.c/MC*.c/SStream.c/utils.c/Mapping.c`。两者与目标架构无关（asmjit 是「生成 arm64 机器码」，capstone 是「反汇编 arm64」），可在任意宿主上交叉编译，实测 0 报错（仅 263 处 `-Wunused-function` 类告警）。
+**asmjit / capstone 如何编**：两者都是**源码内编**（非预编译库），asmjit 只编 `asmjit/arm/*` + `asmjit/core/*`（**裁掉 x86 后端可省 ~200 KB**，当前 Makefile 仍包含 x86 源，见 §10-R3），capstone 只编 `arch/AArch64` + 公共 `cs.c/MC*.c/SStream.c/utils.c/Mapping.c`。两者与目标架构无关（asmjit 是「生成 arm64 机器码」，capstone 是「反汇编 arm64」），可在任意宿主上交叉编译，实测 0 报错（仅 263 处 `-Wunused-function` 类告警）。
 
 ### 3.3 产物与校验（实测）
 
 | 产物 | 路径 | 大小 | sha256（前 32 位） | 类型 |
 |---|---|---|---|---|
-| 静态可执行 | `engine/dist/libskrootpatch-arm64-exec.so` | **2,893,952 B** | `ddc04731be02c9c79fd50f5ee7e0922d` | `ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped` |
-| JNI 共享库 | `engine/dist/libskpatchjni-arm64.so` | **2,958,000 B** | `efc66fede84b8f0634568612cae94da27` | `ELF 64-bit LSB shared object, ARM aarch64, dynamically linked`（NEEDED 仅 `libm.so/libdl.so/libc.so`） |
+| 静态可执行 | `engine/dist/libskrootpatch-arm64-exec.so` | **2,909,504 B** | `e94a8186163b77180d7eb8f80ee74ff9` | `ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped` |
+| JNI 共享库 | `engine/dist/libskpatchjni-arm64.so` | **2,975,528 B** | `a55c6ed08c37cb25f27e532dd2e16dc9` | `ELF 64-bit LSB shared object, ARM aarch64, dynamically linked`（NEEDED 仅 `libm.so/libdl.so/libc.so`） |
+
+> 注：以上为**本地参考构建**（同一脚本、同一 NDK）。按人类规则「禁止本地编译产物作为交付」，正式交付物只取 CI artifacts（§5）。含 bootimg 功能后体积较首版 +15.5 KB。
 
 完整摘要见 `engine/dist/SHA256SUMS`：
 
 ```
-ddc04731be02c9c79fd50f5ee7e0922d670c64c6a8a8d04714e97469b825e986  libskrootpatch-arm64-exec.so
-efc66fede84b8f0634568612cae94da276ea2601646704714c91cdb5ddfd518a  libskpatchjni-arm64.so
+e94a8186163b77180d7eb8f80ee74ff9b5464492b8c35bbc1012b3a6c0ce3005  libskrootpatch-arm64-exec.so
+a55c6ed08c37cb25f27e532dd2e16dc9f6729592efc8c4876fafc8244310831a  libskpatchjni-arm64.so
 ```
 
 ELF 证据链（`readelf`）：
@@ -233,50 +235,27 @@ tasks.named("preBuild") { dependsOn(copyEngine, assertEngine) }
 
 ## 5. CI 交叉编译（GitHub Actions，工作流已就绪）
 
-### 5.1 工作流文件
+### 5.1 工作流文件（已就绪）
 
-已放 `engine/android/ci/engine-arm64.yml`（**未**直接放 `.github/workflows/` 以免与 task-8 的 CI 目录撞车；task-8 负责人可原样移动）。核心步骤：
+工作流：**`.github/workflows/engine.yml`**（`name: engine-arm64`），步骤：
 
-```yaml
-name: engine-arm64
-on: [push, pull_request, workflow_dispatch]
-jobs:
-  build-arm64:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install NDK r27c
-        run: |
-          curl -sSL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
-          mkdir -p "$HOME/ndk" && unzip -q /tmp/ndk.zip -d "$HOME/ndk"
-      - name: Install qemu (for contract self-check)
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static
-      - name: Build both artifacts
-        env: { ANDROID_NDK_HOME: ${{ github.workspace }}/../ndk/android-ndk-r27c }
-        run: |
-          ANDROID_NDK_HOME="$HOME/ndk/android-ndk-r27c" bash engine/android/build_arm64.sh both
-      - name: ELF + contract assertions（防宿主 x86-64 回归）
-        run: |
-          set -euo pipefail
-          E=engine/android/build/arm64/exec/libskrootpatch.so
-          J=engine/android/build/arm64/jni/libskpatchjni.so
-          file "$E" | grep -q 'ARM aarch64'
-          file "$J" | grep -q 'ARM aarch64'
-          readelf -h "$E" | grep -q 'AArch64'
-          test "$(readelf -lW "$E" | awk '/TLS/{print $NF}')" = "0x40"
-          ! readelf -lW "$E" | grep -q INTERP          # 无宿主 glibc 解释器
-          ! readelf -dW "$E" | grep -q NEEDED          # 无动态依赖
-          test -x "$E"
-          bash engine/android/verify_artifact.sh engine/android/build/arm64
-      - uses: actions/upload-artifact@v4
-        with: { name: skroot-engine-arm64, path: engine/android/build/arm64/**/*.so }
-```
+| 步骤 | 内容 |
+|---|---|
+| Install NDK r27c | 从 `dl.google.com` 取 `android-ndk-r27c-linux.zip` → `$HOME/ndk/android-ndk-r27c`，导出 `ANDROID_NDK_HOME` |
+| Install qemu | `apt-get install qemu-user-static`（契约运行时自检） |
+| Build | `bash engine/android/build_arm64.sh both`（exec + JNI 两形态） |
+| ELF 断言（防宿主 x86-64 回归） | `file` 含 `ARM aarch64`、`readelf -h` 含 `AArch64`、可执行位；exec 无 `PT_INTERP`/无 `NEEDED`；`PT_TLS=0x40`；JNI 仅系统库 |
+| 契约断言 | qemu 直跑 arm64 产物：`--help` rc=0、缺参 rc=101、输入不存在 rc=102、**rc≠0 时不得产出 `--out`**（C1 §3） |
+| Bootimg 回归 | 若仓内有 `samples/meizu21/boot.img`：`--bootimg info/extract-kernel/repack` 全链 + kernel sha256 核对 |
+| 归档 | `actions/upload-artifact@v4`（含 `SHA256SUMS`），产物名 `skroot-engine-arm64` |
 
 ### 5.2 证据状态（如实）
 
-- 本机（WSL）**已实测**：编译成功 + `verify_artifact.sh` **ALL PASS**（§3.3/§6.1 日志摘录）。
-- GitHub Actions **尚未实际运行**：本机无该仓库的推送凭据/凭证，无法产出 run 链接。工作流文件与断言已就绪，task-8 负责人接入仓库后即可产出运行链接（这属于 task-8 交付面）。
-- 因此 G-02 当前可用的证据是「本机交叉编译 + ELF/契约断言 + qemu 执行日志」；CI 链接由 task-8 补齐。
+| 证据 | 状态 |
+|---|---|
+| 本地等价 CI 构建（同脚本/同 NDK/同断言） | ✅ 通过（§6.1 ALL PASS） |
+| 本地 qemu 跑**真实内核**（arm64 产物） | ✅ 通过：33,892,864 B 真内核 `rc=0`，耗时 226 s，产物 sha256 与宿主构建**完全一致**（跨架构确定性，§6.2 B9） |
+| GitHub Actions 运行链接 | ⏳ 工作流待推 `v2` 分支后产生 run 链接（人类规则：交付物只认 CI artifacts，本地不产出交付件） |
 
 ---
 
@@ -318,27 +297,42 @@ usage: skroot-patch --in <kernel_image> --out <patched_kernel> (--gen-key|--key 
        [--json <ndjson_sink>] [--workdir <dir>] [--quiet]
 ```
 
-### 6.2 Tier B：真修补产物字节级断言（待样本镜像）
+### 6.2 Tier B：真修补产物字节级断言（**已用魅族 21 官方镜像实测通过**）
 
-设 `KERNEL_IMAGE=<boot.img unpack 出的 arm64 Image>` 后脚本自动断言：
+样本：`samples/meizu21/boot.img`（100,663,296 B，sha256 `8c899eb3…`，来源 `MEIZU21_12.7` 官方固件）。
 
-| 断言 | 判据（契约依据） |
+```bash
+E=engine/src/skroot-patch     # arm64 形态：qemu-aarch64-static engine/android/build/arm64/exec/libskrootpatch.so
+$E --bootimg info           --in samples/meizu21/boot.img
+$E --bootimg extract-kernel --in samples/meizu21/boot.img --out kernel.raw
+$E --in kernel.raw --out kernel.patched --key <48字符> --json ev.ndjson --workdir w
+$E --bootimg repack         --in samples/meizu21/boot.img --kernel kernel.patched --out new-boot.img
+```
+
+| 断言 | 实测结果 |
 |---|---|
-| B1 | 引擎 rc=0 |
-| B2 | `size(out) == size(in)`（C1 §2.1 字节级 patch 不改大小） |
-| B3 | `sha256(out) != sha256(in)`（确有改动） |
-| B4 | out 中存在 `key[0:47] + NUL` 窗口（C1 §4-2；与 v1.1 **E1**「47 字符提权串」一致） |
-| B5 | `report.json`：`hidden_dir_prefix == key[0:16]`、`hook_table` 非空、in/out size 相等 |
-| B6 | NDJSON 终态 `result` 事件**唯一且为最后一行**（C1 §2.3） |
+| B0 解包字段 | `header_version=4`、`header_size=1584(0x630)`、`page_size=4096`、`kernel offset=4096(0x1000)`、`kernel_size=33,892,864`、`compression=raw` |
+| B0b **交叉验证** | 抽出 kernel sha256 = `4d445384c046f2ba2de856b3215de8d2be83a9ccad115948a34471cde3098481`，与 qa ground truth **逐字节一致** |
+| B1 | 补丁 rc=0（`hook_count=19`），`kernel_version=6.1.25`（真实解析，非占位） |
+| B2 | 等长：`33,892,864 B` |
+| B3 | 输出 sha256 = `399ac4797e6ab2ae5700cc21350676daf7b89fe397e473ef24ae32cb9cce3f2f` ≠ 输入 |
+| B4 | 产物含 `key[0:47]+NUL` 窗口（47 字符提权串，CALL v1.1 **E1**） |
+| B5 | `report.json`：`input/output.sha256+size` 齐全且等长、`hidden_dir_prefix==key[0:16]`、`hook_table` 为数组（含 `blob_count/root_key_region`）、`kernel_version=6.1.25`、`errors=[]` |
+| B6 | NDJSON 终态 `result` 唯一且为最后一行 |
+| B7 重打包 | `new-boot.img` **等长**（100,663,296 B）；kernel 段 == `kernel.patched`；差异只落在 kernel 段 |
+| B8 确定性 | 同输入同密钥两次运行产物 sha256 相同 |
+| B9 跨架构 | arm64 产物（qemu）与宿主 x86-64 产物输出**同一 sha256** |
 
-### 6.3 样本内核 Image 获取（进行中）
+> 附带修复（C1 §2.3 契约偏差，qa 会判）：①`report.json` 原缺 `output.size/output.sha256`；②`hook_table` 被 `cJSON*`→`bool` 重载误选写成 `true`；③`kernel_version` 恒 `unknown`。已分别补 `engine/src/spr_sha256.h`（自实现 SHA-256，无第三方依赖）、修正 JSON 序列化、接 `KernelVersionParser`。
 
-- **boot.img 解包/重打包工具链**：Magisk 官方 APK 内的 `lib/arm64-v8a/libmagiskboot.so`（**静态链接 arm64，770,632 B**，已实测在 qemu 下可直接运行 `MagiskBoot - Boot Image Modification Tool`）。来源：`https://github.com/topjohnwu/Magisk/releases/download/v28.1/Magisk-v28.1.apk`。
-  - 用法（宿主侧验证）：`unzip -j Magisk-v28.1.apk 'lib/arm64-v8a/libmagiskboot.so' -d tools/` → `qemu-aarch64-static tools/libmagiskboot.so unpack boot.img`（产出 `kernel`/`ramdisk.cpio`/`dtb`）。
-  - 入库策略：**不**把 APK 入仓；CI 内 `curl` 下载 + sha256 固定 + `unzip`（失败即 fail build），或由 task-8 决定是否直接入库 770 KB 的 magiskboot 二进制。
-  - 自建路径（如需完全可控）：`git clone https://github.com/topjohnwu/Magisk` → `native/src/boot` 目录用本仓 NDK 工具链编译（同 NDK r27c + `-static`；约 20 个 C++ TU），CI 内可复现。
-- **kptools-android**（备选，KernelPatch 官方 release，294,032 B，**动态 bionic**，需 `/system/bin/linker64`）：已下载可用；在 qemu 下需补 bionic 运行库，故**优先 magiskboot**（静态）。
-- **样本镜像**：`samples/` 目录 + `samples/README.md` 记录来源/版本/sha256（见 §9-T2，下载进行中）。
+### 6.3 样本与解包工具链（来源：官方固件，非公开 GKI）
+
+| 项 | 结论 |
+|---|---|
+| 样本来源 | **魅族 21 官方固件 `/mnt/c/MEIZU21_12.7` 解包**（人类提供）；清单 `samples/meizu21/SAMPLES.csv`：`boot.img`、`init_boot.img`（ramdisk 形态：kernel_size=0、ramdisk=2,131,370）、`vbmeta.img`（12,288 B，`AVB0`）。**不使用公开 GKI 样本**；本地已按人类指示删除 GKI 下载（1.5 GB 已清理） |
+| boot.img 形态 | header **v4**，kernel **未压缩 raw arm64 Image**（首字节 `MZ`），`ramdisk_size=0` → 无解压/重压缩风险，SK 补丁天然等长 |
+| 解包/重打包 | **引擎内置**（`engine/src/bootimg.cpp` + `--bootimg` 子命令），不依赖 magiskboot/kptools → §7 |
+| magiskboot 备选 | Magisk APK 内 `lib/arm64-v8a/libmagiskboot.so` 为静态 arm64 可执行（770,632 B），实测 qemu 可运行；仅在遇到 v2 header / vendor_boot / 压缩内核时启用，不默认引入 |
 
 ### 6.4 建议补充 Tier C（真机前，qa task-7 可采纳）
 
@@ -346,7 +340,51 @@ usage: skroot-patch --in <kernel_image> --out <patched_kernel> (--gen-key|--key 
 
 ---
 
-## 7. 与契约对齐（DOC-C1 v1.0 / CALL v1.1）
+## 7. bootimg 解包/重打包与刷入链（AVB）
+
+### 7.1 为什么自己做（不引 magiskboot/kptools）
+
+旧链路三个阻断项里有两条是"外部件"：`libkptools.so` 构建期下载、`kpimg` 资产硬依赖（NEW-DOC-03 R3/R4）。KernelSU 的 `ksud` 用自研 bootimg 解析证明了"完全不依赖 magiskboot 也可行"。SPRoot 更简单：**SK 只 patch kernel 段，不改 ramdisk**（无需 KSU 式 init→init.real 替换），所以自研成本很低。
+
+### 7.2 已实现（`engine/src/bootimg.{h,cpp}`，随引擎编进 arm64 产物）
+
+| 子命令 | 作用 | 实测（魅族 21 boot.img） |
+|---|---|---|
+| `--bootimg info --in boot.img` | 打印 header/kernel/ramdisk/压缩/AVB 全字段 | ✅ v4 / 1584 / 4096 / kernel@4096 33,892,864 raw |
+| `--bootimg extract-kernel --in boot.img --out kernel` | 抽出 kernel Image（拒绝压缩内核并说明如何解压） | ✅ sha256 与 qa ground truth 一致 |
+| `--bootimg unpack --in boot.img --outdir DIR` | 产出 `DIR/kernel` + `DIR/bootimg.info.txt` | ✅ |
+| `--bootimg repack --in boot.img --kernel patched --out new-boot.img [--strip-avb]` | 等长回填 kernel 段；`--strip-avb` 截断 AVB 尾部区 | ✅ 等长 100,663,296 B |
+
+约束与安全边界：
+- **只接受等长 kernel**（SK 补丁等长；不等长直接 E240 拒绝落盘，防"半成品写进 boot"）。
+- 压缩内核（gzip/lz4）**明确报错**而非猜测处理；样本机为 raw，故 MVP 不受影响。后续若目标机为压缩内核，vendor 一个 inflate/lz4 单文件实现即可（CI 内可测）。
+- 不处理 ramdisk/dtb/vendor_boot/v4 boot signature（SK 路线不需要）。
+
+### 7.3 AVB 与刷入链（**MVP 开机关键路径**）
+
+实测解析（`bootimg info` + 手工核对）：
+
+```
+boot.img:      header v4, kernel@0x1000 (33,892,864 raw), ramdisk_size=0
+尾部:          AVBf footer @ 100,663,232（镜像末 64B，大端）
+               original_image_size = 33,898,496   ← 有效镜像长度（header 页 + kernel pages）
+               vbmeta_offset      = 33,898,496   ← 内嵌 vbmeta 紧随其后
+               vbmeta_size        = 2,496
+文件长度 100,663,296 = fastboot 分区尺寸（其余为 0 填充）
+另有独立 vbmeta.img 12,288 B（magic AVB0，alg=SHA256_RSA2048）→ 顶层签名链
+```
+
+结论（**先验推断，待独立子智能体源码核实与真机验证**）：
+1. **修补必然破坏 AVB**：kernel 字节变化 → boot 内嵌 vbmeta 的 hash 失配 → 顶层 `vbmeta.img` 链式校验失败。**直接 `fastboot flash boot` 会触发验证失败/回滚或卡开机**。
+2. **主路径（推荐）**：关闭校验后再刷：
+   `fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img`（官方 vbmeta 只改 flags：`AVB_VBMETA_IMAGE_FLAGS_HASHTREE_DISABLED=1 | VERIFICATION_DISABLED=2`），随后 `fastboot flash --slot=all boot new-boot.img`（A/B 机型必须 `--slot=all`，与官方 `flash.bat` 一致）。
+3. **备选路径**：`--bootimg repack --strip-avb` 去掉 boot 的 AVBf footer/内嵌 vbmeta（输出 33,898,496 B）后刷入；适用于 boot 走"独立校验被跳过"的机型。两条路径**都必须真机实测能否开机**，不能开机则记录阻断并用官方全量包回滚（`flash.bat.reference` 可全量回滚）。
+4. **回滚保障**：刷入前把原 boot.img 落盘并按 **sha1 内容寻址**保存（学 KSU），失败可秒回官方原镜像。
+5. 风险提示：`--disable-verification` 属降级安全态（设备可能显示警告/影响 OTA），需产品侧明示用户。
+
+> ⏳ 待办：AVB 专项结论（独立子智能体）同步后，把"是否必须 vbmeta 关闭/可否只刷 boot"的最终判定回写本节，并在 `bootimg` 里补 `--patch-vbmeta-flags` 子命令（直接产出 flags 已改的 vbmeta.img，去掉对 `fastboot --disable-*` 的依赖）。
+
+## 8. 与契约对齐（DOC-C1 v1.0 / CALL v1.1）
 
 | 契约项 | 实现/证据 | 状态 |
 |---|---|---|
@@ -364,7 +402,7 @@ usage: skroot-patch --in <kernel_image> --out <patched_kernel> (--gen-key|--key 
 
 ---
 
-## 8. 包体与体积
+## 9. 包体与体积
 
 | 组合 | 增量 | 评价 |
 |---|---|---|
@@ -372,11 +410,11 @@ usage: skroot-patch --in <kernel_image> --out <patched_kernel> (--gen-key|--key 
 | 仅 exec 形态 | 2.76 MB | 需 legacy packaging + 路径规范 |
 | 两形态都带 | 5.58 MB | 仅调试期（排障时 exec 形态可直接抓 stderr） |
 
-优化空间（未实施，列入 §9-R3）：裁掉 asmjit x86 后端（~200 KB）、`-ffunction-sections -Wl,--gc-sections`、`-flto`（预估可降到 ~2.0–2.3 MB）；`capstone` 仅 A64 已裁，`cJSON` 不可省（report）。
+优化空间（未实施，列入 §10-R3）：裁掉 asmjit x86 后端（~200 KB）、`-ffunction-sections -Wl,--gc-sections`、`-flto`（预估可降到 ~2.0–2.3 MB）；`capstone` 仅 A64 已裁，`cJSON` 不可省（report）。
 
 ---
 
-## 9. 风险与待决
+## 10. 风险与待决
 
 | # | 风险/待决 | 影响 | 建议 |
 |---|---|---|---|
@@ -390,7 +428,7 @@ usage: skroot-patch --in <kernel_image> --out <patched_kernel> (--gen-key|--key 
 
 ---
 
-## 10. 验收门禁映射（lead 的 10 条 → 本文证据）
+## 11. 验收门禁映射（lead 的 10 条 → 本文证据）
 
 | 门禁 | 本文落点 |
 |---|---|
@@ -438,3 +476,19 @@ bash engine/android/verify_artifact.sh
 # 4) 真镜像断言（有样本后）
 KERNEL_IMAGE=samples/gki-kernel-arm64.Image bash engine/android/verify_artifact.sh
 ```
+
+## 12. 许可证与合规（D-3）
+
+| 组件 | 位置 | 许可证 | 结论 |
+|---|---|---|---|
+| **SKRoot（引擎核心来源）** | `upstream/SKRoot-linuxKernelRoot/`（`Lite_version/src/patch_kernel_root/*` 被 vendor 进 `engine/src/analyze|patch_*.cpp`） | **未声明：仓库无 LICENSE/COPYING，源文件无版权头** → 默认 **All rights reserved（proprietary）**，SPDX 无对应标识 | 🔴 **风险**：无授权即不可再分发/再许可。`engine/` 作为其衍生作品，**发布任何二进制（APK/引擎）前必须取得上游书面许可**，或对 core 做 clean-room 重写，或本项目仅内部使用不发布 |
+| KernelPatch | `upstream/KernelPatch/LICENSE` | **GPL-2.0** | 我们已不 vendor 其源码、也不再调用 kptools（bootimg 自研），仅历史参考 → **不引入传染** |
+| asmjit | `engine/src/3rdparty/asmjit2-src/LICENSE.md` | **Zlib**（改写自 MIT 风格，宽松） | ✅ 兼容闭源/开源分发，保留版权声明即可 |
+| capstone | `engine/src/3rdparty/capstone-5.0.7/`（仅 include/ + src/，未附 LICENSE） | 上游 **BSD-3-Clause** | ✅ 宽松兼容；**行动项**：把上游 LICENSE.TXT/copyright 一并入库（避免"未附声明"的合规瑕疵） |
+| cJSON | `engine/src/3rdparty/cJSON/`（仅 .cpp/.h，未附 LICENSE） | 上游 **MIT** | ✅ 兼容；**行动项**：补 LICENSE 文本入库 |
+| 旧管理器 App（APatch 衍生） | `app/LICENSE` | **GPL-3.0** | 仅作历史参考/根因分析对象；新 App **不继承**其代码则不受 GPL-3 约束（若复用其 UI/代码则需整体 GPL-3 开源，需 architect 拍板） |
+
+**结论（可执行）**：
+1. asmjit(Zlib)/capstone(BSD-3)/cJSON(MIT) 与我们自研代码兼容，可分发；只需补齐第三方位 LICENSE 文本。
+2. **真正的合规风险只有 SKRoot 核心算法（无许可证）**：这是 D-3 的阻塞点，需人类与上游作者确认授权，或走 clean-room。
+3. 新 App 若从 APatch(GPL-3) 复制代码 → 必须整体 GPL-3 开源；纯参考设计不受限。
