@@ -197,7 +197,10 @@ static J build_report(const EngineOptions& opt, const EngineState& st, const std
                 size_t n = (g.last > g.first) ? (g.last - g.first) : 0;
                 h.set("group", g.group ? g.group : "").set("name", g.symbol ? g.symbol : "");
                 if (n == 0) {
-                    h.set("resolved", false).set("reason", "no_patch_bytes_symbol_missing_or_not_used");
+                    // 未解析组也输出统一字段（空值 + reason），便于 qa 按固定 schema 断言
+                    h.set("resolved", false).set("reason", "no_patch_bytes_symbol_missing_or_not_used")
+                     .set("hook_addr", std::string("")).set("trampoline", std::string(""))
+                     .set("bytes", 0);
                 } else {
                     h.set("resolved", true);
                     const auto& first = st.groups.empty() ? g : g;
@@ -221,6 +224,12 @@ static J build_report(const EngineOptions& opt, const EngineState& st, const std
                     h.set("orig_bytes", hex_of(st.orig_buf, off0, len0));
                     h.set("new_bytes", hex_lower(hex_of_str(st.patch_hex[g.first])));
                     h.set("len", static_cast<long long>(len0));
+                    // C1 §2.3 术语别名（qa V 组按 hook_addr/trampoline/bytes 断言，与上面字段同源）：
+                    //   hook_addr = 该组首处补丁落位；trampoline = 作用/跳板地址（无则空串）；bytes = 首处字节数
+                    h.set("hook_addr", std::string(addr_hex));
+                    h.set("bytes", static_cast<long long>(len0));
+                    h.set("trampoline", g.target_addr ? [&]{ std::ostringstream t; t << "0x" << std::hex << g.target_addr; return t.str(); }()
+                                                      : std::string(""));
                     h.set("patches", std::move(patches));
                 }
                 if (g.target_addr) {
