@@ -242,6 +242,12 @@ static J build_report(const EngineOptions& opt, const EngineState& st, const std
             }
             return arr;
         }())
+       .set("hook_groups_count", static_cast<long long>(st.groups.size()))
+       .set("hook_groups_resolved", [&st]() -> long long {
+            long long n = 0;
+            for (auto& g : st.groups) if (g.last > g.first) ++n;
+            return n;
+       }())
        .set("hidden_dir_prefix", root_key.substr(0, 16))
        .set("errors", std::move(errors));
     return rep;

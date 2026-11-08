@@ -156,7 +156,9 @@ fi
 if [[ -n "${KERNEL_IMAGE:-}" ]]; then
   echo "=== Tier B: 真修补产物断言 (KERNEL_IMAGE=$KERNEL_IMAGE) ==="
   B="$(mktemp -d)"
-  KEY="$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 48)"
+  # 48 字符 [A-Za-z0-9] 密钥：base64 需取足够熵（32B→44 字符，过滤非字母数字后可能不足 48）
+  KEY="$(head -c 128 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 48)"
+  [[ ${#KEY} -eq 48 ]] || { echo "FAIL  B0 随机密钥长度 ${#KEY} != 48"; exit 1; }
   OUT="$B/kernel.patched"
   RUN="${QEMU:-}"
   $RUN "$EXEC" --in "$KERNEL_IMAGE" --out "$OUT" --key "$KEY" \
@@ -173,6 +175,21 @@ import sys
 data = open(sys.argv[1], 'rb').read(); key = sys.argv[2]
 sys.exit(0 if data.find(key[:47].encode() + b'\x00') >= 0 else 1)
 PY
+    fi
+    # B7（lead 要求）：用产物字节反证"密钥确实写进内核"——embed_key.new_bytes 必须等于
+    # key[0:47] 的 hex + "00"（47 字符 + NUL，CALL v1.1 E1）；同时断言 hook 组数不小于下界，
+    # 便于跨机型对比"是否少组"。
+    if [[ -f "$OUT.report.json" ]] && command -v python3 >/dev/null; then
+      python3 - "$OUT.report.json" "$KEY" <<'KEYCHK' && pass "B7 密钥自证：hooks[embed_key].new_bytes == key[0:47]hex + \"00\" 且 hook 组数 >=13" || fail "B7 密钥自证/hook 组数断言失败"
+import json, sys
+r = json.load(open(sys.argv[1])); key = sys.argv[2]
+ek = [g for g in r.get("hooks", []) if g.get("group") == "embed_key"]
+ok = bool(ek) and ek[0].get("new_bytes", "").startswith(key[:47].encode().hex()) \
+     and ek[0].get("new_bytes", "").endswith("00") \
+     and int(r.get("hook_groups_count", 0)) >= 13 \
+     and int(r.get("hook_groups_resolved", 0)) >= 10
+sys.exit(0 if ok else 1)
+KEYCHK
     fi
     if [[ -f "$OUT.report.json" ]] && command -v python3 >/dev/null; then
       python3 - "$OUT.report.json" "$KEY" <<'PY' && pass "B5 report.json 契约（hidden_dir_prefix/hook_table/等长）" || fail "B5 report.json 字段不符"

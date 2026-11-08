@@ -572,7 +572,10 @@ magiskboot 来自 Magisk（**GPL-3.0**），我们以**独立可执行程序**�
 | `engine/android/build_arm64.sh` | arm64 交叉编译（exec / jni / both） |
 | `engine/android/verify_artifact.sh` | Tier A/B 静态验证（qemu 契约自检） |
 | `engine/android/jni/skroot_patch_jni.cpp` | JNI 入口 `NativeEngine.patch/engineVersion` |
-| `engine/android/ci/engine-arm64.yml` | GitHub Actions 工作流（待 task-8 接入 `.github/workflows/`） |
+| `engine/android/tools/asmjit_probe.cpp` | asmjit 指令字节生成器（oracle 的 A 侧） |
+| `engine/android/tools/asm_oracle.sh` | asm oracle：asmjit vs NDK LLVM 汇编器逐字节比对（10/10 PASS，已进 CI） |
+| `.github/workflows/engine.yml` | 引擎 CI（NDK 交叉编译 + ELF/JNI 符号/契约/T-12/asm oracle/magiskboot + artifacts） |
+| `NOTICE` | 第三方组件与许可清单（由 lead 维护，本组不再改动） |
 | `engine/dist/` | 产物 + `SHA256SUMS` + `build-info.txt` |
 | `samples/` | 样本内核镜像 + 来源/sha256 说明（进行中） |
 
@@ -611,3 +614,81 @@ KERNEL_IMAGE=samples/gki-kernel-arm64.Image bash engine/android/verify_artifact.
 1. asmjit(Zlib)/capstone(BSD-3)/cJSON(MIT) 与我们自研代码兼容，可分发；只需补齐第三方位 LICENSE 文本。
 2. **真正的合规风险只有 SKRoot 核心算法（无许可证）**：这是 D-3 的阻塞点，需人类与上游作者确认授权，或走 clean-room。
 3. 新 App 若从 APatch(GPL-3) 复制代码 → 必须整体 GPL-3 开源；纯参考设计不受限。
+
+
+## 附录 C：手机端「引擎自检」清单（S2 真机首跑用）
+
+> 目的：在**不动 boot 分区**的前提下，先在手机上确认"引擎能跑、能读真内核、能生成密钥、能产出等长镜像"。
+> 全部步骤只操作 `/data/local/tmp` 与 `/sdcard/Download`，不写分区、不刷机。
+
+### C.0 前置（一次性）
+
+| 项 | 要求 | 校验命令 |
+|---|---|---|
+| 设备解锁 | bootloader 已解锁（AVB 跳过验证依赖它，见 §7.4） | `adb shell getprop ro.boot.verifiedbootstate` → `orange` |
+| 架构 | arm64-v8a | `adb shell getprop ro.product.cpu.abi` → `arm64-v8a` |
+| 原厂 boot 备份 | 从设备读原始 boot | `adb shell su -c 'dd if=/dev/block/by-name/boot iflag=direct of=/data/local/tmp/boot.img'`（或用户提供的 `samples/meizu21/boot.img`） |
+| 工具到位 | `skroot-patch`(arm64 静态) + `libskrootpatch.so`(JNI) + `magiskboot`(arm64) | 从 CI artifact `skroot-engine-arm64` / `magiskboot-arm64` 取 |
+
+### C.1 引擎可执行（exec 形态，最快凸轮）
+
+```bash
+adb push skroot-patch /data/local/tmp/ && adb shell chmod 755 /data/local/tmp/skroot-patch
+adb shell /data/local/tmp/skroot-patch --help
+```
+- **期望**：`SPRoot patch engine v1.0.0 (contract SPROOT-DOC-C1 v1.0)` + usage，**rc=0**
+- **失败判读**：`Permission denied` → 未 chmod；`not executable: 64-bit ELF` → 架构错（拿到 x86 版）；
+  `No such file or directory` 但文件在 → 静态链接缺失（应为 static，无 PT_INTERP）
+
+### C.2 解包真内核（magiskboot）
+
+```bash
+mkdir -p /data/local/tmp/patch && cd /data/local/tmp/patch
+adb push magiskboot . && adb shell chmod 755 magiskboot
+adb shell 'cd /data/local/tmp/patch && ./magiskboot unpack /data/local/tmp/boot.img'
+adb shell 'cd /data/local/tmp/patch && ls -l kernel && sha256sum kernel'
+```
+- **期望**：`HEADER_VER [4] KERNEL_SZ [33892864] PAGESIZE [4096] KERNEL_FMT [raw]`；
+  `kernel` sha256 = `4d445384…4841`（与 §6.2 交叉校验一致）
+- 若 `KERNEL_FMT` 不是 raw（gzip/lz4）：先解压再进下一步，**不要**把压缩 kernel 交给引擎（引擎会 rc=102/E230）
+
+### C.3 修补（只写 /data/local/tmp）
+
+```bash
+adb shell 'cd /data/local/tmp/patch && ./skroot-patch --in kernel --out kernel.patched \
+  --gen-key --json ev.ndjson --workdir w --key-abi 47nul'
+```
+- **期望**：
+  - rc=0，stdout 末行 `ROOT_KEY=<48字符>`；`ev.ndjson` 含 progress 阶段序列
+    `read_input → parse_kallsyms → derive_offsets → locate_init_cred → patch_cfi_huawei → patch_hooks → embed_key → write_output` 与唯一 `result` 终态
+  - `size(kernel.patched) == size(kernel)`（等长，C1 §2.1）
+  - `kernel.patched.report.json`：`hook_groups_count >= 13`、`hook_groups_resolved >= 10`、
+    `hooks[group=embed_key].new_bytes` = 密钥 hex + `00`、`key_spec.abi == "47+NUL"`
+- **耗时预期**：宿主机 33.9 MB 内核 **6.4 s**；qemu 模拟 **226 s**；真机（8 核 A 系）预计 **3–10 s**。
+  若 >60 s 仍未结束：检查是否 `--workdir` 落在 sdcard（FUSE 慢），应放 `/data/local/tmp`
+
+### C.4 打包回镜像（仍不刷机）
+
+```bash
+adb shell 'cd /data/local/tmp/patch && cp kernel.patched kernel && ./magiskboot repack /data/local/tmp/boot.img'
+adb shell 'cd /data/local/tmp/patch && ls -l new-boot.img && sha256sum new-boot.img'
+```
+- **期望**：`new-boot.img` 大小 **== 原 boot.img（100,663,296 B）**；`AVBf` footer 与内嵌 vbmeta 逐字节保留（`--bootimg info` 或 §7.4 脚本核对）
+- ⚠️ 必须 `cp kernel.patched kernel`（T-12：magiskboot repack 只认 `kernel` 文件名）
+
+### C.5 JNI 形态自检（供 App 集成前确认）
+
+```kotlin
+// 在真机 shell 里无法直接 loadLibrary，用 App/Instrumentation 或 adb 触发 PatchEngine.ensureLoaded()
+```
+- **期望**：`System.loadLibrary("skrootpatch")` 成功；`NativeEngine.engineVersion()` 返回 `1.0.0`；
+  传 `key=null` 调 `NativeEngine.patch(...)` 能拿到 rc∈{0,101..}，不抛 `UnsatisfiedLinkError`
+- **失败判读**：`UnsatisfiedLinkError: dlopen failed: library "libskrootpatch.so" not found` → 文件名/ABI 目录错；
+  `... has text relocations` / `cannot locate symbol` → 依赖非系统库（应为 libm/libdl/libc only）
+
+### C.6 需要回传的证据（S2 归档）
+
+`adb pull /data/local/tmp/patch/{ev.ndjson,kernel.patched.report.json,new-boot.img}`
++ `skroot-patch --help` 输出 + `sha256sum` 三件（kernel / kernel.patched / new-boot.img）+ 耗时。
+对照本清单逐项打勾；任一项不符即为**引擎侧 bug**，附 `w/` 目录（失败时保留）与机型内核版本（`uname -r`）。
+
