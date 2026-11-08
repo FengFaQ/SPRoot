@@ -154,10 +154,14 @@ JNIEXPORT jstring JNICALL Java_com_sproot_manager_core_PatchEngine_nativeLastRoo
 
 ### 4.3 为什么 magiskboot 走 nativeLibraryDir
 
+- magiskboot 来源：**Magisk v31.1 官方 APK 内的 `lib/arm64-v8a/libmagiskboot.so`**（实为静态链接的 aarch64 可执行 ELF，约 988,984 B；参考 sha256 `97e9ec75…da4bb54`），由 patcher 的 CI artifact `magiskboot-arm64` 提供，工作流拉取后重命名为 `libmagiskboot.so`；
 - `libmagiskboot.so` 随 APK 分发（`jniLibs/arm64-v8a/`），`packaging.jniLibs.useLegacyPackaging = true` 保证解压到 `nativeLibraryDir`（真实文件、可 exec）；
 - **不在 filesDir exec ELF**（旧版缺陷 ⑨；Android 10+ noexec + SELinux W^X）；
 - 调用方式是 `ProcessBuilder(listOf(bin, "unpack", "boot.img"))`，**不经 `sh -c`、不拼字符串**（缺陷 ⑩）；
-- stdout+stderr 合并逐行回调并实时落盘；超时强杀并明确报 timeout；`--version/--help` 用于能力探测。
+- stdout+stderr 合并逐行回调并实时落盘；超时强杀并明确报 timeout；`--version/--help` 用于能力探测；
+- 目录结构：`unpack` → 引擎 patch `kernel`（必要时 `decompress`/`compress=<fmt>`）→ `repack`（以原 boot.img 为模板）→ 等长/回读校验；
+- 许可：GPL-3.0，APK 内 `assets/NOTICE-magiskboot.txt` 标注来源与版本；
+- CI 断言：APK 内若存在 `lib/arm64-v8a/libmagiskboot.so`，其 ELF `e_machine` 必须为 183(AArch64)；已拉取却未打进 APK 时构建失败。
 
 ### 4.4 产物导出与刷入
 

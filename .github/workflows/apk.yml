@@ -58,12 +58,23 @@ jobs:
             if [ -n "${vf:-}" ]; then cp -f "$vf" "$ASSETS/apd-version.txt"; echo "OK version file -> assets/apd-version.txt"; fi
           }
           fetch_art apd-aarch64-latest libapd.so
+          fetch_art magiskboot-arm64 libmagiskboot.so
           echo "--- 引擎 artifact 名称待 patcher 确认，先按候选名尝试（缺失不阻断） ---"
           fetch_art skrootpatch-aarch64 libskrootpatch.so
           fetch_art engine-aarch64-latest libskrootpatch.so
           fetch_art engine-arm64 libskrootpatch.so
           echo "--- jniLibs ---"; ls -la "$DEST" || true
-          for f in "$DEST"/*.so; do [ -f "$f" ] && file "$f" && head -c 20 "$f" | od -An -tx1 | head -1; done || true
+          for f in "$DEST"/*.so; do
+            [ -f "$f" ] || continue
+            file "$f" || true
+            MACHINE=$(od -An -tu2 -j18 -N2 "$f" | tr -d ' ')
+            echo "ELF machine=$MACHINE ($(basename "$f"))"
+            if [ "$MACHINE" != "183" ]; then echo "::warning::$(basename "$f") 不是 AArch64 ELF (machine=$MACHINE)"; fi
+          done
+          if [ -f "$DEST/libmagiskboot.so" ]; then
+            sha256sum "$DEST/libmagiskboot.so" || true
+            echo "MAGISKBOOT_PRESENT=1" >> "$GITHUB_ENV"
+          fi
 
       - name: Build release APK
         run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
@@ -79,6 +90,27 @@ jobs:
         run: |
           unzip -l app/build/outputs/apk/release/*.apk | grep -E "lib/arm64-v8a|extractNativeLibs" || true
           unzip -l app/build/outputs/apk/release/*.apk | grep "lib/arm64-v8a" || echo "WARN: APK 内暂无 jniLibs（等 engine/apd artifact 就绪）"
+
+      - name: Assert APK contains AArch64 native libs
+        run: |
+          set -u
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          echo "APK=$APK"
+          unzip -l "$APK" | grep -E "lib/arm64-v8a" || true
+          for lib in libmagiskboot.so libapd.so libskrootpatch.so; do
+            if unzip -l "$APK" | grep -q "lib/arm64-v8a/$lib"; then
+              unzip -p "$APK" "lib/arm64-v8a/$lib" > "/tmp/$lib"
+              MACHINE=$(od -An -tu2 -j18 -N2 "/tmp/$lib" | tr -d ' ')
+              echo "$lib: ELF machine=$MACHINE (期望 183)"
+              if [ "$MACHINE" != "183" ]; then echo "::error::$lib 不是 AArch64 ELF"; exit 1; fi
+              echo "OK $lib AArch64"
+            else
+              echo "::warning::APK 未包含 lib/arm64-v8a/$lib（artifact 未就绪或未拉取）"
+              if [ "$lib" = "libmagiskboot.so" ] && [ "${MAGISKBOOT_PRESENT:-0}" = "1" ]; then
+                echo "::error::已拉取 libmagiskboot.so 却未打进 APK"; exit 1
+              fi
+            fi
+          done
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
