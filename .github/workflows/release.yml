@@ -325,6 +325,31 @@ jobs:
           PY
           cat /tmp/manifest-summary.md >> "$GITHUB_STEP_SUMMARY"
 
+      - name: LIC — candidate build license profile (UNKNOWN-license warning)
+        run: |
+          set -euo pipefail
+          WORK="${{ steps.collect.outputs.work }}"
+          APK=$(find "$WORK/apk" -name '*.apk' | head -1)
+          mkdir -p "$WORK/apkx_lic"
+          unzip -o -q "$APK" 'lib/arm64-v8a/libapd.so' -d "$WORK/apkx_lic" || true
+          LIB=$(find "$WORK/apkx_lic" -name libapd.so | head -1)
+          test -n "$LIB" || { echo "::error::APK 内无 libapd.so"; exit 1; }
+          # `resetprop` 是 default feature，其 prop-rs 依赖为 UNKNOWN 许可（见
+          # THIRD_PARTY_LICENSES.md）。发布候对应来自 --no-default-features 干净构建；
+          # 这里不硬失败（人工开关/清单负责），但必须在 summary 留下风险记录。
+          if grep -aq -- resetprop "$LIB"; then
+            {
+              echo "## ⚠️ 候选 libapd.so 含 `resetprop` feature（依赖 `prop-rs`：**UNKNOWN 许可**）"
+              echo ""
+              echo "- 该候选**不是**许可干净构建；发布前必须人工确认已改用 \`--no-default-features\` 构建或取得上游书面授权。"
+              echo "- 依据：\`apd/THIRD_PARTY_LICENSES.md\` 阻断项 / NEW-DOC-05 R16。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::候选含 UNKNOWN 许可依赖 prop-rs（resetprop feature）；发布前需人工确认干净构建或授权"
+          else
+            echo "OK license-clean candidate (no resetprop feature in libapd.so)"
+            echo "## ✅ 候选为许可干净构建（libapd.so 无 resetprop/prop-rs）" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # ------------------------------------------------------------------
       # engine/ 再许可门禁（默认阻止）
       # ------------------------------------------------------------------

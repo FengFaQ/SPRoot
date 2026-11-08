@@ -2,7 +2,7 @@
 
 > Project license: **AGPL-3.0-only** (`apd/Cargo.toml`).
 > Generated from `Cargo.lock` with `cargo metadata --filter-platform aarch64-linux-android`
-> commit: `5dc6d09` · packages: 115 (transitive, Android target only)
+> commit: `8b28e87` · packages: 115 (transitive, Android target, **default features incl. `resetprop`**)
 
 ## Summary
 
@@ -22,13 +22,21 @@
 
 All dependencies are permissive (MIT / Apache-2.0 / BSD / ISC / Zlib / Unlicense / BSL-1.0 / CC0 / Unicode-3.0) **except** the items flagged below.
 
-## Flagged items（architect 需汇总进仓库 NOTICE 前处理）
+## Flagged items
 
 | package | version | license | source | action |
 |---|---|---|---|---|
-| `extattr` | 1.0.0 | **GPL-2.0-only** | crates.io | **已移除**：GPL-2.0-only 与 AGPL-3.0 不兼容；已用 raw `libc` 的 `lsetxattr/lgetxattr` 等价替换（`apd/src/restorecon.rs`，wire 行为不变） |
-| `prop-rs` | 0.2.0 | **UNKNOWN** | git (AndroidPatch/restprops) | 上游未声明 license（仓库无 LICENSE 文件、Cargo.toml 无 license 字段）。需 architect 向上游确认或要求补 LICENSE；确认前不得发布 |
-| `prop-rs-android` | 0.2.0 | **UNKNOWN** | git (同上) | 同上（`resetprop` 依赖，不可简单替换） |
+| `extattr` | 1.0.0 | **GPL-2.0-only** | crates.io | **已移除**：与 AGPL-3.0 不兼容；已用 raw `libc` `lsetxattr/lgetxattr` 等价替换（`apd/src/restorecon.rs`，wire 行为不变） |
+| `prop-rs` | 0.2.0 | **UNKNOWN**（无 LICENSE/无 license 字段） | git `AndroidPatch/restprops` @6f57231 | **发布阻断项**；已 feature 隔离：默认构建启用 `resetprop`（含该依赖，仅供开发/日常使用），`--no-default-features` 产出**许可干净构建**（resetprop 子命令返回明确「本构建未启用」错误）。release.yml 另有 engine 类人工开关与清单标注。闭环方式（人类最终裁决，二选一）：① 上游书面授权；② 自研 bionic property area 实现 |
+| `prop-rs-android` | 0.2.0 | **UNKNOWN**（同上） | git（同上） | 同上（`resetprop` 的真正调用面） |
+
+## License-clean build
+
+```bash
+cargo build --release --locked --no-default-features --target aarch64-linux-android
+```
+
+该构建不含 `prop-rs`/`prop-rs-android`（UNKNOWN）→ 依赖树中无 UNKNOWN 许可项，可作为发布候选；代价是 resetprop/system.prop 不可用（CLI 与内部调用均返回明确错误，不静默失败）。apd CI 的 "Clean build check (no default features)" 步骤长期守护该路径可编译。
 
 ## Full list
 
@@ -153,6 +161,5 @@ All dependencies are permissive (MIT / Apache-2.0 / BSD / ISC / Zlib / Unlicense
 ## Notes
 
 1. `java-properties` (git pin 42a4aa9) ships an MIT LICENSE file; `ap_policy` (git pin 51ff116) ships Apache-2.0.
-2. `policy` (the `ap_policy` crate) declares Apache-2.0 in its manifest.
-3. Git dependencies are pinned by revision in `Cargo.lock`; vendoring for release should include their LICENSE files.
-4. This file is generated (script in commit message); regenerate after any dependency change.
+2. Git dependencies are pinned by revision in `Cargo.lock`; vendoring for release must include their LICENSE files.
+3. This file is generated (script in commit message); regenerate after any dependency/feature change.

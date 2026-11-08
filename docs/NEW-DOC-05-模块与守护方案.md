@@ -124,7 +124,7 @@
 | 模块域（保留） | `module install/uninstall/undo-uninstall/enable/disable/action/list/config` | ✅ 保留 | 行为、返回码、stdout JSON 与 APatch 一致（模块生态零迁移） |
 | 模块域（保留） | `module lua <id> <fn>` | ✅ 保留 | 存量模块能力 |
 | 阶段编排 | `post-fs-data` / `services` / `boot-completed` | ✅ 保留（仅 init 调用） | 加 `--superkey-file`，由 rc 传入 |
-| 多调用 | argv[0]=`su` / `resetprop` / `magiskpolicy` | ✅ 保留（`kp` 已删，契约 §3.4） | 分发改为 **basename 精确匹配**（`cli.rs:220-221` 现为 `ends_with`，P1 修） |
+| 多调用 | argv[0]=`su` / `resetprop` / `magiskpolicy` | ✅ 保留（`kp` 已删，契约 §3.4） | 分发为 **basename 精确匹配**（P1 已修）。`resetprop` 为**条件能力**：默认构建启用 `resetprop` feature；`--no-default-features` 的许可干净构建下，`resetprop` 子命令与 `system.prop` 返回明确「本构建未启用」错误（不静默缺失） |
 | 守护 | **`daemon --superkey-file <f>`（新）** | ➕ 新增 | 常驻：授权 socket + uid-listener + 状态文件；init 拉起 |
 | 部署 | **`deploy --source <nativeLibDir> --superkey-file <f>`（新）** | ➕ 新增 | 首装自举（§6.2）：安装 AP/busybox/key/隐藏 su/空授权表 |
 | 部署 | **`undeploy [--keep-modules]`（新）** | ➕ 新增 | 逆序清理（§6.4） |
@@ -458,7 +458,8 @@ apd daemon --superkey-file /data/adb/sproot/key
 | daemon `--selftest` / `selftest` 子命令 | ✅ | 新模块 `selftest.rs`：检查 root/binary/key_file(0600/47-48/mlocked)/allow_list/hidden_su(0700)/目录权限/daemon pid/socket 探活/bootstate/version 一致性/**AVB 审计**；`--json` 供 App 与 qa；exit 0/1 |
 | 体积再瘦身 | ✅ 已改（数值待 CI） | `opt-level = "z"`（原 3）；`env_logger` 移出 Android 构建（`cfg(not(target_os="android"))`）；上一轮已删 goblin/scroll/adb_client（2.11MB→1.35MB） |
 | AVB 审计字段 | ✅ | `deploy` 的 `state.json` 增 `avb: "vbmeta_untouched"` + `commit`；`selftest` 断言；部署/卸载代码**零** vbmeta 操作（grep 证实） |
-| 许可合规（AGPL-3.0） | ✅ | `Cargo.toml` 增 `license = "AGPL-3.0-only"`；**移除 GPL-2.0-only 的 `extattr`**（与 AGPL 不兼容）→ 用 raw `libc` `lsetxattr/lgetxattr` 等价替换（`restorecon.rs`）；新增 `apd/THIRD_PARTY_LICENSES.md`（115 个 Android 目标传递依赖，含 2 项待上游澄清：`prop-rs`/`prop-rs-android`） |
+| 许可合规（AGPL-3.0） | ✅ | `Cargo.toml` 增 `license = "AGPL-3.0-only"`；**移除 GPL-2.0-only 的 `extattr`**（与 AGPL 不兼容）→ raw `libc` `lsetxattr/lgetxattr` 等价替换；`apd/THIRD_PARTY_LICENSES.md` 全量清单（115 包）。`prop-rs`/`prop-rs-android` 为 **UNKNOWN 许可（发布阻断项）** → 按 lead 裁决**不删 resetprop**，改为 **feature 隔离**：`default = ["resetprop"]`，两个 crate `optional = true`；`--no-default-features` 产出**许可干净构建**（resetprop 返回明确错误） |
+| 许可干净构建路径 | ✅ | `apd/Cargo.toml` `[features] default=["resetprop"]`；`apd.yml` 新增 "Clean build check (no default features)"（`cargo check --locked --no-default-features --target aarch64-linux-android`）；capability 断言中 `resetprop` 标为**条件性**（缺省不判失败） |
 | 体积实测（CI） | ✅ | `libapd.so` = **2,054,408 B**（run 42488946176）；`llvm-size -A`：.text 1,234,160 / .rodata 335,176 / .eh_frame 240,768 / .rela.dyn 82,992；capability 断言 15/15 OK |
 
 #### P2 体积归因表（`libapd.so` 3.94 MB → 2.05 MB，qa 门禁背书）
@@ -502,6 +503,7 @@ apd daemon --superkey-file /data/adb/sproot/key
 | R12 | 二进制体积/冷启动（rc 关键路径） | 开机变慢、用户可感 | 低 | 体积实测 + 必要时拆小二进制 / 延迟加载 lua | 开机耗时对比（原厂 vs 修补） |
 | R14 | rc 注入改动 ramdisk 尺寸 / 误碰 vbmeta | 刷入后 AVB/分区校验异常、无法开机 | 中 | 不碰 AVB 密码学；init_boot 优先 + 按分区大小补齐（8388608）；刷入链只 `fastboot flash boot --slot=all`；`state.json` 留 AVB 审计位 | §9-10 + 真机刷入回滚演练 |
 | R15 | 密钥在内存/swap 残留 | 本机 root 凭据泄露 | 低 | mlock + volatile 擦除（SecretKey）；不落明文文件（0600 root 除外）；日志脱敏 | `selftest` mlocked 断言 + 进程内存抽查 |
+| R16 | `prop-rs`/`prop-rs-android` 许可 UNKNOWN（无 LICENSE/无字段） | 含默认 feature 的产物**不可作为发布物**（AGPL 合规风险） | 高（已知） | feature 隔离 + `--no-default-features` 许可干净构建（CI 长期守护）+ release 清单标注；闭环二选一（上游授权 / 自研 bionic property area）由人类裁决 | release 候选必须来自干净构建（CI 可编译断言）；人工清单勾选 |
 
 ---
 
@@ -549,6 +551,8 @@ apd daemon --superkey-file /data/adb/sproot/key
 | **engine 再许可** | `engine/` 含 SKRoot proprietary 内容且再许可未获书面确认 → **默认阻止**；仅 `workflow_dispatch` + `confirm_engine_redistribute=true` 放行，且 job summary 打印风险提示 | 默认红（有意为之） |
 
 > 已知前置项：当前 APK 仅打包 `assets/NOTICE-magiskboot.txt`，缺 SKRoot/AGPL 段落 → LIC 门禁会按设计拦截；需客户端在打包时把仓库根 `NOTICE`（或合并版）一并放入 `assets/`。
+>
+> **发布候选构建要求（R16）**：`libapd.so` 必须来自 `--no-default-features` 的**许可干净构建**（依赖树无 UNKNOWN 项），否则即便 LIC 门禁通过也不得发布；默认构建产物仅供开发/日常使用。`release.yml` 需在候选来源上人工确认（engine 再许可开关同理）。
 
 ## 附录 A · 证据索引（本文所有结论的源码/文档出处）
 

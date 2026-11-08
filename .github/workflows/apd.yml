@@ -83,6 +83,13 @@ jobs:
       - name: Host syntax check
         run: cargo check --locked
 
+      # License-clean build path: prop-rs/prop-rs-android have an UNKNOWN license
+      # (release blocker for AGPL-3.0) and are behind the `resetprop` feature.
+      # This step proves a build without that feature keeps compiling, so a
+      # license-clean artifact can always be produced.
+      - name: Clean build check (no default features)
+        run: cargo check --locked --no-default-features --target aarch64-linux-android
+
       # Real deliverable: cross-compiled release binary for arm64 Android.
       - name: Cross build (release)
         run: cargo build --release --locked --target aarch64-linux-android
@@ -162,6 +169,10 @@ jobs:
             vbmeta_untouched SPROOT_REQUEST_UID /proc/self/attr/current
             sproot- allow_list boot_count safemode module
           )
+          # Conditional capability: only present when the default `resetprop`
+          # feature is enabled (the license-clean build omits it by design).
+          conditional_markers=(resetprop)
+
           : > ../dist/apd-capabilities.txt
           for m in "${markers[@]}"; do
             if grep -aq -- "$m" "$F"; then
@@ -173,6 +184,15 @@ jobs:
               exit 1
             fi
           done
+
+          for m in "${conditional_markers[@]}"; do
+            if grep -aq -- "$m" "$F"; then
+              echo "OK   $m (conditional feature present)" >> ../dist/apd-capabilities.txt
+            else
+              echo "SKIP $m (conditional: feature disabled in this build)" >> ../dist/apd-capabilities.txt
+            fi
+          done
+
           cat ../dist/apd-capabilities.txt
 
       # Per-commit artifact (immutable, keeps history in the UI).

@@ -7,6 +7,15 @@ license = "AGPL-3.0-only"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+# The resetprop tool depends on `prop-rs`/`prop-rs-android` (git, no LICENSE →
+# UNKNOWN license = release blocker for AGPL-3.0). It is therefore a *default*
+# feature so day-to-day builds are unchanged, while release can build
+# `--no-default-features` for a license-clean artifact (see apd.yml "clean build"
+# step and THIRD_PARTY_LICENSES.md).
+[features]
+default = ["resetprop"]
+resetprop = ["dep:prop-rs", "dep:prop-rs-android"]
+
 [dependencies]
 mlua = { version = "0.12.0", features = ["lua54","vendored"] }
 anyhow = "1.0.104"
@@ -46,7 +55,8 @@ env_logger = "0.11.11"
 rustix = { version = "1.1.4", features = ["all-apis"] }
 # some android specific dependencies which compiles under unix are also listed here for convenience of coding
 android-properties = { version = "0.2.2", features = ["bionic-deprecated"] }
-prop-rs-android = { git = "https://github.com/AndroidPatch/restprops", rev = "6f5723105d8d4cacad31d83d343defbf032c7b33"}
+prop-rs-android = { git = "https://github.com/AndroidPatch/restprops", rev = "6f5723105d8d4cacad31d83d343defbf032c7b33", optional = true}
+prop-rs = { git = "https://github.com/AndroidPatch/restprops", rev = "6f5723105d8d4cacad31d83d343defbf032c7b33", optional = true}
 # Pinned to pre-rewrite rev: master (6ee5489) sepol_add_type does two reallocs
 # and writes the new pointers back only if BOTH succeed; on a partial failure
 # policydb keeps a dangling address, and callers discard the error. This runs
