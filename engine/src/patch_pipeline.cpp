@@ -79,7 +79,11 @@ void huawei_bypass(const std::vector<char>& file_buf, KernelSymbolOffset &sym, s
 	patch_ret_0_cmd(file_buf, sym.hkip_check_xid_root, vec_patch_bytes_data);
 }
 
-PatchKernelResult patch_kernel_handler(const std::vector<char>& file_buf, const PatchKernelOffset& off, KernelSymbolOffset& sym, std::vector<patch_bytes_data>& vec_patch_bytes_data) {
+PatchKernelResult patch_kernel_handler(const std::vector<char>& file_buf, const PatchKernelOffset& off, KernelSymbolOffset& sym, std::vector<patch_bytes_data>& vec_patch_bytes_data, std::vector<PatchGroupSpan>* groups) {
+	auto mark = [&](const char* group, const char* symbol, size_t target_addr, size_t first) {
+		if (!groups) return;
+		groups->push_back({ group, symbol, target_addr, first, vec_patch_bytes_data.size() });
+	};
 	KernelVersionParser kernel_ver(file_buf);
 	PatchBase patchBase(file_buf, off.cred_uid_offset, { .kti_addr = off.huawei_kti_addr });
 	PatchDoExecve patchDoExecve(patchBase, sym);
@@ -97,32 +101,74 @@ PatchKernelResult patch_kernel_handler(const std::vector<char>& file_buf, const 
 		auto start_b_location = next_empty_region.offset;
 		PATCH_AND_CONSUME(next_empty_region, 4);
 		r.root_key_start = next_empty_region.offset;
+		size_t g0 = vec_patch_bytes_data.size();
 		PATCH_AND_CONSUME(next_empty_region, patchDoExecve.patch_do_execve(next_empty_region, off.cred_offset, off.seccomp_offset, vec_patch_bytes_data));
+		mark("do_execve", "do_execveat_common", next_empty_region.offset, g0);
+		g0 = vec_patch_bytes_data.size();
 		PATCH_AND_CONSUME(next_empty_region, patchFilldir64.patch_filldir64_root_key_guide(r.root_key_start, next_empty_region, vec_patch_bytes_data));
+		mark("filldir64", "filldir64(root_key_guide)", r.root_key_start, g0);
+		g0 = vec_patch_bytes_data.size();
 		PATCH_AND_CONSUME(next_empty_region, patchFilldir64.patch_filldir64_core(next_empty_region, vec_patch_bytes_data));
+		mark("filldir64", "filldir64(core)", next_empty_region.offset, g0);
+		g0 = vec_patch_bytes_data.size();
 		PATCH_AND_CONSUME(next_empty_region, patchCompatFilldir.patch_compat_filldir_root_key_guide(r.root_key_start, next_empty_region, vec_patch_bytes_data));
+		mark("compat_filldir", "compat_filldir(root_key_guide)", r.root_key_start, g0);
+		g0 = vec_patch_bytes_data.size();
 		PATCH_AND_CONSUME(next_empty_region, patchCompatFilldir.patch_compat_filldir_core(next_empty_region, vec_patch_bytes_data));
+		mark("compat_filldir", "compat_filldir(core)", next_empty_region.offset, g0);
+		g0 = vec_patch_bytes_data.size();
 		auto current_avc_check_bl_func = next_empty_region.offset;
 		PATCH_AND_CONSUME(next_empty_region, patchCurrentAvcCheck.patch_current_avc_check_bl_func(next_empty_region, off.cred_offset, vec_patch_bytes_data));
+		mark("avc_check", "current_avc_check", current_avc_check_bl_func, g0);
+		g0 = vec_patch_bytes_data.size();
 		PATCH_AND_CONSUME(next_empty_region, patchAvcDenied.patch_avc_denied(next_empty_region, current_avc_check_bl_func, vec_patch_bytes_data));
+		mark("avc_denied", "avc_denied", sym.avc_denied.offset, g0);
+		g0 = vec_patch_bytes_data.size();
 		PATCH_AND_CONSUME(next_empty_region, patchAuditLogStart.patch_audit_log_start(next_empty_region, current_avc_check_bl_func, vec_patch_bytes_data));
+		mark("audit_log_start", "audit_log_start", sym.audit_log_start.offset, g0);
 		auto end_b_location = next_empty_region.offset;
+		g0 = vec_patch_bytes_data.size();
 		patchBase.patch_jump(start_b_location, end_b_location, vec_patch_bytes_data);
+		mark("hook_jump", "empty_region_jump", start_b_location, g0);
 	} else if (sym.die.offset && sym.__drm_puts_coredump.offset && sym.__drm_printfn_coredump.offset) {
+		size_t g0 = vec_patch_bytes_data.size();
 		PATCH_AND_CONSUME(sym.__drm_printfn_coredump, patch_ret_cmd(file_buf, sym.__drm_printfn_coredump.offset, vec_patch_bytes_data));
+		mark("drm_printfn_coredump", "__drm_printfn_coredump", sym.__drm_printfn_coredump.offset, g0);
+		g0 = vec_patch_bytes_data.size();
 		PATCH_AND_CONSUME(sym.__drm_puts_coredump, patch_ret_cmd(file_buf, sym.__drm_puts_coredump.offset, vec_patch_bytes_data));
+		mark("drm_puts_coredump", "__drm_puts_coredump", sym.__drm_puts_coredump.offset, g0);
 		r.root_key_start = sym.die.offset;
+		g0 = vec_patch_bytes_data.size();
 		PATCH_AND_CONSUME(sym.die, patchDoExecve.patch_do_execve(sym.die, off.cred_offset, off.seccomp_offset, vec_patch_bytes_data));
+		mark("do_execve", "do_execveat_common", sym.die.offset, g0);
+		g0 = vec_patch_bytes_data.size();
 		PATCH_AND_CONSUME(sym.die, patchFilldir64.patch_filldir64_root_key_guide(r.root_key_start, sym.die, vec_patch_bytes_data));
+		mark("filldir64", "filldir64(root_key_guide)", r.root_key_start, g0);
+		g0 = vec_patch_bytes_data.size();
 		PATCH_AND_CONSUME(sym.die, patchFilldir64.patch_jump(sym.die.offset, sym.__drm_puts_coredump.offset, vec_patch_bytes_data));
+		mark("filldir64", "filldir64(jump)", sym.die.offset, g0);
+		g0 = vec_patch_bytes_data.size();
 		PATCH_AND_CONSUME(sym.__drm_puts_coredump, patchFilldir64.patch_filldir64_core(sym.__drm_puts_coredump, vec_patch_bytes_data));
+		mark("filldir64", "filldir64(core)", sym.__drm_puts_coredump.offset, g0);
+		g0 = vec_patch_bytes_data.size();
 		PATCH_AND_CONSUME(sym.die, patchCompatFilldir.patch_compat_filldir_root_key_guide(r.root_key_start, sym.die, vec_patch_bytes_data));
+		mark("compat_filldir", "compat_filldir(root_key_guide)", r.root_key_start, g0);
+		g0 = vec_patch_bytes_data.size();
 		PATCH_AND_CONSUME(sym.die, patchCompatFilldir.patch_jump(sym.die.offset, sym.__drm_puts_coredump.offset, vec_patch_bytes_data));
+		mark("compat_filldir", "compat_filldir(jump)", sym.die.offset, g0);
+		g0 = vec_patch_bytes_data.size();
 		PATCH_AND_CONSUME(sym.__drm_puts_coredump, patchCompatFilldir.patch_compat_filldir_core(sym.__drm_puts_coredump, vec_patch_bytes_data));
+		mark("compat_filldir", "compat_filldir(core)", sym.__drm_puts_coredump.offset, g0);
+		g0 = vec_patch_bytes_data.size();
 		auto current_avc_check_bl_func = sym.__drm_printfn_coredump.offset;
 		PATCH_AND_CONSUME(sym.__drm_printfn_coredump, patchCurrentAvcCheck.patch_current_avc_check_bl_func(sym.__drm_printfn_coredump, off.cred_offset, vec_patch_bytes_data));
+		mark("avc_check", "current_avc_check", current_avc_check_bl_func, g0);
+		g0 = vec_patch_bytes_data.size();
 		PATCH_AND_CONSUME(sym.__drm_printfn_coredump, patchAvcDenied.patch_avc_denied(sym.__drm_printfn_coredump, current_avc_check_bl_func, vec_patch_bytes_data));
+		mark("avc_denied", "avc_denied", sym.avc_denied.offset, g0);
+		g0 = vec_patch_bytes_data.size();
 		PATCH_AND_CONSUME(sym.__drm_printfn_coredump, patchAuditLogStart.patch_audit_log_start(sym.__drm_printfn_coredump, current_avc_check_bl_func, vec_patch_bytes_data));
+		mark("audit_log_start", "audit_log_start", sym.audit_log_start.offset, g0);
 	} else {
 		patched = false;
 	}

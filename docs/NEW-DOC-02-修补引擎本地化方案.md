@@ -509,6 +509,7 @@ magiskboot 来自 Magisk（**GPL-3.0**），我们以**独立可执行程序**�
 | §1 拒绝 `.img/.gz` | `main.cpp` 扩展名检查 → rc=102；A6f 实测 | ✅ |
 | §2.1 等长产物 | 写回逻辑基于输入 `file_buf` 拷贝；Tier B2 断言待样本 | ⏳ |
 | §2.2 密钥三处明文（stdout 末行 / NDJSON result / report.json） | `main.cpp` `ROOT_KEY=` 兜底行 + `emit_result` + `build_report`；A6c 实测输出含 `ROOT_KEY=` | ✅ |
+| **§2.3 `hooks[]` 逐 hook 落位（P1 新增，非破坏性）** | 引擎已输出顶层 `hooks[]`：每项 `{group,name,resolved,patch_offset,orig_bytes,new_bytes,len,target_addr,target_resolved,patches[]}`；无法解析的组输出 `resolved:false + reason`（不省略）。魅族 21 实测 **15 组**（cfi_bypass/drm×2/do_execve/filldir64×3/compat_filldir×3/avc_check/avc_denied/audit_log_start/embed_key/huawei_bypass(resolved:false)）。旧 `hook_table` 聚合字段**原样保留**（向后兼容） | ✅ |
 | §2.3 report schema | `build_report`（engine_version/input/output/hook_table/hidden_dir_prefix…） | ✅（Tier B5 待样本验证） |
 | §3 退出码 11 枚举 | `ExitCode` enum；A6b/A6c/A6e 实测 101/102 | ✅ |
 | §3 失败不落盘铁律 | `fail()` 内 `fs::remove(opt.out_path)`；A6d 实测 | ✅ |

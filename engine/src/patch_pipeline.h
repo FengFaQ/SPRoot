@@ -30,4 +30,13 @@ void cfi_bypass(const std::vector<char>& file_buf, KernelSymbolOffset& sym, std:
 void huawei_bypass(const std::vector<char>& file_buf, KernelSymbolOffset& sym, std::vector<patch_bytes_data>& vec_patch_bytes_data);
 
 // 五组 hook 织入（A1 §7）
-PatchKernelResult patch_kernel_handler(const std::vector<char>& file_buf, const PatchKernelOffset& off, KernelSymbolOffset& sym, std::vector<patch_bytes_data>& vec_patch_bytes_data);
+// groups 非空时，按"组"回填每组的 patch blob 下标区间（供 report.json 的 hooks[] 逐 hook 落位，
+// C1 §2.3；非破坏性新增，不影响原有 hook_table 聚合字段）
+struct PatchGroupSpan {
+	const char* group;    // do_execve / filldir64 / compat_filldir / avc_denied / audit_log_start / ...
+	const char* symbol;   // 目标符号（人类可读）
+	size_t target_addr;   // 补丁作用地址（0 = 动态解析/未定）
+	size_t first;         // vec_patch 起始下标
+	size_t last;          // vec_patch 结束下标（不含）
+};
+PatchKernelResult patch_kernel_handler(const std::vector<char>& file_buf, const PatchKernelOffset& off, KernelSymbolOffset& sym, std::vector<patch_bytes_data>& vec_patch_bytes_data, std::vector<PatchGroupSpan>* groups = nullptr);

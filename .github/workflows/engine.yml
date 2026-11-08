@@ -108,7 +108,13 @@ jobs:
           $Q "$E" --in /tmp/__missing__ --out /tmp/noout.img --gen-key >/dev/null 2>&1; rc=$?; test $rc -eq 102 || { echo "E_INPUT rc=$rc"; exit 1; }
           test ! -e /tmp/noout.img || { echo "失败却产出 --out（违反 C1 §3 铁律）"; exit 1; }
           set -e
-          echo "qemu contract: 101/102 + no-output-on-failure OK"
+          # P0：非 47+NUL 的 key ABI 必须被拒（Skroot-Next 的 48-no-NUL 不兼容）
+          rm -f /tmp/kabi.img
+          $Q "$E" --in /tmp/__missing__ --out /tmp/kabi.img --key ABCdef0123456789ABCdef0123456789ABCdef0123456789 --key-abi 48nul >/tmp/kabi.log 2>&1; rc=$?
+          test $rc -eq 101 || { echo "key-abi 非 47nul 未被拒绝 rc=$rc"; exit 1; }
+          grep -q 'INCOMPATIBLE' /tmp/kabi.log || { echo "key-abi 拒绝信息缺少不兼容说明"; exit 1; }
+          test ! -e /tmp/kabi.img || { echo "key-abi 拒绝后仍产出 --out"; exit 1; }
+          echo "qemu contract: 101/102 + no-output-on-failure + key-abi guard OK"
 
       - name: JNI 符号与客户端包名对齐断言（防 UnsatisfiedLinkError）
         # 客户端类：me.sproot.patch.NativeEngine（object，@JvmStatic external fun）
@@ -127,7 +133,15 @@ jobs:
 
       - name: asm oracle（asmjit 字节 vs NDK LLVM 汇编器，逐字节比对）
         # 防止 asmjit 版本/参数变化导致跳板字节悄悄改变（修补"成功"但内核跑飞）
-        run: bash engine/android/tools/asm_oracle.sh 29
+        run: |
+          set -euo pipefail
+          LOG=$(bash engine/android/tools/asm_oracle.sh 29 2>&1 | tee /dev/stderr)
+          echo "$LOG" | grep -q 'asm oracle: PASS=' || { echo "asm oracle 未产出结果"; exit 1; }
+          echo "$LOG" | grep -q 'FAIL=0' || { echo "asm oracle 存在不一致"; exit 1; }
+          CASES=$(echo "$LOG" | grep -c '^PASS ')
+          META=engine/android/build/arm64/ENGINE-META.txt
+          { echo "asm_oracle=PASS"; echo "asm_oracle_cases=$CASES"; echo "asm_oracle_toolchain=llvm-as-via-ndk-clang+llvm-objdump"; } >> "$META"
+          cat "$META" | tail -4
 
       - name: T-12 强断言（合成 bootimg，无需样本，必跑）
         # 强判据：repack 后回读 kernel 段 sha256 必须 == patch 输出 sha256（不是只比长度）。
@@ -194,7 +208,7 @@ jobs:
           cp engine/android/build/arm64/SYMBOLS-libskrootpatch.txt out/ 2>/dev/null || true
           if [ -f dist/magiskboot ]; then cp dist/magiskboot out/; fi
           if [ -f dist/magiskboot-meta.txt ]; then cp dist/magiskboot-meta.txt out/; fi
-          (cd out && sha256sum *.so > SHA256SUMS && cat SHA256SUMS)
+          (cd out && sha256sum $(ls | grep -v '^SHA256SUMS$') | sort -k2 > SHA256SUMS && cat SHA256SUMS)
 
       - uses: actions/upload-artifact@v4
         if: always()

@@ -135,7 +135,32 @@ struct EngineState {
     std::vector<std::string> errors;
     size_t cfi_patch_count = 0;
     size_t huawei_patch_count = 0;
+    // C1 §2.3：逐 hook 落位（非破坏性新增；旧 hook_table 聚合字段保留）
+    std::vector<PatchGroupSpan> groups;
+    std::vector<char> orig_buf;                 // 打补丁前的镜像（回填 orig_bytes）
+    std::vector<size_t> patch_addrs;            // vec_patch[i].write_addr 镜像
+    std::vector<size_t> patch_lens;             // 每处补丁字节数
+    std::vector<std::string> patch_hex;          // 每处补丁 bytes（大写 hex）
 };
+
+// 十六进制小写化（vec_patch 内部为大写 hex；orig_bytes 由镜像读出，统一小写便于比对）
+static std::string hex_lower(const std::string& s) {
+    std::string o = s;
+    for (auto& c : o) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return o;
+}
+static std::string hex_of_str(const std::string& s) { return s; }
+static std::string hex_of(const std::vector<char>& buf, size_t off, size_t n) {
+    static const char* d = "0123456789abcdef";
+    std::string o;
+    o.reserve(n * 2);
+    for (size_t i = 0; i < n && off + i < buf.size(); ++i) {
+        unsigned char b = static_cast<unsigned char>(buf[off + i]);
+        o.push_back(d[b >> 4]);
+        o.push_back(d[b & 0xf]);
+    }
+    return o;
+}
 
 static J build_report(const EngineOptions& opt, const EngineState& st, const std::string& root_key) {
     // C1 §2.3：input/output 均含 path/sha256/size（qa 门禁用其做等长与产物一致性断言）
@@ -163,6 +188,51 @@ static J build_report(const EngineOptions& opt, const EngineState& st, const std
        .set("kernel_version", st.kernel_version)
        .set("key_spec", std::move(key_spec))
        .set("hook_table", std::move(hooks))
+       .set("hooks", [&st]() -> J {
+            // C1 §2.3 五组逐 hook 落位（非破坏性新增）：每组含 group/name/resolved/
+            // patch_offset/orig_bytes/new_bytes/target_addr + patches[]（该组全部落位）
+            J arr = J::array();
+            for (const auto& g : st.groups) {
+                J h;
+                size_t n = (g.last > g.first) ? (g.last - g.first) : 0;
+                h.set("group", g.group ? g.group : "").set("name", g.symbol ? g.symbol : "");
+                if (n == 0) {
+                    h.set("resolved", false).set("reason", "no_patch_bytes_symbol_missing_or_not_used");
+                } else {
+                    h.set("resolved", true);
+                    const auto& first = st.groups.empty() ? g : g;
+                    size_t off0 = 0, len0 = 0;
+                    // 首处落位（供 qa 快速核对；完整列表见 patches[]）
+                    (void)first;
+                    J patches = J::array();
+                    for (size_t i = g.first; i < g.last; ++i) {
+                        size_t addr = st.patch_addrs[i];
+                        size_t len = st.patch_lens[i];
+                        if (off0 == 0) { off0 = addr; len0 = len; }
+                        J pj;
+                        pj.set("patch_offset", "0x" + [&]{ std::ostringstream o; o << std::hex << addr; return o.str(); }())
+                          .set("orig_bytes", hex_of(st.orig_buf, addr, len))
+                          .set("new_bytes", hex_lower(hex_of_str(st.patch_hex[i])))
+                          .set("len", static_cast<long long>(len));
+                        patches.push(std::move(pj));
+                    }
+                    char addr_hex[32]; std::snprintf(addr_hex, sizeof(addr_hex), "0x%zx", off0);
+                    h.set("patch_offset", std::string(addr_hex));
+                    h.set("orig_bytes", hex_of(st.orig_buf, off0, len0));
+                    h.set("new_bytes", hex_lower(hex_of_str(st.patch_hex[g.first])));
+                    h.set("len", static_cast<long long>(len0));
+                    h.set("patches", std::move(patches));
+                }
+                if (g.target_addr) {
+                    std::ostringstream t; t << "0x" << std::hex << g.target_addr;
+                    h.set("target_addr", t.str());
+                } else {
+                    h.set("target_addr", nullptr);
+                }
+                arr.push(std::move(h));
+            }
+            return arr;
+        }())
        .set("hidden_dir_prefix", root_key.substr(0, 16))
        .set("errors", std::move(errors));
     return rep;
@@ -463,17 +533,21 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
     emit_progress("patch_cfi_huawei", 40, "...");
     {
         size_t before = vec_patch.size();
+        st.orig_buf = st.file_buf;
         cfi_bypass(st.file_buf, sym, vec_patch);
         st.cfi_patch_count = vec_patch.size() - before;
+        st.groups.push_back({ "cfi_bypass", "__cfi_check(family)", sym.__cfi_check.offset, before, vec_patch.size() });
         before = vec_patch.size();
         huawei_bypass(st.file_buf, sym, vec_patch);
         st.huawei_patch_count = vec_patch.size() - before;
+        st.groups.push_back({ "huawei_bypass", "hkip_check_(uid|gid|xid)_root", sym.hkip_check_uid_root, before, vec_patch.size() });
     }
 
     // 7) 五组 hook
     emit_progress("patch_hooks", 50, "...");
     {
-        pr = patch_kernel_handler(st.file_buf, off, sym, vec_patch);
+        st.orig_buf = st.file_buf;   // 备份：hooks[].orig_bytes 用原始字节
+        pr = patch_kernel_handler(st.file_buf, off, sym, vec_patch, &st.groups);
         if (!pr.patched)
             return fail(E_NO_HOOK_SPACE, "E220: failed to find hook start addr / not enough kernel space", "-");
         J hooks; hooks.set("name", "hooks_embedded").set("blob_count", static_cast<int>(vec_patch.size()))
@@ -482,16 +556,24 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
     }
 
     // 8) 密钥内嵌（47 字符 + NUL，写入 handler 选定的 root_key_start，与上游等价，A1 §4.1）
+    size_t key_blob_first = vec_patch.size();
     emit_progress("embed_key", 80, "len=48");
     {
         std::string write_key = root_key;
         write_key.erase(write_key.size() - 1);
         patch_data(st.file_buf, pr.root_key_start, (void*)write_key.c_str(), write_key.length() + 1, vec_patch);
+        st.groups.push_back({ "embed_key", "root_key(47+NUL)", pr.root_key_start, key_blob_first, vec_patch.size() });
     }
 
     // 9) 应用补丁并写输出（临时文件 + rename）
     emit_progress("write_output", 95, "...");
     {
+        st.patch_addrs.clear(); st.patch_lens.clear(); st.patch_hex.clear();
+        for (auto& item : vec_patch) {
+            st.patch_addrs.push_back(item.write_addr);
+            st.patch_lens.push_back(item.str_bytes.size() / 2);
+            st.patch_hex.push_back(item.str_bytes);
+        }
         std::vector<char> patched = st.file_buf;
         for (auto& item : vec_patch) {
             std::vector<uint8_t> bytes(item.str_bytes.length() / 2);
