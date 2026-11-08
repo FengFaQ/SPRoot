@@ -125,6 +125,10 @@ jobs:
           ! echo "$SYMS" | grep -q 'Java_com_sproot_manager'
           echo "JNI symbols OK: me.sproot.patch.NativeEngine {patch, engineVersion}"
 
+      - name: asm oracle（asmjit 字节 vs NDK LLVM 汇编器，逐字节比对）
+        # 防止 asmjit 版本/参数变化导致跳板字节悄悄改变（修补"成功"但内核跑飞）
+        run: bash engine/android/tools/asm_oracle.sh 29
+
       - name: T-12 强断言（合成 bootimg，无需样本，必跑）
         # 强判据：repack 后回读 kernel 段 sha256 必须 == patch 输出 sha256（不是只比长度）。
         # verify_artifact.sh 的 A7 段用合成 boot.img 覆盖这条回归；此处断言其 PASS 文本。

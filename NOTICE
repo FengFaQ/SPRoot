@@ -1,0 +1,61 @@
+# SPRoot NOTICE — 第三方组件与许可
+
+本仓库包含/分发以下第三方组件。**修改或再分发前请阅读本清单与各组件许可证原文。**
+
+## 1. SKRoot 内核修补引擎核心（proprietary）
+
+- 来源：`upstream/SKRoot-linuxKernelRoot/**`（上游基线 master@943382cd），其 `Lite_version/src/patch_kernel_root/**`
+  被 vendor 到 `engine/src/analyze/`、`engine/src/patch_*.cpp`、`engine/src/3rdparty/aarch64_*.h`。
+- 许可证：**上游仓库未附 LICENSE/COPYING，源文件无版权头 → 默认 All rights reserved（proprietary，无 SPDX）**。
+- 授权状态：**项目所有人已确认「有作者授权，可以调用」**（2026-11-08），故本项目内部可编译、可自用；
+  **对外分发（APK/二进制）前仍需保存上游书面授权凭证**。详见 `docs/NEW-DOC-02-修补引擎本地化方案.md` §12。
+
+## 2. asmjit（Zlib License）
+
+- 位置：`engine/src/3rdparty/asmjit2-src/`（AArch64 汇编器，引擎跳板字节由此生成）。
+- 许可证：**Zlib**（`engine/src/3rdparty/asmjit2-src/LICENSE.md`，宽松，保留版权声明即可）。
+- SPDX：`Zlib`
+
+## 3. Capstone 5.0.7（BSD-3-Clause）
+
+- 位置：`engine/src/3rdparty/capstone-5.0.7/`（AArch64 反汇编，仅仓库包含 `include/` 与 `src/` 子集）。
+- 许可证：**BSD-3-Clause**（上游 capstone 许可）。本仓子集未随附 LICENSE 文本，**分发前需补入**上游
+  `LICENSE.TXT`/`LICENSE_LLVM.TXT`。
+- SPDX：`BSD-3-Clause`
+
+## 4. cJSON（MIT）
+
+- 位置：`engine/src/3rdparty/cJSON/`（引擎 report.json / NDJSON 序列化）。
+- 许可证：**MIT**。本仓仅含 `cJSON.cpp`/`cJSON.h`，**分发前需补入**上游 `LICENSE`。
+- SPDX：`MIT`
+
+## 5. Magisk / magiskboot（GPL-3.0）
+
+- 使用方式：CI 从 Magisk 官方 release **v31.1** 下载 `Magisk-v31.1.apk`
+  （sha256 `89cefac0a318afa39fb3880c45c87b036c05bc1ebf02a7a715b7f8d7c26ac6e7`），解出
+  `lib/arm64-v8a/libmagiskboot.so`（988,984 B，sha256
+  `97e9ec75731103d31c9e1effca7a50c6444309ce8f78c2ec27e9fe721da4bb54`），重命名 `magiskboot` 后随工具链/APK 分发。
+- 许可证：**GPL-3.0**。magiskboot 作为**独立可执行程序**与本项目聚合分发，不传染本项目自有代码；
+  义务：①随分发物提供 **GPL-3.0 全文**；②标注来源（Magisk v31.1 官方 release URL）与二进制 sha256；
+  ③若修改 magiskboot 源码则须公开修改。
+- SPDX：`GPL-3.0-only`
+- 机器可读元数据：CI 产物 `magiskboot-meta.txt`（版本/来源/sha256）。
+
+## 6. 旧 APatch 管理器代码（GPL-3.0，仅历史参考）
+
+- 位置：`app/`（旧 APatch 衍生管理器，含 `app/LICENSE` = **GPL-3.0**）。
+- 新管理器若**复用其代码**则整体须 GPL-3.0 开源；若仅作设计参考、未复制代码，则不受其传染。
+  当前新管理器的许可待项目所有人确定。
+
+## 7. 构建/测试期依赖（不随产物分发或按各自许可）
+
+| 组件 | 用途 | 许可 |
+|---|---|---|
+| Android NDK r27c（clang/llvm-objdump/llvm-strip） | 交叉编译工具链 | Apache-2.0 + LLVM 例外 |
+| qemu-user（qemu-aarch64/aarch64-static） | 无真机运行时验证（CI/本地） | GPL-2.0（仅测试工具，不随产品分发） |
+| Kotlin / Jetpack Compose / miuix / libsu 等 | 客户端（由 Gradle 依赖管理） | 各自许可（见依赖树） |
+
+## 免责声明
+
+本项目为**内核级 Root 修补**工具，修改 boot 镜像可能导致设备**无法开机、数据丢失、保修失效**。
+所有使用风险由使用者承担。刷机前务必备份原厂镜像并确认可回滚（见 `docs/NEW-DOC-02` §7.4）。

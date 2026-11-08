@@ -15,7 +15,7 @@
 | 项 | 结论 |
 |---|---|
 | 旧病根 | 唯一产物 `engine/src/skroot-patch` 是**宿主 x86-64 glibc 动态 ELF**（`e_machine=0x3E`、带 `PT_INTERP=/lib64/ld-linux-x86-64.so.2`），并且从未进 APK。详见 NEW-DOC-03。 |
-| 本方案 | `engine/android/build_arm64.sh` 用 **NDK r27c clang 18.0.3** 交叉编译同一份 C++ 源码（含新增内置 bootimg 处理），产出 **AArch64** 两种形态：①静态可执行 `skroot-patch`（2,909,504 B，工具/排障用，**不进 APK**）②**JNI 共享库 `libskrootpatch.so`**（2,975,560 B，`System.loadLibrary("skrootpatch")`，进 `jniLibs`）。两者均通过 ELF/契约断言。 |
+| 本方案 | `engine/android/build_arm64.sh` 用 **NDK r27c clang 18.0.3** 交叉编译同一份 C++ 源码（含新增内置 bootimg 处理），产出 **AArch64** 两种形态：①静态可执行 `skroot-patch`（2,920,512 B，工具/排障用，**不进 APK**）②**JNI 共享库 `libskrootpatch.so`**（2,987,088 B，`System.loadLibrary("skrootpatch")`，进 `jniLibs`）。两者均通过 ELF/契约断言。 |
 | 关键坑（已实测） | NDK 静态可执行文件必须用 **`ANDROID_API>=29`** 编译，否则 `PT_TLS p_align=8`，bionic 启动即 abort；API≥29 才输出 `p_align=0x40`。 |
 | 无真机验证 | `verify_artifact.sh`：Tier A（ELF/契约，qemu-user 可跑，**ALL PASS**）+ Tier B（真内核字节级断言）。**已用魅族 21 官方 boot.img 全链实测**：抽 kernel sha256 与 qa ground truth 一致、补丁 rc=0、等长、可确定性复现、重打包等长。 |
 | 推荐集成 | **主形态 JNI（`libskrootpatch.so` + `System.loadLibrary("skrootpatch")`）**，次形态静态 exec（`skroot-patch` 从 `nativeLibraryDir` 真实路径 exec，**禁止** symlink 到 `filesDir`；该可执行件默认不进 APK）。 |
@@ -136,8 +136,8 @@ llvm-strip --strip-all <build>/jni/libskrootpatch.so
 
 | 产物 | 路径 | 大小 | sha256（前 32 位） | 类型 |
 |---|---|---|---|---|
-| 静态可执行（工具/排障，**不进 APK**） | `engine/dist/skroot-patch-arm64`（源码产物 `build/arm64/exec/skroot-patch`） | **2,909,504 B** | `e94a8186163b77180d7eb8f80ee74ff9` | `ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped` |
-| **JNI 共享库（APK 内 `libskrootpatch.so`）** | `engine/dist/libskrootpatch-arm64-jni.so`（源码产物 `build/arm64/jni/libskrootpatch.so`） | **2,975,560 B** | `f0cc70861b9003b4df487bd88b8355a2` | `ELF 64-bit LSB shared object, ARM aarch64, dynamically linked`，`SONAME=libskrootpatch.so`，NEEDED 仅 `libm.so/libdl.so/libc.so`，导出 `Java_me_sproot_patch_NativeEngine_patch/engineVersion` |
+| 静态可执行（工具/排障，**不进 APK**） | `engine/dist/skroot-patch-arm64`（源码产物 `build/arm64/exec/skroot-patch`） | **2,920,512 B** | `ae967d2788c47d9e833daa6d7799328a` | `ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped` |
+| **JNI 共享库（APK 内 `libskrootpatch.so`）** | `engine/dist/libskrootpatch-arm64-jni.so`（源码产物 `build/arm64/jni/libskrootpatch.so`） | **2,987,088 B** | `9788ab74b69161e7f1237daa58154d35` | `ELF 64-bit LSB shared object, ARM aarch64, dynamically linked`，`SONAME=libskrootpatch.so`，NEEDED 仅 `libm.so/libdl.so/libc.so`，导出 `Java_me_sproot_patch_NativeEngine_patch/engineVersion` |
 
 > **命名约定（与 app-client 对齐，重要）**：APK `jniLibs/arm64-v8a/libskrootpatch.so` 必须是**JNI 共享库**（ET_DYN，`System.loadLibrary("skrootpatch")`）；独立可执行文件改名 `skroot-patch`（裸名），**绝不放进 jniLibs**，避免"名字像库实为 ET_EXEC、loadLibrary 必崩"的混淆。
 
@@ -146,8 +146,8 @@ llvm-strip --strip-all <build>/jni/libskrootpatch.so
 完整摘要见 `engine/dist/SHA256SUMS`：
 
 ```
-e94a8186163b77180d7eb8f80ee74ff9b5464492b8c35bbc1012b3a6c0ce3005  skroot-patch-arm64
-f0cc70861b9003b4df487bd88b8355a2a58132c9c64ceacff74cd50f470e4711  libskrootpatch-arm64-jni.so
+ae967d2788c47d9e833daa6d7799328ab4443fa4f9303cdd7a80608ca8f37738  skroot-patch-arm64
+9788ab74b69161e7f1237daa58154d3532aa96eab719a3a85f086a156bdcaaf9  libskrootpatch-arm64-jni.so
 ```
 
 ELF 证据链（`readelf`）：
@@ -451,9 +451,53 @@ fastboot reboot
 - 回滚：刷前按 **sha1 内容寻址**保存原 boot.img（学 KSU），失败可用官方全量包回滚（`flash.bat.reference`）。
 - 待验：真机刷入后能否开机（`fastboot` 在 A/B 双槽的 `--slot=all` 语义已与官方脚本一致）。
 
-### 7.5 许可证（Magisk GPL-3.0 的聚合声明）
+### 7.5 ⚠️ P0 防错：密钥 ABI 不与 Skroot-Next 兼容（必须写死）
 
-magiskboot 来自 Magisk（**GPL-3.0**），我们以**独立可执行程序**随 APK/工具链分发 → 属 GPL 允许的「聚合（aggregate）」，**不传染**我们自研代码；义务是：①随包提供 GPL-3.0 文本；②在 NOTICE/许可清单标注来源（URL + 版本 + 二进制 sha256）；③若修改 magiskboot 源码则需公开修改。已生成 `magiskboot-meta.txt` 随 artifact 分发；NOTICE 条目由 task-8/architect 并入发布清单。
+调研 `docs/research/skroot-next-analysis.md` 结论：**两套 patcher 的密钥 ABI 不兼容，产物不可混用**。
+
+| 维度 | **SPRoot / 现行上游（本引擎）** | Skroot-Next（第三方） |
+|---|---|---|
+| 密钥长度 | 输入 48 字符 `[A-Za-z0-9]` | 48 字节 |
+| 落盘写入内核 | **`key[0..46]` + NUL（共 48 字节，第 48 字节恒为 0）** | **48 字节无 NUL**，按输入实际长度比较 |
+| 内核侧比较 | 跳板逐字节 `ldrb/cmp/cbnz`，遇 NUL 终止（`patch_do_execve.cpp:89-102`） | 按长度比较（`base_func.h:34-40`） |
+| 用户态提权串 | **47 字符 + NUL**（CALL v1.1 **E1**） | 48 字节按实际串 |
+| 交叉套用后果 | **提权失败（静默）**；两套补丁的隐藏目录前缀/密钥语义不同 | 同左 |
+
+**引擎已实现的强制自检（可测）**：
+- `--key-abi <值>`：缺省 `47nul`；**任何其它取值（如 `48nul`/`48`）→ `E101` 拒绝**，stderr 明确写出
+  "SPRoot engine implements only 47+NUL … Skroot-Next uses 48-byte no-NUL ABI and is INCOMPATIBLE"。
+- `report.json → key_spec.abi = "47+NUL"`：产物自描述，qa/客户端可断言，避免与 Next 产物混淆。
+- 文档写死：**禁止**用 Skroot-Next 打过的内核再用本引擎/密钥提权；反之亦然。
+
+**验证命令**（CI 已覆盖）：
+```bash
+skroot-patch --in kernel --out out --key <48字符> --key-abi 48nul   # → rc=101 且无 out 文件
+skroot-patch --in kernel --out out --key <48字符>                   # → rc=0，report.key_spec.abi=="47+NUL"
+```
+
+### 7.6 诊断能力：`--dump-symbols` 与前置拒绝提示
+
+借鉴 Skroot-Next 的可用做法（其余代码不可复用：该仓 2025-01 后无更新、MSVC 构建、无 release/CI）：
+
+| 能力 | 本引擎现状 |
+|---|---|
+| 全量符号 dump | **已加 `--dump-symbols`**：解析 kallsyms 后按地址排序打印 `0x<offset> <symbol>`（魅族 21 实测 93,240 行），NDJSON 输出 `result.symbols` 计数；仅读不写盘，用于"机型号/符号缺失"快速定位 |
+| 拒绝错误输入并给可操作提示 | **已强化**：`--in *.img/*.gz` → `E102`，stderr 给出具体命令：`./magiskboot unpack boot.img` / `gzip -dc` / `lz4 -d` |
+| 能力边界与危险警告 | 见本节 + `NOTICE` 免责声明 + `NEW-DOC-03` 失败模式清单 |
+
+### 7.7 asm oracle：asmjit 字节的独立对照器
+
+风险：引擎五组跳板全部由 **asmjit** 生成；asmjit 版本/编译参数变化可能让字节**静默**改变 → 修补"成功"但内核跑飞。
+做法（`engine/android/tools/`）：
+
+- `asmjit_probe.cpp`：对一组关键指令（`nop / mov x0,x0 / add / sub sp,sp / cmp / ldrb post-index / str xzr post-index / cbnz / movk / ret`）用 asmjit 生成字节；
+- `asm_oracle.sh`：用 **NDK 自带 LLVM 汇编器**（`clang -x assembler` + `llvm-objdump -d`）汇编同一批助记符，取机器码与 asmjit 输出**逐字节比对**；不一致即 FAIL。
+- 实测：**10/10 PASS**；已进 CI（`engine.yml` 步骤「asm oracle」）。probe 只作测试，不进引擎产物。
+
+### 7.8 许可证（Magisk GPL-3.0 的聚合声明 + 根 NOTICE）
+
+magiskboot 来自 Magisk（**GPL-3.0**），我们以**独立可执行程序**随 APK/工具链分发 → 属 GPL 允许的「聚合（aggregate）」，**不传染**我们自研代码；义务是：①随包提供 GPL-3.0 文本；②在 NOTICE/许可清单标注来源（URL + 版本 + 二进制 sha256）；③若修改 magiskboot 源码则需公开修改。已生成 `magiskboot-meta.txt` 随 artifact 分发。
+**仓根 `NOTICE` 已建立**（本组维护）：逐项列出 SKRoot(proprietary·已获授权)/asmjit(Zlib)/capstone(BSD-3)/cJSON(MIT)/Magisk(GPL-3.0)/旧 APatch(GPL-3.0) 的来源、SPDX、义务与待补 LICENSE 文本清单；`LICENSE`（自有代码许可）待人类裁定。
 
 > SKRoot 核心授权：人类已确认「有作者授权，可以调用」→ D-3 合规阻塞解除（不再需要 clean-room）；仍建议在 NOTICE 注明授权来源与范围。
 

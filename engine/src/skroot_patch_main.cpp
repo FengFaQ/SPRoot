@@ -57,6 +57,12 @@ struct EngineOptions {
     std::string json_sink;     // --json NDJSON 落盘（可空）
     std::string key;
     bool key_from_user = false;
+    // 密钥 ABI（P0 防错，见 NEW-DOC-02 §7.6）：
+    //   本引擎只实现 47 字符 + NUL（key[0..46] 写入跳板，第 48 字节恒 0）。
+    //   Skroot-Next 用「48 字节无 NUL、按输入长度比较」，两套**不可混用**。
+    //   因此显式要求 --key-abi=47nul（缺省即此值）；任何其它取值一律拒绝。
+    std::string key_abi = "47nul";
+    bool dump_symbols = false;
 };
 
 static std::ofstream g_ndjson;
@@ -139,6 +145,7 @@ static J build_report(const EngineOptions& opt, const EngineState& st, const std
                 .set("size", static_cast<long long>(st.output_size));
     J key_spec;
     key_spec.set("charset", "A-Za-z0-9").set("length", 48).set("stored_len", 47)
+            .set("abi", "47+NUL")   // P0：与 Skroot-Next 的 48-no-NUL ABI 不兼容
             .set("source", opt.key_from_user ? "user" : "gen");
     J errors = J::array();
     for (auto& e : st.errors) errors.push(e);
@@ -279,6 +286,8 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
         if (a == "--in") { opt.in_path = need("--in"); have_in = true; }
         else if (a == "--out") { opt.out_path = need("--out"); have_out = true; }
         else if (a == "--key") { opt.key = need("--key"); opt.key_from_user = true; have_key = true; }
+        else if (a == "--key-abi") { opt.key_abi = need("--key-abi"); }
+        else if (a == "--dump-symbols") { opt.dump_symbols = true; }
         else if (a == "--gen-key") { have_key = true; }
         else if (a == "--json") { opt.json_sink = need("--json"); }
         else if (a == "--workdir") { opt.workdir = need("--workdir"); }
@@ -298,6 +307,21 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
         emit_result(E_USAGE, std::move(e));
         return E_USAGE;
     }
+    // 密钥 ABI 自检：拒绝任何非 47+NUL 的 ABI（防把 Skroot-Next 的 48 无 NUL 密钥套到本引擎产物上）
+    {
+        std::string normalized;
+        for (char c : opt.key_abi) if (c != '+' && c != '-' && c != '_') normalized.push_back(
+            static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        if (normalized != "47nul") {
+            std::string msg = "E101: unsupported --key-abi '" + opt.key_abi +
+                "'; SPRoot engine implements only 47+NUL (key[0..46] + NUL, 48th byte is 0). "
+                "Skroot-Next uses 48-byte no-NUL ABI and is INCOMPATIBLE — do not mix keys or patchers.";
+            std::cerr << msg << "\n";
+            J e; e.set("error", msg);
+            emit_result(E_USAGE, std::move(e));
+            return E_USAGE;
+        }
+    }
     if (opt.key_from_user && !valid_key(opt.key)) {
         J e; e.set("error", "E101: --key must match ^[A-Za-z0-9]{48}$");
         emit_result(E_USAGE, std::move(e));
@@ -307,7 +331,11 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
         std::string ext = fs::path(opt.in_path).extension().string();
         std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c){ return std::tolower(c); });
         if (fs::exists(opt.in_path) && (ext == ".img" || ext == ".gz")) {
-            J e; e.set("error", "E102: input looks like boot image/compressed kernel; unpack & decompress first");
+            std::string msg = "E102: input looks like boot image/compressed kernel (" + ext +
+                "). Action: ./magiskboot unpack boot.img  # → kernel, then pass that raw kernel; "
+                "gzip: gzip -dc kernel.gz > kernel; lz4: lz4 -d kernel.lz4 kernel";
+            std::cerr << msg << "\n";
+            J e; e.set("error", msg);
             emit_result(E_INPUT, std::move(e));
             return E_INPUT;
         }
@@ -362,6 +390,29 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
             return fail(E_KALLSYMS, "E201: failed to analyze kernel symbols", "CONFIG_KALLSYMS missing or unsupported layout");
         sym = symbol_analyze.get_symbol_offset();
         KernelVersionParser kv(st.file_buf);
+        // --dump-symbols：全量符号 dump（诊断用，对齐 Skroot-Next patch_kernel_root.cpp 的诊断能力）。
+        // 只读取符号表、不落盘任何产物，便于"机型号不匹配/关键符号缺失"时快速定位。
+        if (opt.dump_symbols) {
+            auto all = symbol_analyze.get_all_symbols();
+            std::vector<std::pair<std::string, uint64_t>> rows(all.begin(), all.end());
+            std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+                return a.second < b.second;
+            });
+            std::cout << "# SPRoot symbol dump (" << rows.size() << " symbols, base=0x"
+                      << std::hex << sym._text << std::dec << ")\n";
+            for (auto& r : rows) {
+                char buf[128];
+                std::snprintf(buf, sizeof(buf), "0x%08llx %s\n",
+                              static_cast<unsigned long long>(r.second), r.first.c_str());
+                std::cout << buf;
+            }
+            J extra; extra.set("symbols", static_cast<long long>(rows.size()))
+                          .set("dump", "stdout");
+            emit_result(OK, std::move(extra));
+            if (g_ndjson.is_open()) g_ndjson.close();
+            return OK;
+        }
+
         {   // C1 §2.3：kernel_version 必须是真实版本串（qa/审计依赖），解析失败才回落 unknown
             std::string ver = kv.get_kernel_version();
             if (!ver.empty()) st.kernel_version = ver;
