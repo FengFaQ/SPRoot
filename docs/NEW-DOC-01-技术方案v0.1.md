@@ -1,9 +1,9 @@
 ﻿# 全新 SP 管理器技术方案 v0.1（NEW-DOC-01）
 
 - 文档编号：NEW-DOC-01
-- 版本：**v1.1.2（定稿）**（新增 §11.4.4：`prop-rs` 依赖做成可选 feature `resetprop` + `--no-default-features` 干净构建 + CI 防腐化）
+- 版本：**v1.1.3（定稿）**（新增 §3.7「客户端已实现能力清单（v2 实况）」+ §8.2 按实况修正为 5 个工作流 + 7 项设计/实现差异）
 - 作者：架构（architect）
-- 状态：**定稿 v1.1.2｜供实现与质测引用**
+- 状态：**定稿 v1.1.3｜供实现与质测引用**
 - 项目重大转向：**放弃「改造 APatch 管理器 APK」路线，从零实现全新 SP 管理器；内核修补全程在安卓手机本地完成（不经 PC/云端）**
 - 参考对象：KernelSU(KSU) 与 APatch(AP) 管理器的**架构形态与修补方式**（不复制其内核侧机制）
 - UI 库指定：<https://github.com/compose-miuix-ui/miuix>
@@ -389,6 +389,51 @@ data class AppState(
 | 修补失败 | `kernel=PATCH_FAILED` | 常驻错误卡片（§5.7-L5）+ 日志/诊断导出 + 「重试」 |
 
 > 与 §5.8 的分工：**§5.8 是「修补过程内」的状态机**（一次修补的八步）；**本节是「应用生命周期」状态机**（跨重启、跨安装）。两者正交，UI 上分属「首页状态卡」与「修补页进度」。
+
+### 3.7 客户端已实现能力清单（**v2 实况**，2026-11-08）
+
+> 目的：技术方案的客户端章节此前停留在设计态；本节把 `app/`（Kotlin + Compose + miuix 客户端）的**实际实现**逐项登记，并列出与设计态的差异（§3.7.2），供 task-5/task-7 对齐。证据均为 v2 仓库内文件路径，可直接核对。
+
+#### 3.7.1 已实现（可用）
+
+| # | 能力 | 实现入口（v2 路径） | 关键点 |
+|---|---|---|---|
+| C1 | 四页导航（主页/修补/模块/设置） | `app/src/main/java/com/sproot/manager/ui/AppRoot.kt:35-69` | miuix `NavigationBar`，4 个 `AppTab`；与 §4.4 页面映射一致 |
+| C2 | **修补流水线（8+1 步）** | `app/.../core/PatchPipeline.kt:18-45` | ①环境自检→②复制+**sha1 内容寻址备份**→③`magiskboot unpack`→④压缩则 `decompress`→⑤**JNI patch（密钥注入）**→⑥原压缩格式 `compress`→⑦`magiskboot repack`→⑧校验（存在/内核等长/sha256/与输入不同）→⑨状态机置「已修补·待刷入」；**全程无 root、无 shell、无脚本** |
+| C3 | PatchMode 模式（改造版） | `app/.../core/Models.kt:30-49` | 可用：`EXPORT_ONLY`、`EXPORT_AND_GUIDE`（含 fastboot 模板+AVB 风险提示）；预留 `RESTORE_BACKUP`、`UNINSTALL_RESTORE`（`enabled=false`） |
+| C4 | **入口能力自检（阻断式）** | `app/.../core/Capabilities.kt:22-60+` | ABI / 引擎 / magiskboot / 存储（≥3 GiB）/ 密钥 / 输入魔数；每条含**绝对路径+实际值**；blocking 项不过**不进修补** |
+| C5 | **引擎自检（JNI）** | `app/.../core/PatchEngine.kt:55-110`、`core/Elf.kt:10-52` | `present/executable/aarch64/loaded/version/detail` 五元组；`System.loadLibrary` 失败给「缺件/ABI/符号」排查建议；`EM_AARCH64=183` 断言 |
+| C6 | 修补引擎 JNI 桥 | `app/src/main/java/me/sproot/patch/NativeEngine.kt:1-40` | 两个 JNI 符号 `patch` / `engineVersion`；参数语义对齐 C1（in/out/key/json/workdir；`key=null`→`--gen-key`；固定 `--quiet`，结果走 json/report） |
+| C7 | **原厂备份（sha1 内容寻址）** | `app/.../core/BackupStore.kt:11-63` | `filesDir/backups/<sha1>.img` + `backups/index.tsv`（时间/sha1/大小/原名）；同 sha1 **复用**；对应 §5.6-③ |
+| C8 | 产物导出 | `app/.../core/Exporter.kt:11-40` | API≥29 走 MediaStore → `Downloads/SPRoot/`；API≤28 回退公共 Downloads 目录（无需存储权限/权限回退） |
+| C9 | **模块页（列表/启停/安装/卸载）** | `ui/pages/ModulesPage.kt:51-190`、`core/Modules.kt:26-178` | `module list --json` 解析；`enable/disable <id>`；`install <zip> --json`（SAF→私有 cache→PK 头/大小校验→两阶段语义）；`uninstall <id>` 二次确认；`install_status` 未知字段占位兼容 |
+| C10 | **AP 首启自检（selftest）** | `core/ApdSelfTest.kt:6-40,81-85` | `apd selftest --json`；stage 语义：`undeployed`(exit 0,正常)/`deployed`/`daemon_ready`/`needs_repair`/`no_ap_binary`/`escalation_failed`/`timeout`/`parse_failed`；结果缓存 SharedPreferences，主页/模块/设置页**只读展示**（不每次起进程） |
+| C11 | 版本探测（非 root） | `core/ApdClient.kt:209,283-294` | `apd version --json` 任意身份可调；用于部署状态/版本偏差检测 |
+| C12 | **许可资产随包** | `app/src/main/assets/{NOTICE-APK.md,NOTICE-magiskboot.txt,licenses/GPL-3.0.txt}`；`apk.yml:105` | CI 由仓库根 `NOTICE`/`LICENSE` 装配（单一可信源），与 §5.3.4/§11 一致 |
+| C13 | **原生二进制锁定（可复现构建）** | `app/native.lock.json`；`apk.yml:35-68` | engine/apd/magiskboot 的 artifact、`run_id`、`sha256`、`size` **全固定**；CI 按 lock 精确下载+校验，**不浮动 latest**；升级须显式改 lock 并单独 commit |
+| C14 | 日志与状态持久化 | `core/AppLog.kt`、`core/InstallState.kt:56-72` | 结构化阶段日志 + 安装状态快照（含 `artifact_sha256`）；对应 §5.7-L5 |
+| C15 | 密钥安全存储 | `core/SecretStore.kt` | Android Keystore 加密（对应 §3.5.2「临时 0600 文件、用后即删」） |
+| C16 | CI 五工作流 | `.github/workflows/{apk,engine,apd,licenses,release}.yml` | 见 §8.2（已按实况修正）；`licenses.yml` 校验许可文件 + 上游 15 文件 sha256 指纹不漂移 |
+
+#### 3.7.2 与设计态的差异（**必须对齐**）
+
+| # | 设计条目 | 实现态（v2） | 处置建议 |
+|---|---|---|---|
+| D1 | §5.4 步⑦ **RcInject（ramdisk rc 注入）** | **客户端未实现**（`app/` 内无 `init.sproot`/`cpio` 相关代码） | 归入 `apd deploy`（T2）或 task-5 迭代；模板见 DOC-05 §5.1；**注意 §3.5.4 key ABI 与 rc 不含密钥约束** |
+| D2 | §5.4.2 PatchMode **四模式全开** | 实为 **2 可用 + 2 预留**（RESTORE/UNINSTALL `enabled=false`） | 与「导出与刷入分离」原则一致；直刷模式待 AP 部署链打通后开放（task-5） |
+| D3 | §3.6 **12 态双轴状态机** | 客户端用 `PatchUiState` + `InstallState` + `ApdSelfTest.stage` 组合表达，**未落显式 12 态枚举** | task-4 后续收敛为单一 `deriveCapabilities(state)`（避免散落条件判断） |
+| D4 | §5.2.1 `nativeSelftest()` | 引擎侧仅实现 `engineVersion()`；自检以 `Capabilities`+`Elf` 断言替代 | 可选：引擎补 `nativeSelftest`；当前替代方案已满足「缺件即阻断」 |
+| D5 | §8.2 设计态 **6 工作流** | 实际 **5 个**（`apk/engine/apd/licenses/release`）；无 `ci-static`、无独立 `magiskboot.yml` | 文档已改（§8.2）；静态检查是缺口（D7），magiskboot 并入 `native.lock` |
+| D6 | §5.4.1 **AVB 硬断言（等长+区段 diff）** | 客户端目前仅做「AVB footer 存在性前后对比 + 不修改」日志（`PatchPipeline.kt:465-469`）+ 等长/sha256 | task-5 补「AVB 区段逐字节 diff」硬门禁（PKG-2/AVB-2） |
+| D7 | §8.1 G2「本地只做静态检查」 | **无 `ci-static` 工作流**（ktlint/detekt/clippy 未在 CI 强制） | task-8 补最小静态检查 job（低成本、高收益） |
+
+#### 3.7.3 验证方式（可直接复用）
+
+| 层 | 方法 |
+|---|---|
+| 本地静态 | `cargo check`（apd，默认 + `--no-default-features` 两条路径）；Gradle 依赖解析 |
+| CI | `apk.yml` 断言 AArch64 natives + 签名 + NOTICE assets；`licenses.yml` 断言许可与上游指纹；`engine.yml`/`apd.yml` 断言 ELF 架构与能力标记 |
+| 质测建议（task-7） | 对 C4/C5/C9/C10 各做一条「人为破坏（删 lib/改 lock/断网/错密钥）→ UI 必须给具名错误且不静默」用例 |
 
 ---
 
@@ -1104,18 +1149,19 @@ IDLE ──选镜像──> INPUT_READY ──开始──> PREFLIGHT ─> UNPAC
 | G5 | **不可信输入不参与构建** | 所有第三方二进制（若有）必须 sha256 固定；网络下载仅作辅助且失败即 fail（RC F3） |
 | G6 | **分支策略：`v2` 为唯一开发分支**（lead 2026-11-08 决定） | `main` 是旧代码 + app-client 早期推送，**不作为测试/构建对象**；所有 workflow 的 push/PR 触发只监听 `v2`（及 tag） |
 
-### 8.2 CI 工作流清单（GitHub Actions）
+### 8.2 CI 工作流清单（GitHub Actions）——**按 v2 实况修正（5 个，非设计态 6 个）**
 
-| 工作流 | 触发 | 产出 | 关键断言 | 归属 |
+> 设计态曾列 6 个工作流（`ci-static/engine/magiskboot/apd/newapp/release`）。v2 实际为 **5 个**：`apk / engine / apd / licenses / release`。`ci-static` 未落地（静态检查是缺口，见 §3.7.2 D7）；`magiskboot` 无独立 workflow，改为在 `apk.yml` 内按 `app/native.lock.json` 精确拉取并 sha256 校验。
+
+| 工作流（v2 实际文件名） | 触发 | 产出 | 关键断言 | 归属 |
 |---|---|---|---|---|
-| `ci-static.yml` | PR / push | 无产物（只报告） | ktlint/detekt、`cargo fmt --check`/`clippy`、`clang-format --dry-run`；依赖解析 `checkDebugAarMetadata`（防 U1/U2） | task-8 |
-| `engine.yml` | `engine/**` 变更 | `libskrootpatch.so`（arm64）+ `skroot-patch`（x86-64 诊断） | `readelf -h` 断言 `Machine: AArch64`；`--selftest` 返回 0；导出符号清单；sha256。**依赖 apt 包 `qemu-user`（提供 `qemu-aarch64`，可运行静态 arm64 产物）做契约自检**——⚠️ 不要写成 `qemu-user-static`（ubuntu-latest 上无安装候选，这正是首次 CI 失败原因） | task-3/8 |
-| `magiskboot.yml`（新） | 版本/来源变更时 | `libmagiskboot.so`（arm64） | 来源固定 **Magisk v31.1 官方 ARM64 release**；sha256 校验；`readelf -h` 断言 AArch64；**禁止** AIK / 非官方 Windows 版（人类指令） | task-3/8 |
-| `apd.yml` | `app/apd/**` 变更 | `libapd.so`（arm64） | `file`/`readelf` 断言 aarch64；`--version` 冒烟（qemu 或静态解析）；`--locked` 构建 | task-6/8 |
-| `newapp.yml` | `newapp/**` 变更 | `app-debug.apk` / `app-release.apk`（签名） | `aapt2 dump badging` 断言 minSdk/compileSdk/ABI；`apksigner verify`；APK 内含 `lib/arm64-v8a/libskrootpatch.so` **与 `libmagiskboot.so`** 断言；`NOTICE` 含 magiskboot GPL-3.0 声明 | task-4/8 |
-| `release.yml` | tag `v*` | Release assets + SHA256SUMS | 上述全部 + 版本号与 tag 一致 | task-8 |
+| `apk.yml` | `app/**`、`app/native.lock.json`、根 LICENSE/NOTICE 变更 | `SPRoot-APK`（release APK，签名） | 按 `native.lock.json` 精确拉取 engine/apd/magiskboot + **sha256 逐一校验**；装配 NOTICE assets（单一可信源）；`apksigner verify`；APK 内含所需 **AArch64 natives** 断言 | task-4/8 |
+| `engine.yml` | `engine/**` 变更 | `libskrootpatch.so`（arm64）+ `skroot-patch`（x86-64 诊断） | `readelf` 断言 AArch64；`--selftest` 返回 0；符号清单 + sha256；**依赖 apt `qemu-user`（提供 qemu-aarch64）做契约自检**——⚠️ 不是 `qemu-user-static`（无安装候选，首次 CI 失败原因） | task-3/8 |
+| `apd.yml` | `apd/**` 变更 | `libapd.so`（arm64） | ELF 断言（AARCH64+ET_DYN）；能力标记 grep；体积归因；`--no-default-features` **licence-clean 编译校验**（§11.4.4）；sha256 | task-6/8 |
+| `licenses.yml` | LICENSE/LICENSES.md/NOTICE/`engine/src/**`/检查脚本变更 | 无产物（只报告） | LICENSE 存在且为 AGPL-3.0；LICENSES.md 含「保留所有权利」+ SKRoot 来源；NOTICE 含 AGPL-3.0 + magiskboot；`check_licenses.py` 上游 **15 文件 sha256 指纹未漂移** | task-8 |
+| `release.yml` | tag `v*` | Release assets + SHA256SUMS | 上述汇总 + 版本号与 tag 一致 | task-8 |
 
-> **产物依赖顺序**：`engine.yml` / `magiskboot.yml` / `apd.yml` 的 artifact 需要被 `newapp.yml` 消费（`actions/download-artifact` 或 release 资产）。**禁止**在 `newapp.yml` 里现场编译 Rust/C++（避免工具链漂移与时间不可控）。
+> **产物依赖顺序**：`engine.yml` / `apd.yml` 的 artifact 由 `apk.yml` 按 `native.lock.json`（含 `run_id` + sha256）消费；**禁止**在 `apk.yml` 里现场编译 Rust/C++。`magiskboot` 同样走 `native.lock.json` 锁定（Magisk v31.1 官方 ARM64，sha256 记录）。
 
 ### 8.3 产物管理与发布
 
@@ -1325,6 +1371,7 @@ IDLE ──选镜像──> INPUT_READY ──开始──> PREFLIGHT ─> UNPAC
 | A-41 | **仓根合规文件已落盘**：`LICENSE`（SPDX `AGPL-3.0-only` + AGPL-3.0 全文，34 KB 自 SPDX 官方文本）、`NOTICE`（第三方清单 + SKRoot 风险 + 禁用项 + 发布检查清单）、`README.md`（许可段 + 风险摘要） | 本工作区文件（2026-11-08 创建） |
 | A-42 | **apd Rust 依赖清单**：`apd/THIRD_PARTY_LICENSES.md`（115 个 Android 目标传递依赖，`Cargo.lock` + `cargo metadata --filter-platform aarch64-linux-android`，commit `8b28e87`）；全部 permissive 除：`extattr`（GPL-2.0-only，已移除并等价替换）、`prop-rs`/`prop-rs-android`（UNKNOWN，**阻断发布**） | sys-guard 2026-11-08 交付；根 `NOTICE` §8 + 本文 §11.4 |
 | A-43 | **v2 apd feature 隔离实况**（commit `d45822b` / `05e626a`）：`Cargo.toml` features `default=["resetprop"]` + 两 crate optional；`resetprop.rs` façade + `resetprop_prop_rs.rs`；`apd.yml` 有 `cargo check --no-default-features --target aarch64-linux-android`；本地 `cargo check` 默认与 `--no-default-features` 均 Finished | 本工作区 WSL 实测（2026-11-08）+ `origin/v2` |
+| A-44 | **客户端 v2 实现清点**（本文件 §3.7）：四页导航、8+1 步修补流水线（magiskboot + JNI patch + sha1 备份 + 等长/sha256 校验）、入口能力自检、引擎自检五元组、模块页 list/enable/disable/install/uninstall、AP selftest 首启、许可 assets 随包、`native.lock.json` 可复现锁定、CI 五工作流 | `app/` 源码 + `app/native.lock.json` + `.github/workflows/`（v2 `b93dd39` 实况核对） |
 | A-33 | **构建与分支**：人类硬规则「禁止本地编译，统一 GitHub Actions」；`v2` 为唯一开发分支（`main` 为旧代码，不作测试对象）；首次 CI 失败根因 = AGP9 `newDsl` × KGP 冲突，lead 已修 `gradle.properties` | lead 团队消息（**决议记录**）；workflow YAML 由 task-8 落盘 |
 
 ## 附录 B · 与其它任务的边界（避免越界写盘）
@@ -1337,4 +1384,4 @@ IDLE ──选镜像──> INPUT_READY ──开始──> PREFLIGHT ─> UNPAC
 
 ---
 
-*完 · 架构（architect） · 2026-11-08 · **v1.1.2 定稿**（新增：密钥 ABI 注记 §3.5.4/R22、刷机风险与能力边界 §1.4、仓根 LICENSE/NOTICE/README、§11 许可与合规（AGPL-3.0-only + `engine/` 再许可风险）、§11.4 apd Rust 依赖合规与 2 项 UNKNOWN 阻断/R24）*
+*完 · 架构（architect） · 2026-11-08 · **v1.1.3 定稿**（v1.1.2 基础上新增 §3.7 客户端已实现能力清单 + §8.2 CI 实况修正 + D1–D7 设计/实现差异；v1.1.2 已含 §3.5.4 密钥 ABI 注记/R22、§1.4 刷机风险与能力边界、§11 许可与合规、§11.4 apd 依赖合规/R24）*
