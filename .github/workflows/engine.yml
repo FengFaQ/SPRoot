@@ -64,7 +64,7 @@ jobs:
           else
             echo "apt 均失败，回落 multiarch 静态二进制"
             curl -sSL -o /tmp/qemu-aarch64-static \
-              https://github.com/multiarch/qemu-user-static/releases/download/v8.2.2-1/qemu-aarch64-static || true
+              https://github.com/multiarch/qemu-user-static/releases/download/v7.2.0-1/qemu-aarch64-static || true
             sudo install -m 0755 /tmp/qemu-aarch64-static /usr/local/bin/qemu-aarch64-static 2>/dev/null || true
             command -v qemu-aarch64-static || echo "NO_QEMU"
           fi
@@ -135,6 +135,7 @@ jobs:
           echo "bootimg chain OK: kernel 等长 + boot.img 等长"
 
       - name: Stage artifacts + checksums
+        if: always()
         run: |
           set -euo pipefail
           mkdir -p out
@@ -143,6 +144,7 @@ jobs:
           (cd out && sha256sum *.so > SHA256SUMS && cat SHA256SUMS)
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: skroot-engine-arm64
           path: out/

@@ -1,15 +1,68 @@
-# 大文件与本地资产不入库
-samples/
-samples-meizu21.csv
-upstream/
-APatch/
-backup/
-dist/
-engine/dist/
-target/
+# ---------------------------------------------------------------------------
+# SPRoot 仓库忽略规则
+# 原则：只提交源码/文档/契约/CI 配置；二进制固件、构建产物、上游镜像不入库。
+# 注意：带前导 / 的规则只匹配仓库根目录，避免误伤 newapp/app 模块。
+# ---------------------------------------------------------------------------
+
+# 固件与样本（体积大，且在资产备份中）
+/samples/
+*.img
+
+# 上游镜像 / 旧代码 / 备份（保留在本机）
+/upstream/
+/APatch/
+/app/
+/SPRoot-AP/
+/backup/
+
+# 构建产物
+/dist/
+/engine/dist/
+/target/
 .gradle/
 build/
+**/build/
 *.apk
-*.img
+*.aab
+*.aar
+*.class
+*.dex
+*.o
+*.a
+*.so
+!/newapp/app/src/main/jniLibs/**/*.so
+/engine/src/skroot-patch
+/engine/src/skroot-patch.*
+/engine/build/
 local.properties
-.git/
+.cxx/
+captures/
+.externalNativeBuild/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# 日志与临时文件
+*.log
+*.tmp
+*.swp
+.DS_Store
+Thumbs.db
+*.hprof
+
+# ---------------------------------------------------------------------------
+# 注意：newapp/keystore/sproot-release.jks 与 keystore.properties
+# **必须入库**（方案 A：private 仓库内 CI 直接读取签名密钥）。
+# 一旦仓库转 public，必须立即轮换该密钥并移出仓库。
+# ---------------------------------------------------------------------------
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 构建产物（引擎交叉编译/本地测试产物不入库；交付物只认 CI artifacts）
+engine/**/*.o
+engine/android/build/
+engine/dist/
