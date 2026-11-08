@@ -245,17 +245,18 @@ fun PatchPage(modifier: Modifier = Modifier) {
                         if (state.avbStatus.isNotBlank()) {
                             InfoRow("AVB 校验（AVB-1/2/3）", state.avbStatus)
                         }
-                        // D1：开机自启注入结果
+                        // D1：开机自启注入结果（措辞保守：注入了 rc ≠ 已开启自启）
                         if (state.rcTarget.isNotBlank()) {
                             InfoRow(
                                 "开机自启（AP daemon）",
                                 if (state.rcInjected) {
-                                    "已注入（target=${state.rcTarget}）"
+                                    "已注入 rc（target=${state.rcTarget}）—— **尚未生效**：" +
+                                        "需 AP 部署完成并把密钥写入 /data/adb/sproot/superkey（0600）后，开机才会真正拉起 AP；" +
+                                        "在此之前可手动启动 AP"
                                 } else {
                                     "未注入（target=${state.rcTarget}，原因=${state.rcReason}）—— 产物仍合规，可手动启动 AP"
                                 },
-                                valueColor = if (state.rcInjected) MiuixTheme.colorScheme.onSurfaceContainer
-                                else MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                valueColor = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                             )
                         }
                         state.reportPath?.let { InfoRow("引擎报告", it, monospace = true) }

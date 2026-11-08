@@ -391,9 +391,11 @@ object PatchPipeline {
             AppLog.info(
                 TAG,
                 "自启注入：" + if (rcResult!!.injected) {
-                    "已注入（target=${rcResult!!.target}，幂等命中=${rcResult!!.idempotentHit}）"
+                    "已注入 rc（target=${rcResult!!.target}，幂等命中=${rcResult!!.idempotentHit}）" +
+                        "——注意：rc 已注入 ≠ 已开启自启；需 AP 部署完成并写入 " +
+                        "/data/adb/sproot/superkey（0600）后，开机才会真正拉起 AP daemon"
                 } else {
-                    "未注入（原因=${rcResult!!.reason}，不影响产物合规）"
+                    "未注入（原因=${rcResult!!.reason}，不影响产物合规；可手动启动 AP）"
                 },
             )
 

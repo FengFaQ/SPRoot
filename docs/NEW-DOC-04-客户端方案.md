@@ -346,8 +346,6 @@ UI 铁律：**原始码与可读文案同时展示**（错误区"错误码"字�
 - 启用/禁用：`apd module enable|disable <id>`（同样 root-exec），退出码映射见 §6.1；
 - 模块列表加载失败时也保留原始输出（绝不静默）。
 
-> **模块安装/卸载（cross-ref）**：`apd module install <zip> --json` / `apd module uninstall <id> --json` 的 JSON schema、两阶段语义（`update_pending`/`active_after_reboot`）与退出码（110–122/124/126/127）以 **NEW-DOC-05 §3.1.2** 为准，本文不重复定义。
-
 ### 7A.2 AP 首启自检 `apd selftest --json`
 
 - 启动时 `SPRootApp` 后台执行一次；有密钥走 `root-exec`，无密钥回退直接 exec（只读探测）。
@@ -442,6 +440,11 @@ CI 行为（硬失败）：
 4. **刷入执行**：首阶段保持"导出 + 人工 fastboot"；后续若接入 AP 内刷入（`dd`/`mtd`），必须走 root-exec 且带 bootloop 守卫。
 5. **真机验证**：`PatchPipeline` 的 magiskboot 解包/回压序列需在魅族 21 的 boot.img 上实测（CI 只能验证编译）；失败时错误区/日志/工作目录三件套可直接取证。
 6. **文档缺口**：`NEW-DOC-04` 之后若 UI 大改，需同步更新 §3 与 §4 阶段图。
+7. **D1 自启链（未闭合，措辞已保守处理）**：当前 `RcInject` 只注入 rc 框架（`on post-fs-data` 建目录 + `import /init.sproot.rc`），**不含 apd daemon 启动行**——密钥绝不能写进 ramdisk 里的 rc（明文泄露）。正确形态（待 sys-guard 权威模板）：
+   - AP deploy 把密钥写入固定受保护路径 `/data/adb/sproot/superkey`（0600，root only）；
+   - rc 用固定路径引用：`exec /data/adb/apd daemon --superkey-file /data/adb/sproot/superkey`；
+   - UI 文案已改为「**已注入 rc（尚未生效）**……需 AP 部署完成后才会开机拉起 AP」，日志同口径，不误导用户。
+   拿到模板后客户端只按原文注入，不自行改写。
 
 ---
 
