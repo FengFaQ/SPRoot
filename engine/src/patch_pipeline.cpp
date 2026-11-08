@@ -175,3 +175,15 @@ PatchKernelResult patch_kernel_handler(const std::vector<char>& file_buf, const 
 	r.patched = patched;
 	return r;
 }
+
+// ---------------------------------------------------------------- 期望组数判据
+// 注意：分支判据必须与 patch_kernel_handler 内部完全一致（同一 KernelVersionParser 版本比较），
+// 否则 report.hook_groups_expected 会与实际织入分支不符 —— 这是本函数存在的唯一理由。
+bool hook_branch_ge_6_1(const std::vector<char>& file_buf) {
+	KernelVersionParser ver(file_buf);
+	return !ver.is_kernel_version_less("6.1.0");
+}
+
+bool hook_has_huawei_symbols(const KernelSymbolOffset& sym) {
+	return sym.hkip_check_uid_root != 0 || sym.hkip_check_gid_root != 0 || sym.hkip_check_xid_root != 0;
+}

@@ -152,6 +152,37 @@ else
   echo "SKIP  A7 T-12 强断言（需 qemu + python3）"
 fi
 
+# ---------------- A8：hook_groups_expected 分支逻辑自检（纯逻辑，无需镜像，CI 必跑）-----
+# 目的：5.10/5.15 机型我们没有真机镜像，但必须保证"选 11 组分支"的逻辑正确，
+# 否则将来用户在 <6.1 内核上会被误报成"引擎 bug"。
+#   期望：<6.1 → 11（无 huawei）/ 12（有 huawei）；>=6.1 → 14（无 huawei）/ 15（有 huawei）
+if [[ -n "$QEMU" && -f "$EXEC" ]]; then
+  echo "--- A8 hook_groups_expected 分支自检（<6.1 → 11/12；>=6.1 → 14/15）---"
+  a8_expect() {   # $1=version $2=extra-arg(or empty) $3=expected
+    local got
+    if [[ -n "$2" ]]; then
+      got="$("$QEMU" "$EXEC" --self-test-groups --assume-kernel-version "$1" "$2" 2>/dev/null \
+             | sed -n 's/.*hook_groups_expected=\([0-9][0-9]*\).*/\1/p' | head -1)"
+    else
+      got="$("$QEMU" "$EXEC" --self-test-groups --assume-kernel-version "$1" 2>/dev/null \
+             | sed -n 's/.*hook_groups_expected=\([0-9][0-9]*\).*/\1/p' | head -1)"
+    fi
+    if [[ "$got" == "$3" ]]; then
+      pass "A8 ${1}${2:+ +$2} → hook_groups_expected=$3"
+    else
+      fail "A8 ${1}${2:+ +$2} → 期望 $3 实得 '${got}'（分支选路/基数字错误）"
+    fi
+  }
+  a8_expect 5.10.0 "" 11
+  a8_expect 5.10.0 "--assume-huawei-symbols" 12
+  a8_expect 5.15.104 "" 11
+  a8_expect 6.1.0 "" 14
+  a8_expect 6.1.0 "--assume-huawei-symbols" 15
+  a8_expect 6.6.30 "" 14
+else
+  echo "SKIP  A8 期望组数分支自检（需 qemu）"
+fi
+
 # ---------------- Tier B：真修补产物字节级断言（需一份真 arm64 内核 Image）-----
 if [[ -n "${KERNEL_IMAGE:-}" ]]; then
   echo "=== Tier B: 真修补产物断言 (KERNEL_IMAGE=$KERNEL_IMAGE) ==="
@@ -179,6 +210,20 @@ PY
     # B7（lead 要求）：用产物字节反证"密钥确实写进内核"——embed_key.new_bytes 必须等于
     # key[0:47] 的 hex + "00"（47 字符 + NUL，CALL v1.1 E1）；同时断言 hook 组数不小于下界，
     # 便于跨机型对比"是否少组"。
+    # B8（lead 批准）：组数**严格等值**——hook_groups_count == hook_groups_expected，
+    # 且 resolved >= expected - (has_huawei?1:0)；比下界敏感（少一组即红）
+    if [[ -f "$OUT.report.json" ]] && command -v python3 >/dev/null; then
+      python3 - "$OUT.report.json" <<'GRPCHK' && pass "B8 组数严格等值：count == expected，且 resolved >= expected - has_huawei" || fail "B8 组数与期望不符（可能分支选路错/少织入一组）"
+import json, sys
+r = json.load(open(sys.argv[1]))
+cnt = int(r.get("hook_groups_count", 0))
+exp = int(r.get("hook_groups_expected", -1))
+res = int(r.get("hook_groups_resolved", 0))
+hua = bool(r.get("hook_has_huawei_symbols", False))
+ok = (exp > 0 and cnt == exp and res >= exp - (1 if hua else 0))
+sys.exit(0 if ok else 1)
+GRPCHK
+    fi
     if [[ -f "$OUT.report.json" ]] && command -v python3 >/dev/null; then
       python3 - "$OUT.report.json" "$KEY" <<'KEYCHK' && pass "B7 密钥自证：hooks[embed_key].new_bytes == key[0:47]hex + \"00\" 且 hook 组数 >=13" || fail "B7 密钥自证/hook 组数断言失败"
 import json, sys

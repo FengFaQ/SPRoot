@@ -509,7 +509,9 @@ magiskboot 来自 Magisk（**GPL-3.0**），我们以**独立可执行程序**�
 | §1 拒绝 `.img/.gz` | `main.cpp` 扩展名检查 → rc=102；A6f 实测 | ✅ |
 | §2.1 等长产物 | 写回逻辑基于输入 `file_buf` 拷贝；Tier B2 断言待样本 | ⏳ |
 | §2.2 密钥三处明文（stdout 末行 / NDJSON result / report.json） | `main.cpp` `ROOT_KEY=` 兜底行 + `emit_result` + `build_report`；A6c 实测输出含 `ROOT_KEY=` | ✅ |
-| **§2.3 `hooks[]` 逐 hook 落位（P1 新增，非破坏性）** | 引擎已输出顶层 `hooks[]`：每项 `{group,name,resolved,patch_offset,orig_bytes,new_bytes,len,target_addr,target_resolved,patches[]}`；无法解析的组输出 `resolved:false + reason`（不省略）。魅族 21 实测 **15 组**（cfi_bypass/drm×2/do_execve/filldir64×3/compat_filldir×3/avc_check/avc_denied/audit_log_start/embed_key/huawei_bypass(resolved:false)）。旧 `hook_table` 聚合字段**原样保留**（向后兼容） | ✅ |
+| **§2.3 `hooks[]` 逐 hook 落位（P1 新增，非破坏性）** | 引擎已输出顶层 `hooks[]`：每项 `{group,name,resolved,reason?,hook_addr,trampoline,bytes,patch_offset,orig_bytes,new_bytes,len,target_addr,target_resolved,patches[]}`；无法解析的组输出 `resolved:false + reason`（不省略）；`huawei_bypass` 仅在**内核存在 hkip_check_*_root 符号**时才产出（不适用 ≠ 失败）。魅族 21(6.1.25) 实测 **14 组**（cfi_bypass/drm×2/do_execve/filldir64×3/compat_filldir×3/avc_check/avc_denied/audit_log_start/embed_key）。旧 `hook_table` 聚合字段**原样保留** | ✅ |
+| **组数自校验 `hook_groups_expected`（P1 二期）** | 引擎自算期望组数（**唯一来源** `hook_groups_expected_count(ge61, huawei)`）：≥6.1 基 14、<6.1 基 11，`+1` when huawei 符号存在；report 并列输出 `hook_branch`(>=6.1/<6.1)、`hook_has_huawei_symbols`、`hook_groups_expected_source`(kernel/assume)。断言口径：**`hook_groups_count == hook_groups_expected` 严格等值** + `hook_groups_resolved >= expected - huawei` —— 比下界敏感，少织一组即红 | ✅ |
+| 组数分支自检（无真镜像覆盖 <6.1） | `--self-test-groups [--assume-kernel-version V] [--assume-huawei-symbols]`（隐藏测试参数，不面向用户）：输出 `branch/base/huawei/hook_groups_expected`，CI/A8 断言矩阵 `<6.1: 5.10.0→11, +huawei→12, 5.15.104→11`；`>=6.1: 6.1.0→14, +huawei→15, 6.6.30→14` | ✅ |
 | §2.3 report schema | `build_report`（engine_version/input/output/hook_table/hidden_dir_prefix…） | ✅（Tier B5 待样本验证） |
 | §3 退出码 11 枚举 | `ExitCode` enum；A6b/A6c/A6e 实测 101/102 | ✅ |
 | §3 失败不落盘铁律 | `fail()` 内 `fs::remove(opt.out_path)`；A6d 实测 | ✅ |
@@ -666,6 +668,17 @@ adb shell 'cd /data/local/tmp/patch && ./skroot-patch --in kernel --out kernel.p
     `hooks[group=embed_key].new_bytes` = 密钥 hex + `00`、`key_spec.abi == "47+NUL"`
 - **耗时预期**：宿主机 33.9 MB 内核 **6.4 s**；qemu 模拟 **226 s**；真机（8 核 A 系）预计 **3–10 s**。
   若 >60 s 仍未结束：检查是否 `--workdir` 落在 sdcard（FUSE 慢），应放 `/data/local/tmp`
+
+### C.3b 组数自校验（纯逻辑，10 秒内完成，不需要内核镜像）
+
+```bash
+adb shell '/data/local/tmp/skroot-patch --self-test-groups --assume-kernel-version 5.10.0'
+# 期望: branch=<6.1 base=11 huawei=no hook_groups_expected=11
+adb shell '/data/local/tmp/skroot-patch --self-test-groups --assume-kernel-version 6.1.0 --assume-huawei-symbols'
+# 期望: branch=>=6.1 base=14 huawei=yes hook_groups_expected=15
+```
+- 用途：**验证分支选路逻辑**（<6.1 内核机型上若报"组数不符"，先用本命令确认引擎自身分支判断是否正确，再怀疑镜像）
+- 真机正常修补后，`report.hook_groups_expected` 必须 **== `hook_groups_count`**（严格等值）；`hook_groups_resolved >= expected - (hook_has_huawei_symbols?1:0)`
 
 ### C.4 打包回镜像（仍不刷机）
 

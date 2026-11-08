@@ -11,6 +11,8 @@ public:
 	std::string get_kernel_version() const;
 	std::string get_kernel_tag() const;
 	bool is_kernel_version_less(const std::string& ver) const;
+	// 纯版本串比较（无需 file_buf；用于自检/强制分支等测试路径，语义与 is_kernel_version_less 一致）
+	static bool version_less(const std::string& v1, const std::string& v2);
 private:
 	std::string find_kernel_versions() const;
 	std::string find_kernel_tag() const;

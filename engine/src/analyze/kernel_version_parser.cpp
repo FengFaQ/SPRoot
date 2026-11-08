@@ -108,3 +108,24 @@ bool KernelVersionParser::is_version_less(const std::string& v1, const std::stri
 	// If all parts are equal, return false (i.e., v1 is not less than v2)
 	return false;  // If versions are equal, return false (strictly less)
 }
+
+// 纯版本串比较（与成员版 is_version_less 同语义；给自检/测试路径用，不需要 file_buf）
+bool KernelVersionParser::version_less(const std::string& v1, const std::string& v2) {
+	auto parse = [](const std::string& version) {
+		std::vector<int> parts;
+		std::string cur;
+		for (char ch : version) {
+			if (ch == '.' || ch == '-' || ch == ' ') { if (!cur.empty()) { parts.push_back(std::atoi(cur.c_str())); cur.clear(); } }
+			else if (ch >= '0' && ch <= '9') cur.push_back(ch);
+			else break;
+		}
+		if (!cur.empty()) parts.push_back(std::atoi(cur.c_str()));
+		return parts;
+	};
+	auto a = parse(v1), b = parse(v2);
+	size_t n = std::min(a.size(), b.size());
+	for (size_t i = 0; i < n; ++i) {
+		if (a[i] != b[i]) return a[i] < b[i];
+	}
+	return a.size() < b.size();
+}

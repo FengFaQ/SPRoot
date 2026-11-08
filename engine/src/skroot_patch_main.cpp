@@ -63,6 +63,10 @@ struct EngineOptions {
     //   因此显式要求 --key-abi=47nul（缺省即此值）；任何其它取值一律拒绝。
     std::string key_abi = "47nul";
     bool dump_symbols = false;
+    // 隐藏测试参数（仅自检/CI 用，不面向用户）：强制按给定内核版本走分支选择逻辑
+    std::string assume_kernel_version;   // --assume-kernel-version <ver>
+    bool assume_huawei = false;          // --assume-huawei-symbols
+    bool self_test_groups = false;       // --self-test-groups
 };
 
 static std::ofstream g_ndjson;
@@ -137,6 +141,10 @@ struct EngineState {
     size_t huawei_patch_count = 0;
     // C1 §2.3：逐 hook 落位（非破坏性新增；旧 hook_table 聚合字段保留）
     std::vector<PatchGroupSpan> groups;
+    size_t groups_expected = 0;                 // 期望组数（唯一来源 hook_groups_expected_count）
+    bool branch_ge_6_1 = true;
+    bool has_huawei = false;
+    std::string groups_expected_source = "kernel";  // kernel | assume
     std::vector<char> orig_buf;                 // 打补丁前的镜像（回填 orig_bytes）
     std::vector<size_t> patch_addrs;            // vec_patch[i].write_addr 镜像
     std::vector<size_t> patch_lens;             // 每处补丁字节数
@@ -243,6 +251,10 @@ static J build_report(const EngineOptions& opt, const EngineState& st, const std
             return arr;
         }())
        .set("hook_groups_count", static_cast<long long>(st.groups.size()))
+       .set("hook_groups_expected", static_cast<long long>(st.groups_expected))
+       .set("hook_groups_expected_source", st.groups_expected_source)
+       .set("hook_branch", st.branch_ge_6_1 ? ">=6.1" : "<6.1")
+       .set("hook_has_huawei_symbols", st.has_huawei)
        .set("hook_groups_resolved", [&st]() -> long long {
             long long n = 0;
             for (auto& g : st.groups) if (g.last > g.first) ++n;
@@ -373,6 +385,9 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
         else if (a == "--key") { opt.key = need("--key"); opt.key_from_user = true; have_key = true; }
         else if (a == "--key-abi") { opt.key_abi = need("--key-abi"); }
         else if (a == "--dump-symbols") { opt.dump_symbols = true; }
+        else if (a == "--assume-kernel-version") { opt.assume_kernel_version = need("--assume-kernel-version"); }
+        else if (a == "--assume-huawei-symbols") { opt.assume_huawei = true; }
+        else if (a == "--self-test-groups") { opt.self_test_groups = true; }
         else if (a == "--gen-key") { have_key = true; }
         else if (a == "--json") { opt.json_sink = need("--json"); }
         else if (a == "--workdir") { opt.workdir = need("--workdir"); }
@@ -384,6 +399,27 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
             return OK;
         }
         else { std::cerr << "unknown arg: " << a << "\n"; return E_USAGE; }
+    }
+
+    // 隐藏自检：期望组数分支逻辑覆盖（无需内核镜像、无需密钥；CI 用它保证 <6.1 分支正确）
+    //   --self-test-groups [--assume-kernel-version 5.10.0] [--assume-huawei-symbols]
+    if (opt.self_test_groups) {
+        bool ge61 = true;
+        if (!opt.assume_kernel_version.empty()) {
+            ge61 = !KernelVersionParser::version_less(opt.assume_kernel_version, "6.1.0");
+        }
+        size_t exp = hook_groups_expected_count(ge61, opt.assume_huawei);
+        std::cout << "branch=" << (ge61 ? ">=6.1" : "<6.1")
+                  << " base=" << (ge61 ? 14 : 11)
+                  << " huawei=" << (opt.assume_huawei ? "yes" : "no")
+                  << " hook_groups_expected=" << exp << "\n";
+        J extra;
+        extra.set("branch_ge_6_1", ge61)
+             .set("huawei", opt.assume_huawei)
+             .set("hook_groups_expected", static_cast<long long>(exp));
+        emit_result(OK, std::move(extra));
+        if (g_ndjson.is_open()) g_ndjson.close();
+        return OK;
     }
 
     if (!have_in || !have_out || !have_key) {
@@ -498,6 +534,16 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
             return OK;
         }
 
+        {   // 期望组数（唯一来源）：分支判据与 patch_kernel_handler 一致（KV 版本比较）
+            st.branch_ge_6_1 = !kv.is_kernel_version_less("6.1.0");
+            st.has_huawei = hook_has_huawei_symbols(sym);
+            if (!opt.assume_kernel_version.empty()) {
+                st.branch_ge_6_1 = !KernelVersionParser::version_less(opt.assume_kernel_version, "6.1.0");
+                st.groups_expected_source = "assume";
+            }
+            if (opt.assume_huawei) { st.has_huawei = true; st.groups_expected_source = "assume"; }
+            st.groups_expected = hook_groups_expected_count(st.branch_ge_6_1, st.has_huawei);
+        }
         {   // C1 §2.3：kernel_version 必须是真实版本串（qa/审计依赖），解析失败才回落 unknown
             std::string ver = kv.get_kernel_version();
             if (!ver.empty()) st.kernel_version = ver;
@@ -555,7 +601,11 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
         before = vec_patch.size();
         huawei_bypass(st.file_buf, sym, vec_patch);
         st.huawei_patch_count = vec_patch.size() - before;
-        st.groups.push_back({ "huawei_bypass", "hkip_check_(uid|gid|xid)_root", sym.hkip_check_uid_root, before, vec_patch.size() });
+        // huawei 符号不存在时**不产出该组**（caps 语义：该内核无此保护路径，属"不适用"而非"未解析"；
+        // 若符号存在但未产出字节，则仍会 push 一组 resolved:false，便于发现异常）
+        if (st.has_huawei) {
+            st.groups.push_back({ "huawei_bypass", "hkip_check_(uid|gid|xid)_root", sym.hkip_check_uid_root, before, vec_patch.size() });
+        }
     }
 
     // 7) 五组 hook

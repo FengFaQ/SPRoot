@@ -40,3 +40,18 @@ struct PatchGroupSpan {
 	size_t last;          // vec_patch 结束下标（不含）
 };
 PatchKernelResult patch_kernel_handler(const std::vector<char>& file_buf, const PatchKernelOffset& off, KernelSymbolOffset& sym, std::vector<patch_bytes_data>& vec_patch_bytes_data, std::vector<PatchGroupSpan>* groups = nullptr);
+
+// 期望组数（**唯一来源**，供 report.hook_groups_expected 与自检共用；不要在各处硬编码）：
+//   ≥6.1 分支：cfi + drm_printfn + drm_puts + do_execve + filldir64×3 + compat_filldir×3
+//              + avc_check + avc_denied + audit_log_start + embed_key = 14
+//   <6.1 分支：cfi + do_execve + filldir64×2 + compat_filldir×2 + avc_check + avc_denied
+//              + audit_log_start + hook_jump + embed_key               = 11
+//   + huawei_bypass（内核存在 hkip_check_*_root 符号时 +1）
+inline size_t hook_groups_expected_count(bool kernel_ge_6_1, bool has_huawei_symbols) {
+	return (kernel_ge_6_1 ? 14u : 11u) + (has_huawei_symbols ? 1u : 0u);
+}
+
+// 内核是否 >= 6.1（与 patch_kernel_handler 内部选路判据保持一致）
+bool hook_branch_ge_6_1(const std::vector<char>& file_buf);
+// 内核是否存在华为 hkip_check_*_root 符号族（决定是否多一组 huawei_bypass）
+bool hook_has_huawei_symbols(const KernelSymbolOffset& sym);
