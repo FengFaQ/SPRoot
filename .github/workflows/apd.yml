@@ -97,9 +97,9 @@ jobs:
           # Size attribution (qa asks "why did the binary shrink?"): symbol sizes
           # BEFORE strip (strip removes the table), section sizes AFTER strip.
           NDK_TOOLCHAIN="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          "$NDK_TOOLCHAIN/llvm-nm" --size-sort --print-size "$SRC" 2>/dev/null | tail -40 > ../dist/apd-size-symbols.txt || true
+          "$NDK_TOOLCHAIN/llvm-nm" --size-sort --print-size "$SRC" 2>/dev/null | tail -40 | tee ../dist/apd-size-symbols.txt || true
           "${STRIP_aarch64_linux_android}" ../dist/libapd.so
-          "$NDK_TOOLCHAIN/llvm-size" -A ../dist/libapd.so > ../dist/apd-size-sections.txt
+          "$NDK_TOOLCHAIN/llvm-size" -A ../dist/libapd.so | tee ../dist/apd-size-sections.txt
           "$NDK_TOOLCHAIN/llvm-size" ../dist/libapd.so | tee -a ../dist/apd-size-sections.txt
           # Fixed-name copy for the app CI: download this artifact and put it in
           # newapp/app/src/main/jniLibs/arm64-v8a/libapd.so (version pinned by
