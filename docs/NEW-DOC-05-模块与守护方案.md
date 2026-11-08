@@ -425,6 +425,26 @@ apd daemon --superkey-file /data/adb/sproot/key
 | 体积再瘦身 | ✅ 已改（数值待 CI） | `opt-level = "z"`（原 3）；`env_logger` 移出 Android 构建（`cfg(not(target_os="android"))`）；上一轮已删 goblin/scroll/adb_client（2.11MB→1.35MB） |
 | AVB 审计字段 | ✅ | `deploy` 的 `state.json` 增 `avb: "vbmeta_untouched"` + `commit`；`selftest` 断言；部署/卸载代码**零** vbmeta 操作（grep 证实） |
 
+#### P2 体积归因表（`libapd.so` 3.94 MB → 2.05 MB，qa 门禁背书）
+
+> 单位说明：本节用**未压缩 ELF 体积**（3,935,048 → 2,054,904 B，来源 run 42485894887 → 42487199791）。此前记录里的 2.11/1.35/1.17 MB 是 **artifact zip** 体积，两者不同，勿混用。
+> 拆分方法：zip 体积差（P1 -757,936 B / P2 -187,523 B）按比例分摊到未压缩总差 (-1,880,144 B)。
+
+| 归因项 | 证据 | 未压缩估算 |
+|---|---|---|
+| **P1：删 goblin/scroll/adb_client + KP 模块** | `Cargo.lock` 一次性移除 **91 个 crate**（rustls/ring/rsa/der-parser/x509-parser/rcgen/num-bigint/chrono/pem… 全属 `adb_client` 的 TLS/PKI 依赖链） | **≈ -1.50 MB**（主因；PKI/TLS 内联代码） |
+| **P2：`opt-level` 3 → `"z"`** | 同代码同依赖，仅 codegen；CI artifact zip -187,523 B | **≈ -0.34 MB** |
+| **P2：`env_logger` 移出 Android 构建** | 原本只在 `cfg(not(android))` 引用，LTO 多半已剥；实际收益很小 | **≈ -0.02 MB** |
+| 合计 | 3,935,048 → 2,054,904 B | **-1.88 MB（-48%）** |
+
+**功能未删证据（qa 可直接复核）**：
+1. `cargo tree --locked --target aarch64-linux-android`：mlua/mlua-sys（Lua 脚本）、zip、csv、serde、notify/inotify 均在；goblin/scroll/adb_client/env_logger 不在 Android 依赖树（P1 有意删除 / P2 移出）。
+2. `src/` 24 个模块齐全（daemon/deploy/bootstate/secret/selinux/selftest/root-exec 路径等）。
+3. CLI help 14 个子命令：module/post-fs-data/services/boot-completed/uid-listener/daemon/deploy/undeploy/root-exec/auth/version/selftest/resetprop/sepolicy。
+4. `selftest` 16 个检查项含 `key_file.mlocked` 与 `avb_untouched`；undeployed/deployed 两阶段语义。
+5. CI 新增 **capability marker 断言**：二进制内必须存在 `daemon/deploy/undeploy/root-exec/selftest/auth/version/vbmeta_untouched/SPROOT_REQUEST_UID//proc/self/attr/current/sproot-/allow_list/boot_count/safemode/module` 等静态标记，缺一即 CI 失败（本轮起生效）。
+6. 全程 `--locked` 编译（本地 `cargo check` + CI `cargo build --release --locked`）。
+
 ---
 
 ## 8. 风险清单

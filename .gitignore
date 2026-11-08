@@ -66,3 +66,6 @@ __pycache__/
 engine/**/*.o
 engine/android/build/
 engine/dist/
+
+# Rust build output must never be tracked (was accidentally committed in the v2 import)
+apd/target/

@@ -94,7 +94,13 @@ jobs:
           SRC="target/aarch64-linux-android/release/apd"
           test -f "$SRC"
           cp "$SRC" ../dist/libapd.so
+          # Size attribution (qa asks "why did the binary shrink?"): symbol sizes
+          # BEFORE strip (strip removes the table), section sizes AFTER strip.
+          NDK_TOOLCHAIN="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          "$NDK_TOOLCHAIN/llvm-nm" --size-sort --print-size "$SRC" 2>/dev/null | tail -40 > ../dist/apd-size-symbols.txt || true
           "${STRIP_aarch64_linux_android}" ../dist/libapd.so
+          "$NDK_TOOLCHAIN/llvm-size" -A ../dist/libapd.so > ../dist/apd-size-sections.txt
+          "$NDK_TOOLCHAIN/llvm-size" ../dist/libapd.so | tee -a ../dist/apd-size-sections.txt
           # Fixed-name copy for the app CI: download this artifact and put it in
           # newapp/app/src/main/jniLibs/arm64-v8a/libapd.so (version pinned by
           # apd-version.txt).
@@ -144,6 +150,31 @@ jobs:
           print("ELF assertion passed: aarch64 PIE")
           PY
 
+      # Feature-presence gate: the size work (P1 dep removal + P2 opt-level=z)
+      # must never silently drop a capability. Markers are static strings that
+      # only exist when the corresponding code path is compiled in.
+      - name: Capability assertions (no feature loss from size work)
+        run: |
+          set -euo pipefail
+          F=../dist/libapd.so
+          markers=(
+            daemon deploy undeploy root-exec selftest auth version
+            vbmeta_untouched SPROOT_REQUEST_UID /proc/self/attr/current
+            sproot- allow_list boot_count safemode module
+          )
+          : > ../dist/apd-capabilities.txt
+          for m in "${markers[@]}"; do
+            if grep -aq -- "$m" "$F"; then
+              echo "OK   $m" >> ../dist/apd-capabilities.txt
+            else
+              echo "MISS $m" >> ../dist/apd-capabilities.txt
+              echo "MISSING CAPABILITY MARKER: $m"
+              cat ../dist/apd-capabilities.txt
+              exit 1
+            fi
+          done
+          cat ../dist/apd-capabilities.txt
+
       # Per-commit artifact (immutable, keeps history in the UI).
       - name: Upload artifact (commit-pinned)
         uses: actions/upload-artifact@v4
@@ -154,6 +185,9 @@ jobs:
             dist/libapd.so.sha256
             dist/libapd.elf-info.txt
             dist/apd-version.txt
+            dist/apd-size-sections.txt
+            dist/apd-size-symbols.txt
+            dist/apd-capabilities.txt
           if-no-files-found: error
           retention-days: 14
 
@@ -166,5 +200,8 @@ jobs:
           path: |
             dist/libapd-arm64.so
             dist/apd-version.txt
+            dist/apd-size-sections.txt
+            dist/apd-size-symbols.txt
+            dist/apd-capabilities.txt
           if-no-files-found: error
           retention-days: 30
