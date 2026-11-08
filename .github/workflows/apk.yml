@@ -55,14 +55,33 @@ jobs:
             return 0
           }
 
-          # 1) 引擎 + magiskboot（patcher 的 engine CI：libskpatchjni.so / magiskboot / meta / SHA256SUMS）
+          # 1) 引擎 + magiskboot（patcher 的 engine CI：libskrootpatch.so(JNI) / magiskboot / ENGINE-META / SYMBOLS / SHA256SUMS）
           E=/tmp/art-engine
           if fetch_to skroot-engine-arm64 "$E"; then
-            find "$E" -name 'libskpatchjni.so' -exec cp -f {} "$DEST/" \; 2>/dev/null || true
-            find "$E" -name 'libskrootpatch.so' -exec cp -f {} "$DEST/" \; 2>/dev/null || true
+            # 校验材料先落盘/打印（ENGINE-META / SYMBOLS / SHA256SUMS）
+            for m in ENGINE-META.txt SYMBOLS-libskrootpatch.txt SHA256SUMS magiskboot-meta.txt; do
+              f=$(find "$E" -name "$m" | head -1)
+              if [ -n "${f:-}" ]; then echo "--- $m ---"; cat "$f"; cp -f "$f" "$ASSETS/" 2>/dev/null || true; fi
+            done
+            # 选择 JNI 共享库：优先带 Java_ 符号的 .so（无论叫 libskrootpatch.so 还是旧名 libskpatchjni.so）
+            JNI_SRC=""
+            for f in $(find "$E" -type f -name '*.so'); do
+              if command -v nm >/dev/null 2>&1 && nm -D --defined-only "$f" 2>/dev/null | grep -q "Java_me_sproot_patch_NativeEngine"; then
+                JNI_SRC="$f"; break
+              fi
+            done
+            if [ -z "$JNI_SRC" ]; then
+              # 新命名规范：直接是 libskrootpatch.so（ET_DYN），无 nm 时按名字取
+              JNI_SRC=$(find "$E" -type f -name 'libskrootpatch.so' | head -1)
+            fi
+            if [ -n "${JNI_SRC:-}" ]; then
+              cp -f "$JNI_SRC" "$DEST/libskrootpatch.so"
+              echo "JNI_ENGINE_SRC=$JNI_SRC"
+            else
+              echo "::warning::engine artifact 中未找到 JNI 引擎库"
+            fi
             find "$E" -name 'magiskboot' -exec cp -f {} "$DEST/libmagiskboot.so" \; 2>/dev/null || true
-            find "$E" -name 'magiskboot-meta.txt' -exec cp -f {} "$ASSETS/" \; 2>/dev/null || true
-            find "$E" -name 'SHA256SUMS' -exec sh -c 'cat "$1"' _ {} \; 2>/dev/null || true
+            # 裸名 CLI（skroot-patch）绝不进 jniLibs（ET_EXEC 混入 lib*.so 会被误当库）
           fi
           # 兼容：若 patcher 单独发布 magiskboot artifact
           if [ ! -f "$DEST/libmagiskboot.so" ]; then
@@ -94,7 +113,7 @@ jobs:
             sha256sum "$DEST/libmagiskboot.so" || true
             echo "MAGISKBOOT_PRESENT=1" >> "$GITHUB_ENV"
           fi
-          if [ -f "$DEST/libskpatchjni.so" ]; then echo "ENGINE_PRESENT=1" >> "$GITHUB_ENV"; fi
+          if [ -f "$DEST/libskrootpatch.so" ]; then echo "ENGINE_PRESENT=1" >> "$GITHUB_ENV"; fi
           if [ -f "$DEST/libapd.so" ]; then echo "APD_PRESENT=1" >> "$GITHUB_ENV"; fi
 
       - name: Build release APK
@@ -119,7 +138,7 @@ jobs:
           echo "APK=$APK"
           unzip -l "$APK" | grep -E "lib/arm64-v8a" || true
           MISSING=0
-          for lib in libskpatchjni.so libskrootpatch.so libmagiskboot.so libapd.so; do
+          for lib in libskrootpatch.so libmagiskboot.so libapd.so; do
             if unzip -l "$APK" | grep -q "lib/arm64-v8a/$lib"; then
               unzip -p "$APK" "lib/arm64-v8a/$lib" > "/tmp/$lib"
               MACHINE=$(od -An -tu2 -j18 -N2 "/tmp/$lib" | tr -d ' ')
@@ -133,12 +152,30 @@ jobs:
             fi
           done
           if [ "$MISSING" != "0" ]; then exit 1; fi
-          # JNI ABI 断言：引擎必须导出 me.sproot.patch.NativeEngine 的两个符号
+          # libskrootpatch.so 必须是 JNI 共享库（ET_DYN），不能是 CLI 可执行文件
+          if file /tmp/libskrootpatch.so | grep -q "shared object"; then
+            echo "OK libskrootpatch.so is a shared object (ET_DYN)"
+          else
+            echo "::error::libskrootpatch.so 不是共享库（可能误放 CLI 可执行文件）"; exit 1
+          fi
+          # JNI ABI 断言：必须导出 me.sproot.patch.NativeEngine 的两个符号
           if command -v nm >/dev/null 2>&1; then
-            nm -D --defined-only /tmp/libskpatchjni.so | grep -q "Java_me_sproot_patch_NativeEngine_patch"               && echo "OK JNI symbol patch" || { echo "::error::libskpatchjni.so 缺少 Java_me_sproot_patch_NativeEngine_patch"; exit 1; }
-            nm -D --defined-only /tmp/libskpatchjni.so | grep -q "Java_me_sproot_patch_NativeEngine_engineVersion"               && echo "OK JNI symbol engineVersion" || { echo "::error::libskpatchjni.so 缺少 Java_me_sproot_patch_NativeEngine_engineVersion"; exit 1; }
+            if nm -D --defined-only /tmp/libskrootpatch.so | grep -q "Java_me_sproot_patch_NativeEngine_patch"; then
+              echo "OK JNI symbol patch"
+            else
+              echo "::error::libskrootpatch.so 缺少 Java_me_sproot_patch_NativeEngine_patch"; exit 1
+            fi
+            if nm -D --defined-only /tmp/libskrootpatch.so | grep -q "Java_me_sproot_patch_NativeEngine_engineVersion"; then
+              echo "OK JNI symbol engineVersion"
+            else
+              echo "::error::libskrootpatch.so 缺少 Java_me_sproot_patch_NativeEngine_engineVersion"; exit 1
+            fi
           else
             echo "::warning::nm 不可用，跳过 JNI 符号断言"
+          fi
+          # 作废旧名不得出现在 APK
+          if unzip -l "$APK" | grep -q "lib/arm64-v8a/libskpatchjni.so"; then
+            echo "::error::APK 内出现已作废的 libskpatchjni.so"; exit 1
           fi
           # NOTICE 断言：第三方声明（magiskboot/Magisk GPL-3.0）必须随包
           if unzip -l "$APK" | grep -q "assets/NOTICE-magiskboot.txt"; then

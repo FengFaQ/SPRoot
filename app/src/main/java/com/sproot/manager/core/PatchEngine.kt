@@ -12,10 +12,11 @@ import java.io.File
  * 而且产物是宿主 x86-64 glibc ELF；即便放进去，Android 10+ 的 untrusted_app 域
  * 也不允许 exec app 数据目录（W^X/app_data_file neverallow，NEW-DOC-03 根因 R2）。
  *
- * 新方案：patcher 的 CI artifact `skroot-engine-arm64` 内含
- *  - `libskpatchjni.so`（JNI 形态，进程内调用；本类使用）
- *  - `libskrootpatch.so`（静态链接 CLI 形态，保留但不使用）
- *  - `magiskboot`（v31.1 aarch64，打入 jniLibs 供 exec）
+ * 新方案：patcher 的 CI artifact `skroot-engine-arm64` 提供
+ *  - `libskrootpatch.so`（**JNI 共享库 ET_DYN**，进程内调用；本类使用）
+ *  - `skroot-patch`（裸名 CLI 可执行文件；**不进 jniLibs**，避免 ET_EXEC 混入 lib*.so）
+ *  - `magiskboot`（v31.1 aarch64，打入 jniLibs 为 libmagiskboot.so 供 exec）
+ *  - 校验材料：`ENGINE-META.txt` / `SYMBOLS-libskrootpatch.txt` / `SHA256SUMS`
  *
  * ## JNI ABI（引擎提供，非本项目臆造）
  * 见 `me/sproot/patch/NativeEngine.kt`：
@@ -33,8 +34,8 @@ import java.io.File
  */
 object PatchEngine {
 
-    /** 实际打进 APK 的文件名：libskpatchjni.so */
-    const val LIB_NAME = "skpatchjni"
+    /** 正式名：libskrootpatch.so（JNI 共享库；patcher 已统一命名） */
+    const val LIB_NAME = "skrootpatch"
     const val LIB_FILE_NAME = "lib$LIB_NAME.so"
 
     /** 引擎 ABI 版本（与 patcher 侧一致；变化时同步本文档） */
