@@ -189,7 +189,11 @@ enum Module {
         function: String,
     },
     /// list all modules
-    List,
+    List {
+        /// stable machine-readable schema (id/name/version/author/description/enabled/update_pending)
+        #[arg(long)]
+        json: bool,
+    },
 
     /// manage module configuration
     Config {
@@ -371,7 +375,13 @@ pub fn run() -> Result<()> {
                 }
                 Module::Enable { id } => module::enable_module(&id),
                 Module::Disable { id } => module::disable_module(&id),
-                Module::List => module::list_modules(),
+                Module::List { json } => {
+                    if json {
+                        module::list_modules_json()
+                    } else {
+                        module::list_modules()
+                    }
+                }
                 Module::Config { internal, command } => {
                     let module_id = match internal {
                         Some(internal_name) => format!("internal.{internal_name}"),

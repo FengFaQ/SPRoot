@@ -809,6 +809,68 @@ fn _list_modules(path: &str) -> Vec<HashMap<String, String>> {
     modules
 }
 
+/// Machine-readable module list for the manager (contract: stable schema,
+/// `module list --json`). Fields frozen 2026-11-08 (agreed with app-client):
+/// `{id,name,version,versionCode,author,description,enabled,update_pending}`.
+///
+/// `update_pending` is true when either the module carries the `update` flag or
+/// a staged copy exists in `modules_update/<id>` (i.e. a reboot will apply it).
+pub fn list_modules_json() -> Result<()> {
+    let mut modules: Vec<serde_json::Value> = Vec::new();
+    let modules_dir = Path::new(defs::MODULE_DIR);
+    let Ok(dir) = std::fs::read_dir(modules_dir) else {
+        // No module dir yet is a valid empty state, not an error.
+        println!("[]");
+        return Ok(());
+    };
+
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let id_from_dir = entry.file_name().to_string_lossy().to_string();
+        let mut props = read_module_prop(&path).unwrap_or_default();
+        let id = props
+            .get("id")
+            .filter(|v| !v.is_empty())
+            .cloned()
+            .unwrap_or(id_from_dir.clone());
+        // Normalise: the module.prop `id` is authoritative when present.
+        props.entry("id".to_string()).or_insert_with(|| id.clone());
+
+        let enabled = !path.join(defs::DISABLE_FILE_NAME).exists();
+        let update_pending = path.join(defs::UPDATE_FILE_NAME).exists()
+            || Path::new(defs::MODULE_UPDATE_DIR).join(&id).exists();
+        // module.prop `versionCode` is a decimal string; expose it as a number
+        // (0 when absent/unparsable) so the manager can sort versions.
+        let version_code: i64 = props
+            .get("versionCode")
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+
+        modules.push(serde_json::json!({
+            "id": id,
+            "name": props.get("name").cloned().unwrap_or_else(|| id.clone()),
+            "version": props.get("version").cloned().unwrap_or_default(),
+            "versionCode": version_code,
+            "author": props.get("author").cloned().unwrap_or_default(),
+            "description": props.get("description").cloned().unwrap_or_default(),
+            "enabled": enabled,
+            "update_pending": update_pending,
+        }));
+    }
+
+    modules.sort_by(|a, b| {
+        a["id"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["id"].as_str().unwrap_or(""))
+    });
+    println!("{}", serde_json::to_string_pretty(&modules)?);
+    Ok(())
+}
+
 pub fn list_modules() -> Result<()> {
     let modules = _list_modules(defs::MODULE_DIR);
     println!("{}", serde_json::to_string_pretty(&modules)?);

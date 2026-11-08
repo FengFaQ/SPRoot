@@ -210,16 +210,17 @@ pub fn run(json: bool) -> Result<()> {
     }
 
     // ---- daemon + socket -------------------------------------------------
+    let mut daemon_alive = false;
     if deployed {
         let pid = daemon::daemon_pid();
-        let alive = pid
+        daemon_alive = pid
             .map(|p| Path::new(&format!("/proc/{p}")).exists())
             .unwrap_or(false);
         checks.push(Check::new(
             "daemon",
-            alive,
+            daemon_alive,
             false,
-            format!("pid={pid:?} alive={alive}"),
+            format!("pid={pid:?} alive={daemon_alive}"),
         ));
     } else {
         checks.push(Check::pending("daemon", "first-boot self-check"));
@@ -309,10 +310,25 @@ pub fn run(json: bool) -> Result<()> {
     ));
 
     let critical_ok = checks.iter().filter(|c| c.critical).all(|c| c.ok);
+    // Stable summary for the manager UI (app-client maps these four states):
+    //   undeployed    — 未部署（App 首启自检，正常）
+    //   deployed      — 已部署但 daemon 未在跑（可能刚重启/被停）
+    //   daemon_ready  — 已部署且 daemon 在跑
+    //   needs_repair  — 已部署但有 critical 项失败
+    let summary = if !deployed {
+        "undeployed"
+    } else if !critical_ok {
+        "needs_repair"
+    } else if daemon_alive {
+        "daemon_ready"
+    } else {
+        "deployed"
+    };
     if json {
         let payload = serde_json::json!({
             "ok": critical_ok,
             "stage": stage,
+            "summary": summary,
             "checks": checks,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);

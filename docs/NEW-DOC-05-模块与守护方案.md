@@ -136,6 +136,40 @@
 
 > **与 phase1「KPM 等能力保留」原则的偏离**：phase1 的结论建立在「旧管理器 + APatch 生态延续」前提上；新项目从零重写且无 kernelpatch.ko，保留这些子命令只会产生「看似可用、实际必失败」的路径。此为**有意偏离，需 lead 确认**（§10-Q3）。
 
+#### 3.1.1 模块列表 JSON schema（**v1.0 定稿**，与 app-client 对齐 2026-11-08）
+
+`apd module list --json` —— 管理器模块页唯一数据源（经 `root-exec` 调用）。**字段冻结**，变更须走 v1.1 修订：
+
+```json
+[
+  {
+    "id": "example_module",
+    "name": "Example Module",
+    "version": "1.2.3",
+    "versionCode": 12,
+    "author": "someone",
+    "description": "一句话描述",
+    "enabled": true,
+    "update_pending": false
+  }
+]
+```
+
+| 字段 | 类型 | 语义 | 缺省 |
+|---|---|---|---|
+| `id` | string | `module.prop` 的 id（无则用目录名） | — |
+| `name` | string | `module.prop` name；缺失回退为 id | id |
+| `version` | string | `module.prop` version | `""` |
+| `versionCode` | number | `module.prop` versionCode 十进制解析 | `0` |
+| `author` | string | `module.prop` author | `""` |
+| `description` | string | `module.prop` description | `""` |
+| `enabled` | bool | 无 `disable` 标志文件 | `true` |
+| `update_pending` | bool | 有 `update` 标志 **或** `modules_update/<id>/` 存在（重启后生效） | `false` |
+
+**契约保证**：① stdout **纯 JSON 数组**，日志只走 stderr/logcat（契约 v1.1 §8.4）；② 无模块输出 `[]` 且 exit 0；③ 不含密钥/路径前缀等敏感字段；④ 数组按 `id` 字典序稳定排序。
+
+`apd selftest --json` 同步定稿：`{ok: bool, stage: "undeployed"|"deployed", summary: "undeployed"|"deployed"|"daemon_ready"|"needs_repair", checks: [{name, ok, critical, detail}]}`；`stage=undeployed`（App 首启自检）exit 0。
+
 ### 3.2 部署路径（/data/adb 与隐藏目录）
 
 ```
@@ -424,6 +458,8 @@ apd daemon --superkey-file /data/adb/sproot/key
 | daemon `--selftest` / `selftest` 子命令 | ✅ | 新模块 `selftest.rs`：检查 root/binary/key_file(0600/47-48/mlocked)/allow_list/hidden_su(0700)/目录权限/daemon pid/socket 探活/bootstate/version 一致性/**AVB 审计**；`--json` 供 App 与 qa；exit 0/1 |
 | 体积再瘦身 | ✅ 已改（数值待 CI） | `opt-level = "z"`（原 3）；`env_logger` 移出 Android 构建（`cfg(not(target_os="android"))`）；上一轮已删 goblin/scroll/adb_client（2.11MB→1.35MB） |
 | AVB 审计字段 | ✅ | `deploy` 的 `state.json` 增 `avb: "vbmeta_untouched"` + `commit`；`selftest` 断言；部署/卸载代码**零** vbmeta 操作（grep 证实） |
+| 许可合规（AGPL-3.0） | ✅ | `Cargo.toml` 增 `license = "AGPL-3.0-only"`；**移除 GPL-2.0-only 的 `extattr`**（与 AGPL 不兼容）→ 用 raw `libc` `lsetxattr/lgetxattr` 等价替换（`restorecon.rs`）；新增 `apd/THIRD_PARTY_LICENSES.md`（115 个 Android 目标传递依赖，含 2 项待上游澄清：`prop-rs`/`prop-rs-android`） |
+| 体积实测（CI） | ✅ | `libapd.so` = **2,054,408 B**（run 42488946176）；`llvm-size -A`：.text 1,234,160 / .rodata 335,176 / .eh_frame 240,768 / .rela.dyn 82,992；capability 断言 15/15 OK |
 
 #### P2 体积归因表（`libapd.so` 3.94 MB → 2.05 MB，qa 门禁背书）
 
@@ -500,6 +536,20 @@ apd daemon --superkey-file /data/adb/sproot/key
 
 ---
 
+## 11. 发布门禁（`.github/workflows/release.yml`，2026-11-08 新增）
+
+触发器：tag `v*` 或手动 `workflow_dispatch`。**只产出 `release-manifest.json`，从不自动发布**。
+
+| 门禁 | 断言内容 | 失败后果 |
+|---|---|---|
+| **LIC** | 根 `LICENSE`(AGPL-3.0)/`LICENSES.md`/`NOTICE` 存在；`quality/static/check_licenses.py` 必须 `RESULT: ALL PASS`；`LICENSES.md` 含「保留所有权利」+ SKRoot 来源；`NOTICE` 含 magiskboot 与 AGPL-3.0 说明；**APK 内 `assets/NOTICE*`** 必须覆盖 magiskboot（GPL-3.0 + 源码链接）、SKRoot（保留所有权利）、AGPL-3.0 | job 红，不可发布 |
+| **ARCH** | APK 内 native 仅允许 `lib/arm64-v8a/*` 且逐个 `e_machine==183`；engine/magiskboot/apd 独立产物同样全 AArch64；APK manifest `extractNativeLibs=true` | job 红 |
+| **VER** | `apd-version.txt.commit` == APK `assets/apd-version.txt.commit`；`libapd.so` sha256 三方一致（APK / apd artifact / version meta）；二进制内嵌 commit 可检索 | job 红 |
+| **清单** | 聚合同 commit 的 `SPRoot-APK`/`skroot-engine-arm64`/`magiskboot-arm64`/`apd-aarch64-latest`，输出 `release-manifest.json`（每文件 size/sha256/来源 artifact+run） | job 红 |
+| **engine 再许可** | `engine/` 含 SKRoot proprietary 内容且再许可未获书面确认 → **默认阻止**；仅 `workflow_dispatch` + `confirm_engine_redistribute=true` 放行，且 job summary 打印风险提示 | 默认红（有意为之） |
+
+> 已知前置项：当前 APK 仅打包 `assets/NOTICE-magiskboot.txt`，缺 SKRoot/AGPL 段落 → LIC 门禁会按设计拦截；需客户端在打包时把仓库根 `NOTICE`（或合并版）一并放入 `assets/`。
+
 ## 附录 A · 证据索引（本文所有结论的源码/文档出处）
 
 | 结论 | 出处 |
@@ -539,4 +589,4 @@ apd daemon --superkey-file /data/adb/sproot/key
 
 ---
 
-*版本：v1.1（2026-11-08，sys-guard）。v1.0 草案 → v1.1：① 契约 v1.1 已三方会签并**冻结（2026-11-08 21:23 +08，TBD-10 关闭）**；② 补入 §2.2「修补链 ≠ 特权链」边界铁律；③ §7 backlog P0 进入实施（交叉编译链依赖 CI）。下一交付：P0 代码落地 + host `cargo check` 通过记录。*
+*版本：v1.2（2026-11-08 夜间自主令，sys-guard）。v1.1 → v1.2：① `module list --json` / `selftest --json` schema 定稿（与 app-client 对齐）；② 新增 §11 发布门禁（release.yml）；③ P2 收尾记录（AGPL/许可清单/实测体积）。历史：v1.1（2026-11-08，sys-guard）。v1.0 草案 → v1.1：① 契约 v1.1 已三方会签并**冻结（2026-11-08 21:23 +08，TBD-10 关闭）**；② 补入 §2.2「修补链 ≠ 特权链」边界铁律；③ §7 backlog P0 进入实施（交叉编译链依赖 CI）。下一交付：P0 代码落地 + host `cargo check` 通过记录。*

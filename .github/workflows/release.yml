@@ -1,0 +1,361 @@
+# SPRoot 发布门禁（Release Gate）
+#
+# 触发：tag push（v*）或手动 workflow_dispatch。
+# 作用：把同一 commit 的既有 CI artifacts（APK / engine / magiskboot / apd）聚合成
+#       发布产物，并做**发布前硬断言**，最后产出 `release-manifest.json`。
+#       本工作流**不发布**任何东西（不上传 Release、不推送）——发布由人执行。
+#
+# 断言（任一失败即 job 红）：
+#   LIC   根 LICENSE(AGPL-3.0)/LICENSES.md/NOTICE 存在；check_licenses.py ALL PASS；
+#         APK 内含 NOTICE 且覆盖 magiskboot(GPL-3.0+源码链接)、SKRoot(保留所有权利)、AGPL-3.0；
+#   ARCH  所有 native 必须 AArch64（拒绝任何宿主 x86-64 混入）；APK extractNativeLibs=true；
+#   VER   apd-version.txt.commit == APK assets/apd-version.txt.commit == 二进制内嵌 commit；
+#         libapd.so 的 sha256 三方一致（APK / artifact / apd-version.txt）。
+#
+# engine/ 再许可未获书面确认：默认**阻止**；仅当手动触发并显式
+# `confirm_engine_redistribute=true` 才放行，且无论如何都会在 job summary 打印风险提示。
+
+name: Release gate
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      confirm_engine_redistribute:
+        description: "确认已获得 engine/ 再许可书面授权（否则默认阻止公开发布）"
+        type: boolean
+        default: false
+      tag:
+        description: "发布 tag（默认使用当前 ref 名，仅用于清单记录）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: release-gate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-gate:
+    name: Assert artifacts are release-ready
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve release tag / target commit
+        id: meta
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "${TAG:-}" ]; then TAG="${GITHUB_REF_NAME}"; fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          {
+            echo "## 发布门禁 — tag=\`$TAG\` commit=\`$GITHUB_SHA\`"
+            echo ""
+            echo "> ⚠️ **engine/ 再许可风险**：engine/src 含 SKRoot 上游 proprietary 内容（逐字节相同，见 LICENSES.md）；"
+            echo "> 在取得书面再许可前，本仓库不得公开发布含该内容的产物。默认阻止；仅手动触发且"
+            echo "> \`confirm_engine_redistribute=true\` 时放行。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # LIC
+      # ------------------------------------------------------------------
+      - name: LIC — license files + attribution checker
+        run: |
+          set -euo pipefail
+          for f in LICENSE LICENSES.md NOTICE; do
+            test -s "$f" || { echo "::error::缺少 $f"; exit 1; }
+            echo "OK  $f ($(wc -c <"$f") bytes)"
+          done
+          grep -q "GNU AFFERO GENERAL PUBLIC LICENSE" LICENSE || { echo "::error::LICENSE 不是 AGPL-3.0"; exit 1; }
+          grep -qiE "保留所有权利|all rights reserved" LICENSES.md || { echo "::error::LICENSES.md 缺少「保留所有权利」声明"; exit 1; }
+          grep -q "SKRoot" LICENSES.md || { echo "::error::LICENSES.md 缺少 SKRoot 来源标注"; exit 1; }
+          grep -qi "magiskboot" NOTICE || { echo "::error::NOTICE 缺少 magiskboot 声明"; exit 1; }
+          grep -q "AGPL-3.0" NOTICE || { echo "::error::NOTICE 缺少 AGPL-3.0 说明"; exit 1; }
+          python3 quality/static/check_licenses.py --repo-root . | tee /tmp/lic.log
+          grep -q "RESULT: ALL PASS" /tmp/lic.log || { echo "::error::check_licenses.py 未 ALL PASS"; exit 1; }
+
+      # ------------------------------------------------------------------
+      # 聚合同 commit 的 artifacts（等它们就绪）
+      # ------------------------------------------------------------------
+      - name: Collect artifacts for this commit
+        id: collect
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/release"
+          mkdir -p "$WORK"
+          echo "work=$WORK" >> "$GITHUB_OUTPUT"
+
+          fetch_artifact() { # $1=artifact name  $2=dest dir
+            local name="$1" dest="$2" deadline=$(( $(date +%s) + 1200 ))
+            mkdir -p "$dest"
+            while :; do
+              local id
+              id=$(gh api "/repos/$REPO/actions/artifacts?name=$name&per_page=100" 2>/dev/null | python3 -c 'import json,sys;d=json.load(sys.stdin);c=[a for a in d.get("artifacts",[]) if (a.get("workflow_run") or {}).get("head_sha")==sys.argv[1]];c.sort(key=lambda a:a["id"]);print(c[-1]["id"] if c else "")' "$GITHUB_SHA" || true)
+              if [ -n "${id:-}" ]; then
+                if gh api "/repos/$REPO/actions/artifacts/$id/zip" > "/tmp/$name.zip" 2>/dev/null \
+                   && unzip -o -q "/tmp/$name.zip" -d "$dest"; then
+                  gh api "/repos/$REPO/actions/artifacts/$id" > "$dest/.artifact.json" 2>/dev/null || true
+                  echo "OK $name (artifact $id)"
+                  return 0
+                fi
+              fi
+              if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "::error::artifact '$name' for commit $GITHUB_SHA 未在 20 分钟内出现（上游 CI 可能未跑/失败）"
+                return 1
+              fi
+              echo "… waiting for $name (commit $GITHUB_SHA)"
+              sleep 20
+            done
+          }
+
+          fetch_artifact SPRoot-APK          "$WORK/apk"
+          fetch_artifact skroot-engine-arm64 "$WORK/engine"
+          fetch_artifact magiskboot-arm64    "$WORK/magiskboot"
+          fetch_artifact apd-aarch64-latest  "$WORK/apd"
+          find "$WORK" -maxdepth 3 -type f | head -40
+
+      - name: Setup Android build-tools (aapt2 for extractNativeLibs)
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "build-tools;34.0.0"
+
+      # ------------------------------------------------------------------
+      # ARCH + APK 内容
+      # ------------------------------------------------------------------
+      - name: ARCH — every native must be AArch64
+        run: |
+          set -euo pipefail
+          WORK="${{ steps.collect.outputs.work }}"
+          APK=$(find "$WORK/apk" -name '*.apk' | head -1)
+          test -n "$APK" || { echo "::error::APK artifact 为空"; exit 1; }
+          echo "APK=$APK"
+
+          assert_aarch64() { # $1=file
+            local machine
+            machine=$(od -An -tu2 -j18 -N2 "$1" | tr -d ' \n')
+            if [ "$machine" != "183" ]; then
+              echo "::error::$1 不是 AArch64 ELF（e_machine=$machine；183=AArch64）"
+              return 1
+            fi
+            echo "OK aarch64: $1"
+          }
+
+          # 1) APK 内所有 native：只允许 lib/arm64-v8a/，且全部 AArch64
+          mkdir -p "$WORK/apkx"
+          unzip -o -q "$APK" 'lib/*' -d "$WORK/apkx" || true
+          mapfile -t LIBS < <(unzip -Z1 "$APK" | grep '^lib/' || true)
+          if [ "${#LIBS[@]}" -eq 0 ]; then echo "::error::APK 内无 native（jniLibs 缺失）"; exit 1; fi
+          for entry in "${LIBS[@]}"; do
+            case "$entry" in
+              lib/arm64-v8a/*) ;;
+              *) echo "::error::APK 含非 arm64-v8a native: $entry"; exit 1 ;;
+            esac
+            f="$WORK/apkx/$entry"
+            [ -f "$f" ] || { echo "::error::解包缺失 $entry"; exit 1; }
+            assert_aarch64 "$f"
+          done
+          for req in libapd.so libskrootpatch.so libmagiskboot.so; do
+            unzip -Z1 "$APK" | grep -qx "lib/arm64-v8a/$req" || { echo "::error::APK 缺少 lib/arm64-v8a/$req"; exit 1; }
+            echo "OK present: lib/arm64-v8a/$req"
+          done
+
+          # 2) engine / magiskboot / apd 独立产物
+          while IFS= read -r f; do
+            magic=$(od -An -tx1 -N4 "$f" | tr -d ' \n')
+            if [ "$magic" = "7f454c46" ]; then assert_aarch64 "$f"; fi
+          done < <(find "$WORK/engine" "$WORK/magiskboot" "$WORK/apd" -type f)
+
+      - name: ARCH — APK extractNativeLibs=true
+        run: |
+          set -euo pipefail
+          WORK="${{ steps.collect.outputs.work }}"
+          APK=$(find "$WORK/apk" -name '*.apk' | head -1)
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | tail -1)
+          DUMP=$("$BT/aapt2" dump xmltree --file AndroidManifest.xml "$APK")
+          echo "$DUMP" | grep -i extractNativeLibs || true
+          if ! echo "$DUMP" | grep -qi 'extractNativeLibs'; then
+            echo "::error::APK manifest 未声明 extractNativeLibs（默认值随 AGP 版本变化，必须显式 true）"
+            exit 1
+          fi
+          echo "$DUMP" | grep -qiE 'extractNativeLibs[^=]*=(type 0x12)0xffffffff|extractNativeLibs.*true' \
+            || { echo "::error::extractNativeLibs 不是 true（APK 安装后 nativeLibraryDir 不可执行）"; exit 1; }
+          echo "OK extractNativeLibs=true"
+
+      - name: LIC — APK bundles NOTICE with magiskboot + SKRoot + AGPL markers
+        run: |
+          set -euo pipefail
+          WORK="${{ steps.collect.outputs.work }}"
+          APK=$(find "$WORK/apk" -name '*.apk' | head -1)
+          mkdir -p "$WORK/apkx_notice"
+          unzip -o -q "$APK" 'assets/NOTICE*' -d "$WORK/apkx_notice" || true
+          FOUND=$(find "$WORK/apkx_notice" -type f -name 'NOTICE*' | head -5)
+          if [ -z "$FOUND" ]; then echo "::error::APK 内缺少 assets/NOTICE*（第三方声明必须随包分发）"; exit 1; fi
+          MISS=0
+          while IFS= read -r f; do
+            echo "--- $f ---"; wc -c "$f"
+            grep -qi "magiskboot" "$f"          || { echo "::error::APK NOTICE 缺 magiskboot 声明"; MISS=1; }
+            grep -qiE "GPL-3\.0|General Public License" "$f" || { echo "::error::APK NOTICE 缺 magiskboot GPL-3.0 说明"; MISS=1; }
+            grep -qi "github.com/topjohnwu/Magisk" "$f" || { echo "::error::APK NOTICE 缺 magiskboot 源码链接"; MISS=1; }
+            grep -qi "SKRoot" "$f"              || { echo "::error::APK NOTICE 缺 SKRoot proprietary 声明"; MISS=1; }
+            grep -qiE "保留所有权利|all rights reserved" "$f" || { echo "::error::APK NOTICE 缺「保留所有权利」表述"; MISS=1; }
+            grep -qi "AGPL-3\.0" "$f"           || { echo "::error::APK NOTICE 缺 AGPL-3.0 说明"; MISS=1; }
+          done <<< "$FOUND"
+          [ "$MISS" -eq 0 ] || exit 1
+          echo "OK APK NOTICE markers complete"
+
+      # ------------------------------------------------------------------
+      # VER — 版本一致性
+      # ------------------------------------------------------------------
+      - name: VER — apd version consistency (artifact ↔ APK ↔ binary)
+        run: |
+          set -euo pipefail
+          WORK="${{ steps.collect.outputs.work }}"
+          APK=$(find "$WORK/apk" -name '*.apk' | head -1)
+          META=$(find "$WORK/apd" -name 'apd-version.txt' | head -1)
+          test -n "$META" || { echo "::error::apd artifact 缺 apd-version.txt"; exit 1; }
+          echo "--- apd-version.txt ---"; cat "$META"
+          ART_COMMIT=$(grep -E '^commit=' "$META" | cut -d= -f2-)
+          ART_SHORT=$(grep -E '^commit_short=' "$META" | cut -d= -f2- || true)
+          ART_SHA=$(grep -E '^sha256=' "$META" | cut -d= -f2-)
+          test -n "$ART_COMMIT" || { echo "::error::apd-version.txt 缺 commit"; exit 1; }
+
+          # 1) APK 内 assets/apd-version.txt 必须与 artifact 的 commit 完全一致
+          mkdir -p "$WORK/apkx_meta"
+          unzip -o -q "$APK" 'assets/apd-version.txt' -d "$WORK/apkx_meta" 2>/dev/null || true
+          APK_META=$(find "$WORK/apkx_meta" -name 'apd-version.txt' | head -1)
+          test -n "$APK_META" || { echo "::error::APK 缺 assets/apd-version.txt（无法校验版本一致性）"; exit 1; }
+          APK_COMMIT=$(grep -E '^commit=' "$APK_META" | cut -d= -f2-)
+          [ "$APK_COMMIT" = "$ART_COMMIT" ] || { echo "::error::版本不一致：artifact=$ART_COMMIT apk=$APK_COMMIT"; exit 1; }
+          echo "OK commit matches: $ART_COMMIT"
+
+          # 2) libapd.so sha256 三方一致（APK / artifact / manifest）
+          APK_LIB=$(find "$WORK/apkx" -path '*arm64-v8a/libapd.so' | head -1)
+          ART_LIB=$(find "$WORK/apd" -name 'libapd-arm64.so' | head -1)
+          test -n "$APK_LIB" && test -n "$ART_LIB" || { echo "::error::缺 libapd.so"; exit 1; }
+          SHA_APK=$(sha256sum "$APK_LIB" | cut -d' ' -f1)
+          SHA_ART=$(sha256sum "$ART_LIB" | cut -d' ' -f1)
+          echo "sha(apk)=$SHA_APK sha(artifact)=$SHA_ART sha(meta)=$ART_SHA"
+          [ "$SHA_APK" = "$SHA_ART" ] || { echo "::error::APK 内 libapd.so 与 apd artifact 不一致（版本错配）"; exit 1; }
+          [ "$SHA_APK" = "$ART_SHA" ] || { echo "::error::libapd.so sha256 与 apd-version.txt 记录不一致"; exit 1; }
+
+          # 3) 二进制内嵌 commit（build.rs 注入 VERSION_COMMIT）必须存在
+          if [ -n "${ART_SHORT:-}" ]; then
+            grep -aq -- "$ART_SHORT" "$APK_LIB" || { echo "::error::libapd.so 内未找到内嵌 commit $ART_SHORT"; exit 1; }
+            echo "OK embedded commit found in binary: $ART_SHORT"
+          fi
+          {
+            echo "## 版本一致性 — PASS"
+            echo "- commit: \`$ART_COMMIT\`"
+            echo "- libapd.so sha256: \`$SHA_APK\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # 发布物清单
+      # ------------------------------------------------------------------
+      - name: Build release-manifest.json
+        run: |
+          set -euo pipefail
+          WORK="${{ steps.collect.outputs.work }}"
+          python3 - "$WORK" "${{ steps.meta.outputs.tag }}" "$GITHUB_SHA" > "$WORK/release-manifest.json" <<'PY'
+          import hashlib, json, os, sys
+          from pathlib import Path
+
+          work, tag, sha = sys.argv[1], sys.argv[2], sys.argv[3]
+          root = Path(work)
+          files = []
+          for path in sorted(root.rglob('*')):
+              if not path.is_file():
+                  continue
+              if path.name.startswith('.') or path.name == 'release-manifest.json':
+                  continue
+              rel = path.relative_to(root).as_posix()
+              artifact = rel.split('/')[0]
+              meta = root / artifact / '.artifact.json'
+              src = {}
+              if meta.exists():
+                  try:
+                      a = json.loads(meta.read_text())
+                      wr = a.get('workflow_run') or {}
+                      src = {
+                          'artifact': a.get('name'),
+                          'artifact_id': a.get('id'),
+                          'run_id': wr.get('id'),
+                          'workflow': wr.get('name'),
+                          'run_url': wr.get('html_url'),
+                      }
+                  except Exception:
+                      pass
+              files.append({
+                  'path': rel,
+                  'size': path.stat().st_size,
+                  'sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                  'source': src or {'artifact': artifact},
+              })
+          manifest = {
+              'project': 'SPRoot',
+              'license': 'AGPL-3.0-only (engine/ subset: SKRoot proprietary, see LICENSES.md)',
+              'tag': tag,
+              'commit': sha,
+              'generated_at': __import__('datetime').datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+              'files': files,
+          }
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+          mv "$WORK/release-manifest.json" ./release-manifest.json
+          python3 - <<'PY'
+          import json
+          m=json.load(open('release-manifest.json'))
+          print(f"manifest: {len(m['files'])} files, tag={m['tag']}, commit={m['commit']}")
+          rows="\n".join(f"| `{f['path']}` | {f['size']} | `{f['sha256'][:16]}…` | {f['source'].get('artifact','')} |" for f in m['files'])
+          open('/tmp/manifest-summary.md','w').write("## 发布物清单\n\n| file | size | sha256 | artifact |\n|---|---|---|---|\n"+rows+"\n")
+          PY
+          cat /tmp/manifest-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------------
+      # engine/ 再许可门禁（默认阻止）
+      # ------------------------------------------------------------------
+      - name: Gate — engine redistribution written permission
+        run: |
+          set -euo pipefail
+          CONFIRM="${{ github.event.inputs.confirm_engine_redistribute }}"
+          if [ "${CONFIRM:-false}" != "true" ]; then
+            {
+              echo "## ⛔ 发布被阻止：engine/ 再许可未获书面确认"
+              echo ""
+              echo "engine/src 的 15 个 patch 文件与 SKRoot 上游逐字节相同（proprietary，原作者保留所有权利，见 LICENSES.md）。"
+              echo "在取得书面再许可前，含该内容的产物**不得公开发布**。"
+              echo ""
+              echo "如需放行：Actions → Release gate → Run workflow → 勾选 \`confirm_engine_redistribute=true\`。"
+              echo "本工作流只产出 \`release-manifest.json\`，从不自动发布。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::engine/ 再许可未确认——默认阻止发布（workflow_dispatch + confirm_engine_redistribute=true 可显式放行）"
+            exit 1
+          fi
+          {
+            echo "## ⚠️ engine/ 再许可已由人工确认（confirm_engine_redistribute=true）"
+            echo ""
+            echo "本次仅产出 release-manifest.json；发布动作由人执行，风险由确认人承担。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest
+          path: release-manifest.json
+          if-no-files-found: warn
+          retention-days: 30
