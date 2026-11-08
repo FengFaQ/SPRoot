@@ -14,7 +14,9 @@
 #
 # 依赖（由 apd deploy 负责建立，非本文件职责）：
 #    /data/adb/apd                      apd 可执行文件（aarch64）
-#    /data/adb/sproot/superkey          0600 root:root，47 字符密钥 + NUL
+#    /data/adb/sproot/key          0600 root:root，内容为 47 字符密钥（无 NUL，逐行为纯文本）
+#                                  —— 与 apd/src/defs.rs::SPROOT_KEY_FILE 严格一致；
+#                                     由 apd deploy 的 step 5/9 原子写入（tmp+fsync+rename）
 #    /data/adb/sproot/                 0700 root:root
 
 on post-fs-data
@@ -24,7 +26,7 @@ on post-fs-data
 # ⚠️ 参数顺序（clap）：--superkey-file 是 apd 的**顶层**参数，必须写在子命令 daemon 之前。
 #    写成 `apd daemon --superkey-file ...` 会被 clap 判为 unexpected argument（rc=2），
 #    daemon 根本起不来；RcInject 按本文件原文注入，故顺序在这里就是最终生效顺序。
-service sproot-apd /data/adb/apd --superkey-file /data/adb/sproot/superkey daemon
+service sproot-apd /data/adb/apd --superkey-file /data/adb/sproot/key daemon
     class late_start
     user root
     group root
