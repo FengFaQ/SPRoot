@@ -321,14 +321,15 @@ engineVersion()=<引擎返回>
 
 结果同时写日志（tag=Settings），供 qa 做 JNI 加载验证（B-14）。
 
-### 7A.4 NOTICE / 许可证随包（单源）
+### 7A.4 NOTICE / 许可证随包（单源，满足 qa LIC-1 与 release.yml LIC 门禁）
 
-构建期 CI 组装（不再手工维护两份）：
+构建期 CI 组装（不再手工维护多份副本）：
 
-1. `assets/NOTICE` = 仓库根 `NOTICE`（唯一事实源）+ `assets/NOTICE-APK.md`（APK 特有清单：magiskboot GPL-3.0、apd AGPL-3.0、SKRoot proprietary、Kotlin/Compose/Miuix Apache-2.0）；
-2. `assets/licenses/GPL-3.0.txt`（magiskboot 义务：GPL 全文）+ `assets/licenses/AGPL-3.0.txt`（= 仓库根 `LICENSE`）；
+1. `assets/NOTICE` = 仓库根 `NOTICE`（唯一事实源）+ `assets/NOTICE-APK.md`（APK 特有清单，四段式）：
+   ① 本项目 AGPL-3.0；② **SKRoot 上游：版权归原作者、保留所有权利（All Rights Reserved）、AGPL-3.0 不适用该部分**（含上游 URL `github.com/abcz316/SKRoot-linuxKernelRoot`）；③ magiskboot（Magisk v31.1、GPL-3.0、来源 URL + APK/二进制 sha256 + 源码 tag）；④ 其他第三方（AndroidX/Compose/Kotlin/miuix=Apache-2.0，asmjit=Zlib，capstone=BSD-3，cJSON=MIT）；
+2. 随包许可证全文：`assets/licenses/AGPL-3.0.txt`（= 仓库根 `LICENSE`）、`assets/licenses/LICENSE`（同全文，供门禁按名查找）、`assets/licenses/NOTICE`（同 NOTICE 内容）、`assets/licenses/GPL-3.0.txt`（magiskboot 义务）；
 3. 构建期校验材料（`ENGINE-META.txt`、`SYMBOLS-libskrootpatch.txt`、`SHA256SUMS`、`magiskboot-meta.txt`、`apd-version.txt`）一并入 assets；
-4. CI 硬断言：上述 4 项 asset 必须存在，且 `assets/NOTICE` 必须提及 magiskboot。
+4. CI 硬断言（构建失败条件）：上列 6 个 asset 必须存在；`assets/NOTICE` 必含 `SKRoot`/`All Rights Reserved`/`AGPL-3.0`/`GPL-3.0`/`magiskboot`/`asmjit`/`capstone`/`cJSON`；`assets/licenses/LICENSE` 必须 >20KB 且含 AGPL 标题。
 
 ---
 
