@@ -130,7 +130,7 @@ pub fn wait_timeout(child: &mut Child, timeout: Duration) -> Result<Option<ExitS
         thread::sleep(Duration::from_millis(50));
     }
 }
-pub fn is_safe_mode(superkey: Option<String>) -> bool {
+pub fn is_safe_mode(superkey: Option<&str>) -> bool {
     // Contract v1.0 §3.5: three paths, any hit means safe mode.
     // Path 1+2: system properties (upstream behaviour, unchanged).
     let safemode = getprop("persist.sys.safemode")

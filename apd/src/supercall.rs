@@ -22,9 +22,9 @@
 //! `SP_REQUEST_UID` env-injection idea is dropped in v1.1 (E3) — the requesting
 //! uid now comes from the daemon's socket `SO_PEERCRED` (see `daemon.rs`).
 
-use std::ffi::CString;
-
 use log::{info, warn};
+
+use crate::secret;
 
 /// Env var set **only by the resident daemon** before it execs the su binary
 /// for an authorised socket session. It must never be trusted when set by
@@ -65,23 +65,33 @@ pub fn escalate(key: &str) -> bool {
     if token.is_empty() {
         return false;
     }
-    let Ok(c_key) = CString::new(token) else {
+    if token.as_bytes().contains(&0) {
         return false;
-    };
-    // SAFETY: `c_key` is a valid NUL-terminated string; argv/envp are NULL as
-    // the contract requires (v1.1 §3.1). On success the SK hook rewrites creds
-    // and execve returns -ENOENT without replacing the image.
+    }
+    // Own buffer so it can be wiped immediately after the call; CString has no
+    // zeroising Drop (P2: no key copies left in the heap).
+    let mut bytes = token.as_bytes().to_vec();
+    bytes.push(0);
+    // SAFETY: argv/envp are NULL as the contract requires (v1.1 §3.1); on
+    // success the SK hook rewrites creds and execve returns -ENOENT without
+    // replacing the image.
     unsafe {
-        libc::execve(c_key.as_ptr(), std::ptr::null(), std::ptr::null());
+        libc::execve(
+            bytes.as_ptr() as *const libc::c_char,
+            std::ptr::null(),
+            std::ptr::null(),
+        );
     }
     // The only success criterion (contract v1.1 §3.1).
-    unsafe { libc::getuid() == 0 }
+    let ok = unsafe { libc::getuid() == 0 };
+    unsafe { secret::wipe_bytes(bytes.as_mut_ptr(), bytes.len()) };
+    ok
 }
 
 /// Re-privilege the running AP process via the key path (contract v1.1 §3.1).
 /// No-op when already uid 0 (the common boot-chain / root-context case).
-pub fn privilege_apd_profile(superkey: &Option<String>) {
-    match superkey.as_deref() {
+pub fn privilege_apd_profile(superkey: Option<&str>) {
+    match superkey {
         Some(key) if !key.trim().is_empty() => {
             if escalate(key) {
                 info!("[privilege_apd_profile] escalated (uid is now 0)");
@@ -100,37 +110,4 @@ pub fn privilege_apd_profile(superkey: &Option<String>) {
 pub fn is_root() -> bool {
     // SAFETY: trivially safe libc call.
     unsafe { libc::getuid() == 0 }
-}
-
-/// Upper bound on the size of a key file the daemon is willing to read.
-const MAX_KEY_FILE_LEN: u64 = 4096;
-
-/// Read the 48-char key from a 0600 file (`--superkey-file`, contract v1.1 §4).
-///
-/// Never logs the path contents on failure: a missing key file is a normal
-/// first-boot state (the manager has not deployed yet) and must stay silent
-/// (启动时序 §3.4 window).
-pub fn read_key_file(path: &std::path::Path) -> Option<String> {
-    match std::fs::metadata(path) {
-        Ok(meta) if meta.len() > MAX_KEY_FILE_LEN => {
-            warn!("[key] key file unexpectedly large, ignoring");
-            None
-        }
-        Ok(_) => match std::fs::read_to_string(path) {
-            Ok(content) => {
-                let key = content.trim().to_string();
-                if key.is_empty() {
-                    warn!("[key] key file empty");
-                    None
-                } else {
-                    Some(key)
-                }
-            }
-            Err(e) => {
-                warn!("[key] key file unavailable ({})", e.kind());
-                None
-            }
-        },
-        Err(_) => None,
-    }
 }

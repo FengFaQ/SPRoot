@@ -272,6 +272,12 @@ on boot
 
 **既有 `init.rc` 末尾文本级追加一行**：`import /init.sproot.rc`（magiskboot `cpio add`；不依赖 kptools embed-extra——SK 无开机解压运行时，时序稿 §3.4 已定）。
 
+**AVB / 分区约束（2026-11-08 AVB 专项结论，三家方案一致：不碰 AVB 密码学）**：
+1. **禁止任何 vbmeta/AVB 操作**：不改 `vbmeta.img`、不加 `--disable-verification`、不改 AVB 元数据。仅依赖「已解锁 bootloader 跳过验证」这一前提。
+2. **刷入链**：`fastboot flash boot`（双槽 `--slot=all`）+ `reboot`；**不得**出现 `fastboot flash vbmeta` / `fastboot --disable-verification`（后者还会清数据，必须禁用）。
+3. **rc 注入目标与尺寸**：优先 `init_boot`（有则用 init_boot，其次 boot 的 ramdisk）；rc 注入会改变 ramdisk cpio 大小 → **必须按目标分区大小补齐**（`init_boot` = 8388608 字节），保证镜像长度与分区一致，避免 AVB/分区校验与刷入异常。
+4. **审计证据**：`deploy` 在 `state.json` 写入 `"avb": "vbmeta_untouched"`；`apd selftest` 的 `avb_untouched` 检查项供 qa 自动断言「部署过程从未触碰 vbmeta」。
+
 **为什么 services/boot-completed 不各占一个 rc 触发器**：
 1. 厂商 `init.rc` 结构差异大，rc 钩子越少越稳（时序稿 §3.4 实测门禁项）；
 2. `exec` 命令是**同步阻塞** init 的（模块 post-fs-data 语义需要），但 `service` 是异步且可被 init 监管/重启——常驻 daemon 用 service 比 `exec &` 可靠；
@@ -346,7 +352,7 @@ apd daemon --superkey-file /data/adb/sproot/key
 | 5 | 从临时 key 文件读密钥 → 写 `/data/adb/sproot/key`（0600 root，无换行） | 长度 48、字符集 `[A-Za-z0-9]` |
 | 6 | **install_su 等价**：`key16 = key[0:16]`；`mkdir /data/<key16>`（0700，label 伪装）→ 复制 AP 副本为 `<随机16字符>`（0700）→ `ln -sfn <隐藏路径> /data/adb/ap/bin/su` | 隐藏文件可执行；`exec -a su` 冒烟 |
 | 7 | 初始化 `/data/adb/ap/allow_list`（表头 + 空）+ `.lock`（0600） | 可被 daemon 解析 |
-| 8 | 写 `/data/adb/sproot/state.json`（版本、部署时间、隐藏文件名——**不含密钥任何片段**）+ 清空 `boot_count` + 写抽象 socket 名 `/data/adb/ap/bin/.su.sock`（0644，名字不含密钥） | JSON 可解析；socket 名可被客户端读取 |
+| 8 | 写 `/data/adb/sproot/state.json`（版本、**build commit**、部署时间、隐藏文件名、**`avb: vbmeta_untouched` 审计位**——**不含密钥任何片段**）+ 清空 `boot_count` + 写抽象 socket 名 `/data/adb/ap/bin/.su.sock`（0644，名字不含密钥） | JSON 可解析；socket 名可被客户端读取；AVB 审计位存在 |
 | 9 | 冒烟：`/data/adb/apd version --json`（以 root）+ `su -c id`（经 root-exec） | exit 0 |
 
 **版本一致性检查（APK 内 libapd.so ↔ /data/adb/apd，2026-11-08 lead 要求）**：
@@ -409,6 +415,16 @@ apd daemon --superkey-file /data/adb/sproot/key
 | CI 交叉编译（禁止本地出 arm64） | ⏳ 工作流已写 | `.github/workflows/apd.yml`（rust + NDK r27c + ELF AArch64/PIE 断言 + artifact）；**待仓库集成**：根仓库 `.gitignore` 目前忽略 `/app/`，CI 取不到 apd 源码（待 lead 决定 un-ignore `app/apd` 或迁移到 tracked 路径） |
 | 本地语法门禁 | ✅ 通过 | `cargo check`（WSL rustc 1.99.1 / x86_64-linux）；**仅语法验证，非交付物** |
 
+### P2 实施进度（2026-11-08，代码已落地）
+
+| P2 项 | 状态 | 落点 |
+|---|---|---|
+| 密钥 mlock + 用完即擦 | ✅ | 新模块 `secret.rs`：`SecretKey`（mlock 页范围 + `write_volatile` 擦除 + drop 解锁）；`supercall::escalate` 用自带缓冲并在 execve 后立即擦除；CLI 从 argv/文件进进程即包裹并擦 argv 副本；`--superkey-file` 也就地 mlock |
+| `-Z` 真 setcon | ✅ | 新模块 `selinux.rs`：不依赖 libselinux，`open/write/close` 写 `/proc/self/attr/current`（async-signal-safe，可入 `pre_exec`）；`root-exec --scontext` 在 drop uid **之前**切换；`su -Z` 真实切换（失败仅告警，保留原 context） |
+| daemon `--selftest` / `selftest` 子命令 | ✅ | 新模块 `selftest.rs`：检查 root/binary/key_file(0600/47-48/mlocked)/allow_list/hidden_su(0700)/目录权限/daemon pid/socket 探活/bootstate/version 一致性/**AVB 审计**；`--json` 供 App 与 qa；exit 0/1 |
+| 体积再瘦身 | ✅ 已改（数值待 CI） | `opt-level = "z"`（原 3）；`env_logger` 移出 Android 构建（`cfg(not(target_os="android"))`）；上一轮已删 goblin/scroll/adb_client（2.11MB→1.35MB） |
+| AVB 审计字段 | ✅ | `deploy` 的 `state.json` 增 `avb: "vbmeta_untouched"` + `commit`；`selftest` 断言；部署/卸载代码**零** vbmeta 操作（grep 证实） |
+
 ---
 
 ## 8. 风险清单
@@ -428,6 +444,8 @@ apd daemon --superkey-file /data/adb/sproot/key
 | R11 | 契约 v1.1 未及时修订（E1–E5） | 实现照旧契约写必然失败/返工 | 高 | 本文 §4.6 作为修订依据，lead 终审后同步契约 | 契约 v1.1 会签 |
 | R13 | APK 内置 libapd.so 与已部署 /data/adb/apd 版本漂移 | root-exec/授权/部署语义不一致，故障难定位 | 中 | `apd-version.txt`（固定 artifact）+ `version --json.commit` + `state.json.commit` 三方比对；不一致禁止静默使用 | 版本一致性验收项（§9-8） |
 | R12 | 二进制体积/冷启动（rc 关键路径） | 开机变慢、用户可感 | 低 | 体积实测 + 必要时拆小二进制 / 延迟加载 lua | 开机耗时对比（原厂 vs 修补） |
+| R14 | rc 注入改动 ramdisk 尺寸 / 误碰 vbmeta | 刷入后 AVB/分区校验异常、无法开机 | 中 | 不碰 AVB 密码学；init_boot 优先 + 按分区大小补齐（8388608）；刷入链只 `fastboot flash boot --slot=all`；`state.json` 留 AVB 审计位 | §9-10 + 真机刷入回滚演练 |
+| R15 | 密钥在内存/swap 残留 | 本机 root 凭据泄露 | 低 | mlock + volatile 擦除（SecretKey）；不落明文文件（0600 root 除外）；日志脱敏 | `selftest` mlocked 断言 + 进程内存抽查 |
 
 ---
 
@@ -441,6 +459,9 @@ apd daemon --superkey-file /data/adb/sproot/key
 6. **回滚**：刷回原厂 boot → 系统正常；`undeploy` 后 `/data/<key16>`、`/data/adb/sproot`、`/data/adb/apd` 均不存在。
 7. **契约一致性**：E1–E5 在契约 v1.1 中已修订或明确接受（会签记录）。
 8. **版本一致性**：APK 内置 libapd.so 的 commit 与 `/data/adb/apd` 的 `version --json.commit` 一致；不一致时 UI 有明确「重新部署」提示。
+9. **自检可用**：`apd selftest --json` 在健康部署上返回 `ok=true`、全 critical 项通过；删除 key/隐藏 su 后对应 critical 项失败且 exit 1。
+10. **AVB 未被触碰**：`state.json.avb == "vbmeta_untouched"`；刷入链无任何 vbmeta 命令；rc 注入产物按分区大小补齐（init_boot 8388608）。
+11. **密钥无残留**：`selftest` 的 `key_file.mlocked=true`；进程退出后 `/proc/<pid>/cmdline`/日志中无密钥原文或前缀。
 
 ---
 

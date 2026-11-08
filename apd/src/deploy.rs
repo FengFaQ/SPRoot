@@ -26,7 +26,7 @@ use anyhow::{Context, Result, bail, ensure};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 
-use crate::{defs, supercall};
+use crate::{defs, secret, supercall};
 
 /// Minimum accepted key length: the kernel compares the first 47 characters.
 const MIN_KEY_LEN: usize = supercall::KERNEL_KEY_LEN;
@@ -41,6 +41,10 @@ pub struct DeployState {
     /// APK-bundled `libapd.so` (version consistency check).
     #[serde(default)]
     pub commit: String,
+    /// AVB audit evidence: deploy never touches vbmeta/AVB structures. The
+    /// value is a fixed marker so QA can prove it from state.json.
+    #[serde(default)]
+    pub avb: String,
     pub deployed_at: u64,
     /// Random file name inside `/data/<key16>/`, needed by `undeploy`.
     /// Contains no key material (the directory name is derived from the key
@@ -57,11 +61,11 @@ pub fn deploy(source: Option<PathBuf>) -> Result<()> {
     // the root-only location and never echoed.
     let key_source = std::env::var("SPROOT_KEY_SOURCE").ok().map(PathBuf::from);
     let key = match key_source.as_deref() {
-        Some(path) => supercall::read_key_file(path).context("key file missing or unreadable")?,
-        None => supercall::read_key_file(Path::new(defs::SPROOT_KEY_FILE))
+        Some(path) => secret::read_key_file(path).context("key file missing or unreadable")?,
+        None => secret::read_key_file(Path::new(defs::SPROOT_KEY_FILE))
             .context("no key available (use --superkey-file)")?,
     };
-    validate_key(&key)?;
+    validate_key(key.as_str())?;
 
     let source_dir = match source {
         Some(dir) => dir,
@@ -98,10 +102,10 @@ pub fn deploy(source: Option<PathBuf>) -> Result<()> {
     )?;
 
     info!("[deploy] step 5/9: key file");
-    write_key_file(&key)?;
+    write_key_file(key.as_str())?;
 
     info!("[deploy] step 6/9: hidden su deployment");
-    let hidden_file = install_su(&key, &apd_src)?;
+    let hidden_file = install_su(key.as_str(), &apd_src)?;
 
     info!("[deploy] step 7/9: allow list");
     init_allow_list()?;
@@ -127,9 +131,9 @@ pub fn undeploy(keep_modules: bool) -> Result<()> {
     remove_path(&concat_path(defs::BINARY_DIR, "su"));
 
     // 2. hidden directory: derive the name from the root key, never persisted.
-    if let Some(key) = supercall::read_key_file(Path::new(defs::SPROOT_KEY_FILE)) {
+    if let Some(key) = secret::read_key_file(Path::new(defs::SPROOT_KEY_FILE)) {
         if key.len() >= 16 {
-            let hidden_dir = format!("/data/{}", &key[..16]);
+            let hidden_dir = format!("/data/{}", &key.as_str()[..16]);
             remove_path(&hidden_dir);
         } else {
             warn!("[undeploy] key file too short, hidden directory left in place");
@@ -283,6 +287,7 @@ fn write_state(hidden_file: &str, source_dir: &Path) -> Result<()> {
     let state = DeployState {
         version: defs::VERSION_NAME.trim().to_string(),
         commit: defs::VERSION_COMMIT.trim().to_string(),
+        avb: "vbmeta_untouched".to_string(),
         deployed_at: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())

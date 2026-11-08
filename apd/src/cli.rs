@@ -1,5 +1,6 @@
 use crate::{
-    auth_list, daemon, defs, deploy, event, lua, module, module_config, supercall, utils,
+    auth_list, daemon, defs, deploy, event, lua, module, module_config, secret, selftest,
+    supercall, utils,
 };
 #[cfg(target_os = "android")]
 use android_logger::Config;
@@ -51,7 +52,11 @@ enum Commands {
 
     /// Resident daemon (init only): services stage + uid-listener + auth socket
     /// + userspace boot-completed detection
-    Daemon,
+    Daemon {
+        /// run the read-only self-check and exit instead of daemonising
+        #[arg(long)]
+        selftest: bool,
+    },
 
     /// First-install deployment: install AP/busybox/key/hidden su/allow list.
     /// Run once root is available (the manager calls it via `root-exec`-style
@@ -94,6 +99,13 @@ enum Commands {
 
     /// Machine readable deployment/version status (`--json`)
     Version {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Read-only capability/diagnostic self-check (manager capability probe +
+    /// QA automation). Exit 0 = all critical checks pass, 1 = failed.
+    Selftest {
         #[arg(long)]
         json: bool,
     },
@@ -272,22 +284,27 @@ pub fn run() -> Result<()> {
 
     let mut cli = Args::parse();
 
-    // --superkey-file (启动时序 §3.3): read the key from a 0600 file so the
-    // key never appears in init's cmdline. Best-effort argv wipe: overwrite
-    // the argv slot that held the path is not needed (path is not secret),
-    // but the parsed struct must not outlive the key longer than necessary.
-    if cli.superkey.is_none() {
-        if let Some(ref path) = cli.superkey_file {
-            match std::fs::read_to_string(path) {
-                Ok(key) => cli.superkey = Some(key.trim().to_string()),
-                Err(e) => {
-                    // Silent-degrade: rc may retry with the key file in place
-                    // later (启动时序 §3.2 window). Log without the path
-                    // contents; a missing key is not an error surface.
-                    log::warn!("[superkey-file] unavailable (key not loaded)");
-                    let _ = e;
-                }
-            }
+    // Key material (P2): as soon as the key enters the process it is wrapped in
+    // a `SecretKey` — mlock'ed pages + volatile wipe on drop. The argv copy is
+    // wiped immediately after wrapping (only the path is non-secret).
+    let mut superkey = match cli.superkey.take() {
+        Some(mut raw) => {
+            let key = secret::SecretKey::new(&raw);
+            secret::wipe_string(&mut raw);
+            Some(key)
+        }
+        None => None,
+    };
+    // --superkey-file (启动时序 §3.3): read the key from a 0600 file so the key
+    // never appears in init's cmdline.
+    if superkey.is_none()
+        && let Some(ref path) = cli.superkey_file
+    {
+        superkey = secret::read_key_file(path);
+        if superkey.is_none() {
+            // Silent-degrade: rc may retry later (启动时序 §3.2 window). A
+            // missing key is not an error surface; never log the path content.
+            log::warn!("[superkey-file] unavailable (key not loaded)");
         }
     }
 
@@ -299,18 +316,28 @@ pub fn run() -> Result<()> {
 
     log::info!("command: {:?}", cli.command);
 
-    if cli.superkey.is_some() {
-        supercall::privilege_apd_profile(&cli.superkey);
+    if let Some(key) = superkey.as_ref() {
+        supercall::privilege_apd_profile(Some(key.as_str()));
     }
 
     let result = match cli.command {
-        Commands::PostFsData => event::on_post_data_fs(cli.superkey),
+        Commands::PostFsData => {
+            event::on_post_data_fs(superkey.as_ref().map(secret::SecretKey::as_str))
+        }
 
-        Commands::BootCompleted => event::on_boot_completed(cli.superkey),
+        Commands::BootCompleted => {
+            event::on_boot_completed(superkey.as_ref().map(secret::SecretKey::as_str))
+        }
 
         Commands::UidListener => event::start_uid_listener(),
 
-        Commands::Daemon => daemon::run(cli.superkey),
+        Commands::Daemon { selftest } => {
+            if selftest {
+                selftest::run(false)
+            } else {
+                daemon::run(superkey.clone())
+            }
+        }
 
         Commands::Deploy { source } => deploy::deploy(source),
 
@@ -326,6 +353,8 @@ pub fn run() -> Result<()> {
         Commands::Auth { command } => run_auth(command),
 
         Commands::Version { json } => print_version(json),
+
+        Commands::Selftest { json } => selftest::run(json),
 
         Commands::Module { command } => {
             #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -435,7 +464,9 @@ pub fn run() -> Result<()> {
             }
         }
 
-        Commands::Services => event::on_services(cli.superkey),
+        Commands::Services => {
+            event::on_services(superkey.as_ref().map(secret::SecretKey::as_str))
+        }
 
         Commands::Resetprop { args } => {
             let mut full_args = vec!["resetprop".to_string()];
@@ -471,25 +502,38 @@ fn run_root_exec(
         eprintln!("root-exec: empty command");
         std::process::exit(2);
     }
-    if let Some(ctx) = &scontext {
-        // P1: per-session setcon needs libselinux; never pretend it worked.
-        log::warn!("root-exec: --scontext {ctx} not supported yet (P1), ignored");
-    }
+    // P2: real per-session SELinux context (no libselinux dependency — the
+    // helper writes /proc/self/attr/current with raw libc calls, which is
+    // async-signal-safe enough for `pre_exec`).
+    let context = match scontext {
+        Some(ctx) => match std::ffi::CString::new(ctx.clone()) {
+            Ok(con) => Some(con),
+            Err(_) => {
+                eprintln!("root-exec: invalid scontext");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
 
     let mut command = std::process::Command::new(&argv[0]);
     command.args(&argv[1..]);
     // Session leader so a timeout can kill the whole process group.
     use std::os::unix::process::CommandExt;
     command.process_group(0);
-    if let Some(target_uid) = uid {
-        unsafe {
-            command.pre_exec(move || {
-                if libc::setgid(target_uid) != 0 || libc::setuid(target_uid) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+    unsafe {
+        command.pre_exec(move || {
+            // Order matters: switch context while still privileged, then drop.
+            if let Some(con) = context.as_ref() {
+                crate::selinux::setcon_raw(con)?;
+            }
+            if let Some(target_uid) = uid
+                && (libc::setgid(target_uid) != 0 || libc::setuid(target_uid) != 0)
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
 
     let mut child = command
@@ -541,9 +585,9 @@ fn print_version(json: bool) -> Result<()> {
     // key_prefix_sha256 (contract §8.3): an integrity marker, never the key or
     // any fragment of it. Only computable when root can read the key file —
     // otherwise the field is null (the contract's "身份要求: 任意").
-    let key_prefix_sha256 = supercall::read_key_file(std::path::Path::new(defs::SPROOT_KEY_FILE))
+    let key_prefix_sha256 = secret::read_key_file(std::path::Path::new(defs::SPROOT_KEY_FILE))
         .and_then(|key| {
-            let prefix: String = key.chars().take(16).collect();
+            let prefix: String = key.as_str().chars().take(16).collect();
             utils::sha256_hex_stdin(prefix.as_bytes())
         });
     if !json {

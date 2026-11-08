@@ -15,6 +15,9 @@ mod package;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod pty;
 mod resetprop;
+mod secret;
+mod selinux;
+mod selftest;
 mod restorecon;
 mod sepolicy;
 mod supercall;

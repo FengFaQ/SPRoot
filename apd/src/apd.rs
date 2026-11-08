@@ -154,9 +154,13 @@ pub fn root_shell() -> Result<()> {
     let mount_master = matches.opt_present("M");
 
     if let Some(context) = matches.opt_str("Z") {
-        log::warn!(
-            "su: SELinux context {context} requested but per-session context switching is not supported, ignoring"
-        );
+        // P2: real setcon (no libselinux dependency). The request is honoured
+        // before the shell is exec'd; a failure is logged but not fatal (the
+        // session still works in the current context, same as Magisk's fallback).
+        match crate::selinux::setcon(&context) {
+            std::result::Result::Ok(()) => log::info!("su: switched SELinux context to {context}"),
+            Err(e) => log::warn!("su: setcon({context}) failed: {e}"),
+        }
     }
 
     // -g overrides the primary group, -G appends supplementary groups

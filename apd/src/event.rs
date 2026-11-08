@@ -26,7 +26,7 @@ use crate::{
 // Contract v1.0 §3.4: the kernel su-path registration (0x1111) and the KP
 // truncate-remap event reporting are gone. `report_kernel` degenerates to a
 // log line with the same call signature so the stage flow reads identically.
-fn report_kernel(_superkey: Option<String>, event: &str, state: &str) {
+fn report_kernel(_superkey: Option<&str>, event: &str, state: &str) {
     info!("[report_kernel] {event}/{state}");
 }
 
@@ -41,20 +41,20 @@ fn refresh_allow_list(mutex: &std::sync::Arc<std::sync::Mutex<()>>) {
     auth_list::refresh_allow_list();
 }
 
-pub fn on_post_data_fs(superkey: Option<String>) -> Result<()> {
+pub fn on_post_data_fs(superkey: Option<&str>) -> Result<()> {
     utils::umask(0);
     // Boot-loop guard (NEW-DOC-05 §5.5, contract §3.5 addendum): count every
     // boot attempt before any module script can run; two consecutive boots
     // without a boot-completed force safe mode so the device cannot loop.
     let boot_attempt = bootstate::post_fs_data_start();
     info!("[post-fs-data] boot attempt #{boot_attempt}");
-    report_kernel(superkey.clone(), "post-fs-data", "before");
+    report_kernel(superkey, "post-fs-data", "before");
     use std::process::Stdio;
     #[cfg(unix)]
     // Contract v1.0 §3.4: su-path registration removed (no kernel remap).
     // The daemon is expected to be started with the key already granted via
     // the SK execve hook chain (启动时序分析 determines who execs us).
-    privilege_apd_profile(&superkey);
+    privilege_apd_profile(superkey);
 
     let mut sepol = get_policy_main(&["magiskpolicy".to_string(), "--live".to_string()])?;
     sepol.magisk_rules();
@@ -63,7 +63,7 @@ pub fn on_post_data_fs(superkey: Option<String>) -> Result<()> {
         .context("Cannot apply policy")?;
 
     info!("Re-privilege apd profile after injecting sepolicy");
-    privilege_apd_profile(&superkey);
+    privilege_apd_profile(superkey);
 
     // Clear all temporary module configs early
     if let Err(e) = crate::module_config::clear_all_temp_configs() {
@@ -72,7 +72,7 @@ pub fn on_post_data_fs(superkey: Option<String>) -> Result<()> {
 
     if utils::has_magisk() {
         warn!("Magisk detected, skip post-fs-data!");
-        report_kernel(superkey.clone(), "post-fs-data", "after");
+        report_kernel(superkey, "post-fs-data", "after");
         return Ok(());
     }
 
@@ -146,7 +146,7 @@ pub fn on_post_data_fs(superkey: Option<String>) -> Result<()> {
         Err(_) => println!("{} not found", key),
     }
 
-    let safe_mode = utils::is_safe_mode(superkey.clone());
+    let safe_mode = utils::is_safe_mode(superkey);
 
     if safe_mode {
         // we should still mount modules.img to `/data/adb/modules` in safe mode
@@ -204,7 +204,7 @@ pub fn on_post_data_fs(superkey: Option<String>) -> Result<()> {
     if let Err(e) = module::exec_stage_script("post-fs-data", true) {
         warn!("exec post-fs-data scripts failed: {}", e);
     }
-    if let Err(e) = lua::exec_stage_lua("post-fs-data", true, superkey.as_deref().unwrap_or("")) {
+    if let Err(e) = lua::exec_stage_lua("post-fs-data", true, superkey.unwrap_or("")) {
         warn!("Failed to exec post-fs-data lua: {}", e);
     }
     // load system.prop
@@ -215,14 +215,14 @@ pub fn on_post_data_fs(superkey: Option<String>) -> Result<()> {
     info!("remove update flag");
     let _ = fs::remove_file(module_update_flag);
 
-    run_stage("post-mount", superkey.clone(), true);
+    run_stage("post-mount", superkey, true);
 
     env::set_current_dir("/").with_context(|| "failed to chdir to /")?;
     report_kernel(superkey, "post-fs-data", "after");
     Ok(())
 }
 
-fn run_stage(stage: &str, superkey: Option<String>, block: bool) {
+fn run_stage(stage: &str, superkey: Option<&str>, block: bool) {
     utils::umask(0);
 
     if utils::has_magisk() {
@@ -230,7 +230,7 @@ fn run_stage(stage: &str, superkey: Option<String>, block: bool) {
         return;
     }
 
-    if utils::is_safe_mode(superkey.clone()) {
+    if utils::is_safe_mode(superkey) {
         warn!("safe mode, skip {stage} scripts");
         if let Err(e) = module::disable_all_modules() {
             warn!("disable all modules failed: {}", e);
@@ -249,12 +249,12 @@ fn run_stage(stage: &str, superkey: Option<String>, block: bool) {
     if let Err(e) = module::exec_stage_script(stage, block) {
         warn!("Failed to exec {stage} scripts: {e}");
     }
-    if let Err(e) = lua::exec_stage_lua(stage, block, superkey.as_deref().unwrap_or("")) {
+    if let Err(e) = lua::exec_stage_lua(stage, block, superkey.unwrap_or("")) {
         warn!("Failed to exec {stage} lua: {e}");
     }
 }
 
-pub fn on_services(superkey: Option<String>) -> Result<()> {
+pub fn on_services(superkey: Option<&str>) -> Result<()> {
     info!("on_services triggered!");
     run_stage("service", superkey, false);
 
@@ -267,7 +267,7 @@ fn _removed_run_uid_monitor() {
     // writer lock for the allow list and the single-instance lock for itself.
 }
 
-pub fn on_boot_completed(superkey: Option<String>) -> Result<()> {
+pub fn on_boot_completed(superkey: Option<&str>) -> Result<()> {
     info!("on_boot_completed triggered!");
 
     run_stage("boot-completed", superkey, false);

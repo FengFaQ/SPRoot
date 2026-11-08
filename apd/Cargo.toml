@@ -23,7 +23,6 @@ zip = { version = "8.6.0",features = [
 ], default-features = false }
 java-properties = { git = "https://github.com/AndroidPatch/java-properties.git", branch = "master", default-features = false }
 log = "0.4.33"
-env_logger = "0.11.11"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 encoding_rs = "0.8.35"
@@ -36,6 +35,11 @@ getopts = "0.2.24"
 notify = "8.2.0"
 signal-hook = "0.4.4"
 regex-lite = "0.1.9"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+# host-only logging (Android builds use android_logger instead; keeping it out
+# of the arm64 artifact saves size)
+env_logger = "0.11.11"
 
 [target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
 rustix = { version = "1.1.4", features = ["all-apis"] }
@@ -54,7 +58,7 @@ android_logger = { version = "0.15.1", default-features = false }
 strip = true
 overflow-checks = false
 rpath = false
-opt-level = 3
+opt-level = "z"
 codegen-units = 1
 panic = "abort"
 lto = "fat"

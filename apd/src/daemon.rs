@@ -34,7 +34,7 @@ use std::{
 use anyhow::{Context, Result};
 use log::{error, info, warn};
 
-use crate::{auth_list, defs, event, supercall, utils};
+use crate::{auth_list, defs, event, secret::SecretKey, supercall, utils};
 
 /// How long the daemon waits for `sys.boot_completed=1` before giving up on the
 /// boot-completed stage (it stays alive and retries on the next poll cycle).
@@ -45,7 +45,7 @@ const PROP_POLL_INTERVAL: Duration = Duration::from_secs(1);
 static BOOT_DONE: AtomicBool = AtomicBool::new(false);
 
 /// `apd daemon` entry point.
-pub fn run(superkey: Option<String>) -> Result<()> {
+pub fn run(superkey: Option<SecretKey>) -> Result<()> {
     if !supercall::is_root() {
         // Silent: the rc may have started us before the manager deployed
         // (first-boot window, 时序稿 §3.4). Do not spam logs, do not crash.
@@ -66,7 +66,7 @@ pub fn run(superkey: Option<String>) -> Result<()> {
     info!("[daemon] starting (pid={})", std::process::id());
 
     // (1) Stage ② — non-blocking module service scripts.
-    if let Err(e) = event::on_services(superkey.clone()) {
+    if let Err(e) = event::on_services(superkey.as_ref().map(SecretKey::as_str)) {
         warn!("[daemon] services stage failed: {e:#}");
     }
 
@@ -87,7 +87,9 @@ pub fn run(superkey: Option<String>) -> Result<()> {
         }
     });
 
-    // (4) Stage ③ — userspace boot-completed detection.
+    // (4) Stage ③ — userspace boot-completed detection. The key is cloned into
+    // a *new* locked copy for this thread; both copies zeroise on drop.
+    let boot_key = superkey.clone();
     thread::spawn(move || {
         let mut waited = 0u64;
         while waited < BOOT_WAIT_SECS {
@@ -101,7 +103,7 @@ pub fn run(superkey: Option<String>) -> Result<()> {
             warn!("[daemon] boot-completed not observed within {BOOT_WAIT_SECS}s");
             return;
         }
-        if let Err(e) = event::on_boot_completed(superkey.clone()) {
+        if let Err(e) = event::on_boot_completed(boot_key.as_ref().map(SecretKey::as_str)) {
             warn!("[daemon] boot-completed stage failed: {e:#}");
         }
         BOOT_DONE.store(true, Ordering::SeqCst);
@@ -219,6 +221,14 @@ fn bind_abstract(name: &str) -> io::Result<RawFd> {
         }
         Ok(fd)
     }
+}
+
+/// Read-only socket probe for `selftest`: bind then immediately close.
+/// `EADDRINUSE` means a daemon is already listening on that abstract name.
+pub(crate) fn probe_abstract_bind(name: &str) -> io::Result<()> {
+    let fd = bind_abstract(name)?;
+    unsafe { libc::close(fd) };
+    Ok(())
 }
 
 fn peer_uid(fd: RawFd) -> io::Result<u32> {
