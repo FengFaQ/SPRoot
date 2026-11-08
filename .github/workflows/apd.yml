@@ -1,0 +1,134 @@
+# SPRoot AP binary (apd/, Rust) CI — v2 layout.
+#
+# Project rule: NO local cross-compilation; every arm64 artifact is built here
+# on GitHub Actions. Locally only `cargo check` is allowed as a fast syntax gate
+# (never a deliverable, never an arm64 binary).
+#
+# Produces dist/libapd.so (aarch64 PIE executable; packaged into the APK's
+# jniLibs/arm64-v8a and executed from nativeLibraryDir), asserts the ELF header
+# is EM_AARCH64 + ET_DYN, and uploads artifact + sha256.
+
+name: apd (Rust, aarch64-android)
+
+on:
+  push:
+    branches: [v2]
+    paths:
+      - "apd/**"
+      - ".github/workflows/apd.yml"
+  pull_request:
+    branches: [v2]
+    paths:
+      - "apd/**"
+      - ".github/workflows/apd.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apd-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-apd:
+    name: build libapd.so (aarch64-linux-android)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: apd
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Rust toolchain + cross target (edition 2024 needs a recent stable).
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apd
+          key: apd-aarch64
+
+      # Android NDK provides the clang linker + sysroot for the target.
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
+      - name: Configure cross linker / C compiler
+        run: |
+          set -euo pipefail
+          NDK_BIN="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CC="${NDK_BIN}/aarch64-linux-android24-clang"
+          if [ ! -x "$CC" ]; then
+            echo "toolchain missing: $CC"; ls "$NDK_BIN"; exit 1
+          fi
+          {
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${CC}"
+            echo "CC_aarch64_linux_android=${CC}"
+            echo "CXX_aarch64_linux_android=${NDK_BIN}/aarch64-linux-android24-clang++"
+            echo "AR_aarch64_linux_android=${NDK_BIN}/llvm-ar"
+            echo "RANLIB_aarch64_linux_android=${NDK_BIN}/llvm-ranlib"
+            echo "STRIP_aarch64_linux_android=${NDK_BIN}/llvm-strip"
+          } >> "$GITHUB_ENV"
+
+      # Fast syntax gate on the host first, so a typo fails in seconds.
+      - name: Host syntax check
+        run: cargo check --locked
+
+      # Real deliverable: cross-compiled release binary for arm64 Android.
+      - name: Cross build (release)
+        run: cargo build --release --locked --target aarch64-linux-android
+
+      - name: Stage artifact as libapd.so
+        run: |
+          set -euo pipefail
+          mkdir -p ../dist
+          SRC="target/aarch64-linux-android/release/apd"
+          test -f "$SRC"
+          cp "$SRC" ../dist/libapd.so
+          "${STRIP_aarch64_linux_android}" ../dist/libapd.so
+          ls -l ../dist/libapd.so
+          ( cd ../dist && sha256sum libapd.so | tee libapd.so.sha256 )
+          file ../dist/libapd.so | tee ../dist/libapd.elf-info.txt
+
+      # ELF assertion: ELFCLASS64 + little-endian + ET_DYN (PIE) + EM_AARCH64.
+      - name: Assert ELF is aarch64 PIE
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import struct
+
+          path = "../dist/libapd.so"
+          with open(path, "rb") as f:
+              ident = f.read(20)
+
+          assert ident[:4] == b"\x7fELF", "not an ELF file"
+          ei_class, ei_data = ident[4], ident[5]
+          e_type, e_machine = struct.unpack("<HH", ident[16:20])
+          print(f"class={ei_class} data={ei_data} e_type={e_type} e_machine={e_machine}")
+
+          assert ei_class == 2, "not ELFCLASS64"
+          assert ei_data == 1, "not little-endian"
+          assert e_type == 3, "not ET_DYN (PIE executable expected)"
+          assert e_machine == 183, "not EM_AARCH64 (183)"
+          print("ELF assertion passed: aarch64 PIE")
+          PY
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apd-aarch64-${{ github.sha }}
+          path: |
+            dist/libapd.so
+            dist/libapd.so.sha256
+            dist/libapd.elf-info.txt
+          if-no-files-found: error
+          retention-days: 14

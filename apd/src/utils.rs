@@ -6,13 +6,15 @@ use std::{
     fs::{File, OpenOptions, create_dir_all, metadata},
     io::{ErrorKind::AlreadyExists, Write},
     path::Path,
-    process::{Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
+    thread,
+    time::Duration,
 };
 
 use anyhow::{Context, Error, Ok, Result, bail};
 use log::info;
 
-use crate::{defs, supercall::SP_SAFEMODE_FILE};
+use crate::defs;
 
 pub fn ensure_file_exists<T: AsRef<Path>>(file: T) -> Result<()> {
     match File::options().write(true).create_new(true).open(&file) {
@@ -67,6 +69,67 @@ pub fn run_command(
     let child = command_builder.spawn()?;
     Ok(child)
 }
+
+/// SHA-256 hex digest of `data`, computed with the deployed busybox.
+///
+/// No crypto crate is added on purpose (dependency-free build, contract v1.1
+/// §8.3 only needs an integrity marker). Returns `None` when busybox is not
+/// available yet (pre-deploy), in which case callers emit JSON `null`.
+pub fn sha256_hex_stdin(data: &[u8]) -> Option<String> {
+    let busybox = Path::new(crate::defs::BINARY_DIR).join("busybox");
+    if !busybox.exists() {
+        return None;
+    }
+    let mut child = Command::new(busybox)
+        .arg("sha256sum")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(data).ok()?;
+    }
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .map(|digest| digest.to_string())
+}
+
+/// Wait for `child` with a deadline. Returns `Ok(Some(status))` when it exited
+/// in time, `Ok(None)` after killing the child's **process group** on timeout.
+///
+/// Module scripts are spawned with `process_group(0)` (module.rs), so killing
+/// `-pid` also kills their subshells — otherwise a hung `post-fs-data.sh` would
+/// keep the whole boot blocked and defeat the deadline (NEW-DOC-05 §5.2/§5.5).
+pub fn wait_timeout(child: &mut Child, timeout: Duration) -> Result<Option<ExitStatus>> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            std::result::Result::Ok(Some(status)) => return Ok(Some(status)),
+            std::result::Result::Ok(None) => {}
+            Err(e) => return Err(e.into()),
+        }
+        if std::time::Instant::now() >= deadline {
+            let pid = child.id();
+            // Negative pid targets the process group when the caller made the
+            // child a group leader (`process_group(0)`); the plain pid covers
+            // callers that did not. Both are best-effort.
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+            // Reap; ignore errors (already-exited race is harmless).
+            let _ = child.wait();
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
 pub fn is_safe_mode(superkey: Option<String>) -> bool {
     // Contract v1.0 §3.5: three paths, any hit means safe mode.
     // Path 1+2: system properties (upstream behaviour, unchanged).
@@ -86,7 +149,7 @@ pub fn is_safe_mode(superkey: Option<String>) -> bool {
     // signature for call-site compatibility; the kernel path it used to gate
     // no longer exists (silent removal, contract §3.5 "kernel 不参与").
     let _ = superkey;
-    let file_flag = Path::new(SP_SAFEMODE_FILE).exists();
+    let file_flag = Path::new(defs::SPROOT_SAFEMODE_FILE).exists();
     info!("safemode_file: {}", file_flag);
     file_flag
 }

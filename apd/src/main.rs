@@ -1,8 +1,11 @@
 mod apd;
 mod assets;
 mod auth_list;
+mod bootstate;
 mod cli;
+mod daemon;
 mod defs;
+mod deploy;
 mod event;
 mod insmod;
 mod late_load;

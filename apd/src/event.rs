@@ -18,7 +18,7 @@ use std::{
 };
 
 use crate::{
-    assets, auth_list, defs, lua, metamodule, module, restorecon,
+    assets, auth_list, bootstate, defs, lua, metamodule, module, restorecon,
     supercall::privilege_apd_profile,
     utils::{self, switch_cgroups},
 };
@@ -43,6 +43,11 @@ fn refresh_allow_list(mutex: &std::sync::Arc<std::sync::Mutex<()>>) {
 
 pub fn on_post_data_fs(superkey: Option<String>) -> Result<()> {
     utils::umask(0);
+    // Boot-loop guard (NEW-DOC-05 §5.5, contract §3.5 addendum): count every
+    // boot attempt before any module script can run; two consecutive boots
+    // without a boot-completed force safe mode so the device cannot loop.
+    let boot_attempt = bootstate::post_fs_data_start();
+    info!("[post-fs-data] boot attempt #{boot_attempt}");
     report_kernel(superkey.clone(), "post-fs-data", "before");
     use std::process::Stdio;
     #[cfg(unix)]
@@ -256,28 +261,10 @@ pub fn on_services(superkey: Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn run_uid_monitor() {
-    info!("Trigger run_uid_monitor!");
-
-    // Contract v1.0: daemon path comes from defs (binary renamed apd → AP);
-    // the hardcoded "/data/adb/apd" is gone.
-    let mut command = &mut Command::new(defs::DAEMON_PATH);
-    {
-        command = command.process_group(0);
-        command = unsafe {
-            command.pre_exec(|| {
-                // ignore the error?
-                switch_cgroups();
-                Ok(())
-            })
-        };
-    }
-    command = command.arg("uid-listener");
-
-    command
-        .spawn()
-        .map(|_| ())
-        .expect("[run_uid_monitor] Failed to run uid monitor");
+fn _removed_run_uid_monitor() {
+    // Intentionally removed (contract v1.1 §3.2): the forked `uid-listener`
+    // child is replaced by a thread inside `apd daemon`, which owns the single
+    // writer lock for the allow list and the single-instance lock for itself.
 }
 
 pub fn on_boot_completed(superkey: Option<String>) -> Result<()> {
@@ -285,7 +272,10 @@ pub fn on_boot_completed(superkey: Option<String>) -> Result<()> {
 
     run_stage("boot-completed", superkey, false);
 
-    run_uid_monitor();
+    // A boot that reached this stage is healthy: clear the loop counter. The
+    // uid-listener used to be forked here; it now lives inside `apd daemon`
+    // (single writer, single instance, contract v1.1 §3.2).
+    bootstate::boot_completed();
     Ok(())
 }
 

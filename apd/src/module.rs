@@ -15,6 +15,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     str::FromStr,
+    time::Duration,
 };
 
 #[allow(clippy::wildcard_imports)]
@@ -243,8 +244,24 @@ pub fn exec_script<T: AsRef<Path>>(path: T, wait: bool) -> Result<()> {
         .arg(path.as_ref())
         .envs(get_common_script_envs(module_id.as_deref()));
 
+    // A module script runs inline with init's post-fs-data, so an unbounded
+    // script is a boot hang. `wait_timeout` kills the whole process group (the
+    // script is spawned as group leader above) after the per-script budget.
     let result = if wait {
-        command.status().map(|_| ())
+        let mut child = command
+            .spawn()
+            .map_err(|err| anyhow!("Failed to exec {}: {}", path.as_ref().display(), err))?;
+        match wait_timeout(&mut child, Duration::from_secs(defs::SCRIPT_TIMEOUT_SECS))? {
+            Some(_) => Ok(()),
+            None => {
+                warn!(
+                    "script timed out after {}s, process group killed: {}",
+                    defs::SCRIPT_TIMEOUT_SECS,
+                    path.as_ref().display()
+                );
+                Ok(())
+            }
+        }
     } else {
         command.spawn().map(|_| ())
     };
@@ -364,7 +381,7 @@ fn _install_module(zip: &str) -> Result<()> {
     ensure_boot_completed()?;
 
     // print banner
-    println!(include_str!("./../../banner"));
+    println!(include_str!("../assets/banner"));
 
     assets::ensure_binaries().with_context(|| "binary missing")?;
 

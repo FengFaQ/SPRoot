@@ -187,20 +187,20 @@ pub fn root_shell() -> Result<()> {
     // use current uid if no user specified, these has been done in kernel!
     let mut uid = unsafe { libc::getuid() };
     let mut gid = unsafe { libc::getgid() };
-    // Contract v1.0 §3.2 "授权执行点": the requesting uid is the *original*
-    // caller identity. In the SK model the do_execve hook already rewrote our
-    // creds to 0 before this code runs, so the requesting uid must be taken
-    // from the su invocation chain, not from getuid() (which is 0 here). SK's
-    // hook stores the pre-exec uid in the AUXV-style env var SP_REQUEST_UID;
-    // when absent (AP initiated via rc, already-root chains) fall back to 0.
-    let request_uid: i32 = std::env::var("SP_REQUEST_UID")
+    // Authorisation point (contract v1.1 §3.2, E3). The requesting uid is NOT
+    // recoverable from `getuid()` (the SK hook already rewrote it to 0), and
+    // the v1.0 `SP_REQUEST_UID` kernel env injection was proven impossible, so:
+    // * socket session  -> daemon set REQUEST_UID_ENV from SO_PEERCRED (trusted:
+    //   the daemon is root and forks this child itself);
+    // * root context    -> env absent; only root can execute the 0700 hidden
+    //   `su`, so the request is authorised by definition.
+    let request_uid = std::env::var(crate::supercall::REQUEST_UID_ENV)
         .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    if !crate::auth_list::is_authorized(request_uid) {
+        .and_then(|v| v.parse::<i32>().ok());
+    if !crate::auth_list::authorize(request_uid) {
         // Silent deny: same visible behaviour as SK's silent kernel reject —
         // exit non-zero without explaining (contract §2.3 no information leak).
-        log::warn!("[root_shell] unauthorized uid (denied)");
+        log::warn!("[root_shell] unauthorized request (denied)");
         std::process::exit(1);
     }
     if free_idx < matches.free.len() {

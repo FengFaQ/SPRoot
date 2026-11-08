@@ -389,6 +389,23 @@ apd daemon --superkey-file /data/adb/sproot/key
 
 ---
 
+### P0 实施进度（2026-11-08，代码已落地）
+
+| P0 项 | 状态 | 落点 |
+|---|---|---|
+| 新子命令 `daemon`/`deploy`/`undeploy`/`root-exec`/`auth`/`version --json` | ✅ 代码完成 | `cli.rs` + 新模块 `daemon.rs`/`deploy.rs` |
+| 废弃 `SP_REQUEST_UID` 内核注入 | ✅ | `apd.rs`：改读 daemon 设置的 `SPROOT_REQUEST_UID`（来源=socket `SO_PEERCRED`）；`auth_list::authorize(None)` = root 上下文 |
+| uid-listener 并入 daemon | ✅ | `daemon.rs` 线程 + 单实例 flock；`event::start_uid_listener()` 留作手工入口 |
+| `synchronize_package_uid` 剪枝接线 | ✅ | `auth_list::refresh_allow_list` → `package::synchronize_package_uid_locked`（同锁内，避免重入 flock） |
+| 脚本超时 | ✅ | `utils::wait_timeout`（超时 kill 进程组）→ `module::exec_script`，默认 60s（`defs::SCRIPT_TIMEOUT_SECS`） |
+| bootloop 守卫 | ✅ | `bootstate.rs`：post-fs-data +1 / boot-completed 清零 / ≥2 自动写 safemode 并禁用全部模块 |
+| 授权表单文件 `allow_list`（E4） | ✅ | `defs.rs` 常量 + `package.rs`/`auth_list.rs`（无 `exclude_list`） |
+| 符号链接去硬编码（P1 提前） | ✅ | `assets.rs` → `defs::DAEMON_PATH` |
+| CI 交叉编译（禁止本地出 arm64） | ⏳ 工作流已写 | `.github/workflows/apd.yml`（rust + NDK r27c + ELF AArch64/PIE 断言 + artifact）；**待仓库集成**：根仓库 `.gitignore` 目前忽略 `/app/`，CI 取不到 apd 源码（待 lead 决定 un-ignore `app/apd` 或迁移到 tracked 路径） |
+| 本地语法门禁 | ✅ 通过 | `cargo check`（WSL rustc 1.99.1 / x86_64-linux）；**仅语法验证，非交付物** |
+
+---
+
 ## 8. 风险清单
 
 | # | 风险 | 影响 | 概率 | 缓解 | 门禁/验收 |

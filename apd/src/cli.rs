@@ -1,4 +1,7 @@
-use crate::{defs, event, insmod, late_load, lua, magica, module, module_config, supercall, utils};
+use crate::{
+    auth_list, daemon, defs, deploy, event, insmod, late_load, lua, magica, module, module_config,
+    supercall, utils,
+};
 #[cfg(target_os = "android")]
 use android_logger::Config;
 use anyhow::{Context, Result};
@@ -43,8 +46,58 @@ enum Commands {
     /// Trigger `boot-complete` event
     BootCompleted,
 
-    /// Start uid listener for synchronizing root list
+    /// Start uid listener for synchronizing root list (manual/debug; the
+    /// resident daemon hosts its own one)
     UidListener,
+
+    /// Resident daemon (init only): services stage + uid-listener + auth socket
+    /// + userspace boot-completed detection
+    Daemon,
+
+    /// First-install deployment: install AP/busybox/key/hidden su/allow list.
+    /// Run once root is available (the manager calls it via `root-exec`-style
+    /// self-escalation; contract v1.1 §7 / NEW-DOC-05 §6.2).
+    Deploy {
+        /// directory containing the packaged binaries (usually the APK
+        /// nativeLibraryDir: libapd.so / libbusybox.so)
+        #[arg(long)]
+        source: Option<PathBuf>,
+    },
+
+    /// Reverse of deploy: remove AP, hidden su, key and private state
+    Undeploy {
+        /// keep /data/adb/modules and module configs
+        #[arg(long)]
+        keep_modules: bool,
+    },
+
+    /// Run a command as root. This is the manager's ONLY root entry point
+    /// (contract v1.1 §8.2); stdio and exit code are passed through.
+    RootExec {
+        /// drop to this uid before exec (default: stay root)
+        #[arg(long)]
+        uid: Option<u32>,
+        /// SELinux context for the session (not implemented yet, ignored)
+        #[arg(long)]
+        scontext: Option<String>,
+        /// kill the process group (and exit 124) after this many seconds
+        #[arg(long)]
+        timeout: Option<u64>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 1..)]
+        command: Vec<String>,
+    },
+
+    /// Authorisation table maintenance (contract v1.1 §3.2/§3.6)
+    Auth {
+        #[command(subcommand)]
+        command: AuthCmd,
+    },
+
+    /// Machine readable deployment/version status (`--json`)
+    Version {
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Load a kernel module (.ko) without version check (jailbreak mode)
     Insmod {
@@ -87,6 +140,28 @@ enum Commands {
 
     /// MagiskPolicy - SELinux Policy Patch Tool
     Sepolicy(crate::sepolicy::Args),
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum AuthCmd {
+    /// List the allow list as JSON
+    List,
+    /// Grant root to <uid> (optionally updating pkg/to_uid/scontext)
+    Grant {
+        uid: i32,
+        #[arg(long, default_value = "")]
+        pkg: String,
+        #[arg(long, default_value_t = 0)]
+        to_uid: i32,
+        #[arg(long, default_value = "")]
+        scontext: String,
+    },
+    /// Revoke root from <uid>
+    Revoke { uid: i32 },
+    /// Mark <uid> as excluded from module effects
+    Exclude { uid: i32 },
+    /// Clear the module-exclusion bit of <uid>
+    Unexclude { uid: i32 },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -215,17 +290,23 @@ pub fn run() -> Result<()> {
     env_logger::init();
 
     // the kernel executes su with argv[0] basename dispatching. Contract
-    // v1.0 §3.4: only the `su` branch remains — the SK deploy form puts this
-    // binary at /data/<key16>/su; `kp` had no SK counterpart and is removed.
+    // v1.1 §3.4: only the `su` branch remains — the SK deploy form puts this
+    // binary in the hidden dir; `kp` had no SK counterpart and is removed.
+    // Match the basename exactly (not `ends_with`) so e.g. a binary called
+    // "kasu" cannot accidentally enter the root shell path.
     let arg0 = std::env::args().next().unwrap_or_default();
-    if arg0.ends_with("su") {
+    let arg0_base = std::path::Path::new(&arg0)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if arg0_base == "su" {
         return crate::apd::root_shell();
     }
-    if arg0.ends_with("resetprop") {
+    if arg0_base == "resetprop" {
         let all_args: Vec<String> = std::env::args().collect();
         crate::resetprop::resetprop_main(&all_args)
     }
-    if arg0.ends_with("magiskpolicy") {
+    if arg0_base == "magiskpolicy" {
         let all_args: Vec<String> = std::env::args().collect();
         crate::sepolicy::policy_main(&all_args)
     }
@@ -251,6 +332,12 @@ pub fn run() -> Result<()> {
         }
     }
 
+    // deploy needs the key *path* (it copies the key to the root-only store),
+    // and it must not end up in any generated file — transport it via env.
+    if let Some(path) = cli.superkey_file.clone() {
+        let _ = crate::deploy::set_key_source_env(&path);
+    }
+
     log::info!("command: {:?}", cli.command);
 
     if cli.superkey.is_some() {
@@ -263,6 +350,23 @@ pub fn run() -> Result<()> {
         Commands::BootCompleted => event::on_boot_completed(cli.superkey),
 
         Commands::UidListener => event::start_uid_listener(),
+
+        Commands::Daemon => daemon::run(cli.superkey),
+
+        Commands::Deploy { source } => deploy::deploy(source),
+
+        Commands::Undeploy { keep_modules } => deploy::undeploy(keep_modules),
+
+        Commands::RootExec {
+            uid,
+            scontext,
+            timeout,
+            command,
+        } => run_root_exec(uid, scontext, timeout, command),
+
+        Commands::Auth { command } => run_auth(command),
+
+        Commands::Version { json } => print_version(json),
 
         Commands::Insmod { module, params } => insmod::insmod(&module, &params),
 
@@ -336,7 +440,7 @@ pub fn run() -> Result<()> {
                             let value_str = match value {
                                 Some(v) if !stdin => v,
                                 _ => {
-                                    // Read from stdin
+                                    // Read value from stdin
                                     use std::io::Read;
                                     let mut buffer = String::new();
                                     std::io::stdin()
@@ -408,4 +512,117 @@ pub fn run() -> Result<()> {
         log::error!("Error: {:?}", e);
     }
     result
+}
+
+// ---------------------------------------------------------------------------
+// root-exec (contract v1.1 §8.2): the manager's only root entry point.
+// ---------------------------------------------------------------------------
+
+fn run_root_exec(
+    uid: Option<u32>,
+    scontext: Option<String>,
+    timeout: Option<u64>,
+    argv: Vec<String>,
+) -> Result<()> {
+    // Caller identity: AP self-escalated from `--superkey-file` before dispatch.
+    if !supercall::is_root() {
+        // 125 = escalation failed (contract §8.5); stay silent otherwise.
+        std::process::exit(125);
+    }
+    if argv.is_empty() {
+        eprintln!("root-exec: empty command");
+        std::process::exit(2);
+    }
+    if let Some(ctx) = &scontext {
+        // P1: per-session setcon needs libselinux; never pretend it worked.
+        log::warn!("root-exec: --scontext {ctx} not supported yet (P1), ignored");
+    }
+
+    let mut command = std::process::Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    // Session leader so a timeout can kill the whole process group.
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+    if let Some(target_uid) = uid {
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setgid(target_uid) != 0 || libc::setuid(target_uid) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("spawn {}", argv[0]))?;
+    let code = match timeout {
+        Some(secs) => match utils::wait_timeout(&mut child, std::time::Duration::from_secs(secs))? {
+            Some(status) => status.code().unwrap_or(1),
+            None => {
+                log::warn!("root-exec: timed out after {secs}s, process group killed");
+                124
+            }
+        },
+        None => child.wait()?.code().unwrap_or(1),
+    };
+    std::process::exit(code);
+}
+
+// ---------------------------------------------------------------------------
+// auth (contract v1.1 §3.2/§8.3): single writer, flock protected.
+// ---------------------------------------------------------------------------
+
+fn run_auth(command: AuthCmd) -> Result<()> {
+    if !supercall::is_root() {
+        std::process::exit(125);
+    }
+    match command {
+        AuthCmd::List => println!("{}", auth_list::list_json()?),
+        AuthCmd::Grant {
+            uid,
+            pkg,
+            to_uid,
+            scontext,
+        } => auth_list::grant(uid, &pkg, to_uid, &scontext)?,
+        AuthCmd::Revoke { uid } => auth_list::revoke(uid)?,
+        AuthCmd::Exclude { uid } => auth_list::set_exclude(uid, true)?,
+        AuthCmd::Unexclude { uid } => auth_list::set_exclude(uid, false)?,
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// version --json (contract v1.1 §8.3): machine readable, no key material.
+// ---------------------------------------------------------------------------
+
+fn print_version(json: bool) -> Result<()> {
+    let state = deploy::read_state();
+    let deployed = state.is_some() && std::path::Path::new(defs::DAEMON_PATH).exists();
+    // key_prefix_sha256 (contract §8.3): an integrity marker, never the key or
+    // any fragment of it. Only computable when root can read the key file —
+    // otherwise the field is null (the contract's "身份要求: 任意").
+    let key_prefix_sha256 = supercall::read_key_file(std::path::Path::new(defs::SPROOT_KEY_FILE))
+        .and_then(|key| {
+            let prefix: String = key.chars().take(16).collect();
+            utils::sha256_hex_stdin(prefix.as_bytes())
+        });
+    if !json {
+        println!("{} ({})", defs::VERSION_NAME.trim(), defs::VERSION_CODE.trim());
+        println!("deployed: {deployed}");
+        return Ok(());
+    }
+    let payload = serde_json::json!({
+        "version": defs::VERSION_NAME.trim(),
+        "version_code": defs::VERSION_CODE.trim(),
+        "deployed": deployed,
+        "key_prefix_sha256": key_prefix_sha256,
+        "daemon_pid": daemon::daemon_pid(),
+        "boot_stage_done": daemon::boot_stage_done(),
+        "deployed_at": state.as_ref().map(|s| s.deployed_at),
+        "hidden_file": state.as_ref().map(|s| s.hidden_file.clone()),
+    });
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
 }
