@@ -140,6 +140,12 @@ jobs:
           else
             echo "::warning::nm 不可用，跳过 JNI 符号断言"
           fi
+          # NOTICE 断言：第三方声明（magiskboot/Magisk GPL-3.0）必须随包
+          if unzip -l "$APK" | grep -q "assets/NOTICE-magiskboot.txt"; then
+            echo "OK assets/NOTICE-magiskboot.txt present"
+          else
+            echo "::error::APK 缺少 assets/NOTICE-magiskboot.txt（第三方声明缺失）"; exit 1
+          fi
           # extractNativeLibs 断言（Android 需解压 nativeLibraryDir 才能 exec magiskboot/apd）
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | tail -1)
           "$BT/aapt2" dump xmltree --file AndroidManifest.xml "$APK" | grep -i "extractNativeLibs" || true

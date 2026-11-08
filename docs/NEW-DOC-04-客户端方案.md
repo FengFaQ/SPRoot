@@ -196,7 +196,6 @@ fastboot reboot
 ---
 
 ## 5. 特权链（App ↔ AP，契约 v1.1 §8）
-
 唯一入口 `ApdClient.rootExec()`，只做三件事：
 
 1. 把 48 位密钥写入 `filesDir/exec-keys/key-< nanoTime >.tmp`（0600），**argv 只传路径**；
@@ -228,6 +227,34 @@ fastboot reboot
 | 静默跳过缺失依赖 | 入口能力自检把缺失列为**阻断项**并给出绝对路径与修复建议 |
 
 错误码分层：`PatchEngine`（C1 枚举）与 `ApdClient`（§8.5 枚举）各自维护稳定映射，未知码原样带出，绝不吞。
+
+### 6.1 G-04 错误码 → 用户文案映射表（客户端职责，已实现）
+
+UI 铁律：**原始码与可读文案同时展示**（错误区"错误码"字段 + 标题），便于用户截图上报与质测断言。
+
+| 来源 | 退出码 | UI 文案（`Models.kt` / `ApdClient.kt`） |
+|---|---|---|
+| 修补引擎 | 0 | 成功 |
+| 修补引擎 | 101 | E_USAGE：调用参数错误（引擎实现或调用方 bug） |
+| 修补引擎 | 102 | E_INPUT：输入内核不可读 / 仍是 .img/.gz / 非 arm64 Image |
+| 修补引擎 | 201 | E_KALLSYMS：kallsyms 解析失败，该内核暂不支持 |
+| 修补引擎 | 202 | E_SYMBOL_MISSING：关键符号缺失，该内核暂不支持 |
+| 修补引擎 | 210 | E_OFFSET_DERIVE：cred/uid/seccomp 偏移推导失败 |
+| 修补引擎 | 211 | E_INIT_CRED_NOT_FOUND：init_cred 模式搜索失败 |
+| 修补引擎 | 220 | E_NO_HOOK_SPACE：shellcode 空间不足 |
+| 修补引擎 | 230 | E_UNSUPPORTED_VERSION：内核版本超出 3.10~6.18 支持域 |
+| 修补引擎 | 240 | E_WRITE：输出写失败（磁盘/权限） |
+| 修补引擎 | 250 | E_INTERNAL：引擎内部未分类错误 |
+| 修补引擎 | 其他 | E_UNKNOWN(<code>)：引擎返回了契约外的退出码（原样带出） |
+| App 自检 | T-12 | 补丁未生效：产物 kernel 回读与 kernel.patched 不一致（不导出） |
+| AP root-exec | 0 | 成功 |
+| AP root-exec | 1 | AP 业务失败（展示 stderr 摘要） |
+| AP root-exec | 2 | AP 用法错误——视为 bug，展示原始 argv |
+| AP root-exec | 124 | 超时（提示用户，保留日志） |
+| AP root-exec | 125 | 密钥无效或需重新修补（提权被内核静默拒绝；**不自动重试**） |
+| AP root-exec | 126 | 目标命令不可执行（126），需重新部署 AP |
+| AP root-exec | 127 | 目标命令不存在（127），需重新部署 AP |
+| AP root-exec | 其他 | 未知退出码（<code>），原样展示 |
 
 ---
 

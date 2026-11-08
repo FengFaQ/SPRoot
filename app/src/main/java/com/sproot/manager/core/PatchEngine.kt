@@ -88,7 +88,7 @@ object PatchEngine {
         val file = libraryFile(context)
         val present = file.isFile
         val executable = present && file.canExecute()
-        val aarch64 = present && Elf.isAArch64(file.absolutePath)
+        val aarch64 = present && Elf.isAarch64(file.absolutePath)
         val failure = ensureLoaded()
         val versionValue = if (failure == null) version() else null
         val detail = when {
