@@ -32,89 +32,75 @@ jobs:
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37" "build-tools;37.0.0" || true
           echo "--- installed ---"
           ls "$ANDROID_HOME/platforms" "$ANDROID_HOME/build-tools" || true
-      - name: Fetch native libs from CI artifacts (optional, non-blocking)
+      - name: Fetch pinned native libs (app/native.lock.json, reproducible)
         env:
           GH_TOKEN: ${{ github.token }}
-        continue-on-error: true
         run: |
-          set -u
+          set -euo pipefail
           DEST=app/src/main/jniLibs/arm64-v8a
           ASSETS=app/src/main/assets
           mkdir -p "$DEST" "$ASSETS"
+          LOCK=app/native.lock.json
+          [ -f "$LOCK" ] || { echo "::error::缺少 $LOCK（可复现构建必需）"; exit 1; }
+          echo "--- native.lock.json ---"; cat "$LOCK"
 
-          fetch_to() { # $1=artifact name $2=dest dir
-            name="$1"; out="$2"
-            id=$(gh api "/repos/${{ github.repository }}/actions/artifacts?name=$name&per_page=1"                   --jq '.artifacts[0].id // empty' 2>/dev/null || true)
-            if [ -z "${id:-}" ]; then echo "SKIP $name (artifact 不存在)"; return 1; fi
-            if ! gh api "/repos/${{ github.repository }}/actions/artifacts/$id/zip" > "/tmp/$name.zip" 2>/dev/null; then
-              echo "SKIP $name (下载失败)"; return 1
-            fi
+          lock() { python3 -c "import json;d=json.load(open('$LOCK'))['$1'];print(d.get('$2',''))"; }
+
+          fetch_run_artifact() { # $1=run_id $2=artifact name $3=outdir
+            rid="$1"; name="$2"; out="$3"
+            id=$(gh api "/repos/${{ github.repository }}/actions/runs/$rid/artifacts?per_page=100" \
+                  --jq ".artifacts[] | select(.name==\"$name\") | .id" 2>/dev/null | head -1)
+            if [ -z "${id:-}" ]; then echo "::error::run $rid 中找不到 artifact $name"; return 1; fi
             mkdir -p "$out"
-            unzip -o -q "/tmp/$name.zip" -d "$out" || { echo "SKIP $name (解压失败)"; return 1; }
-            echo "OK $name -> $out"
-            return 0
+            gh api "/repos/${{ github.repository }}/actions/artifacts/$id/zip" > "$out.zip"
+            unzip -o -q "$out.zip" -d "$out"
+            echo "downloaded $name (run $rid, artifact id $id)"
           }
 
-          # 1) 引擎 + magiskboot（patcher 的 engine CI：libskrootpatch.so(JNI) / magiskboot / ENGINE-META / SYMBOLS / SHA256SUMS）
-          E=/tmp/art-engine
-          if fetch_to skroot-engine-arm64 "$E"; then
-            # 校验材料先落盘/打印（ENGINE-META / SYMBOLS / SHA256SUMS）
-            for m in ENGINE-META.txt SYMBOLS-libskrootpatch.txt SHA256SUMS magiskboot-meta.txt; do
-              f=$(find "$E" -name "$m" | head -1)
-              if [ -n "${f:-}" ]; then echo "--- $m ---"; cat "$f"; cp -f "$f" "$ASSETS/" 2>/dev/null || true; fi
-            done
-            # 选择 JNI 共享库：优先带 Java_ 符号的 .so（无论叫 libskrootpatch.so 还是旧名 libskpatchjni.so）
-            JNI_SRC=""
-            for f in $(find "$E" -type f -name '*.so'); do
-              if command -v nm >/dev/null 2>&1 && nm -D --defined-only "$f" 2>/dev/null | grep -q "Java_me_sproot_patch_NativeEngine"; then
-                JNI_SRC="$f"; break
-              fi
-            done
-            if [ -z "$JNI_SRC" ]; then
-              # 新命名规范：直接是 libskrootpatch.so（ET_DYN），无 nm 时按名字取
-              JNI_SRC=$(find "$E" -type f -name 'libskrootpatch.so' | head -1)
+          verify_file() { # $1=file $2=expected sha256 $3=label
+            [ -f "$1" ] || { echo "::error::$3 文件不存在：$1"; exit 1; }
+            got=$(sha256sum "$1" | cut -d' ' -f1)
+            size=$(stat -c %s "$1")
+            if [ "$got" != "$2" ]; then
+              echo "::error::$3 sha256 不匹配：锁定=$2 实际=$got（产物与被锁定的 run 不一致，禁止出包）"
+              exit 1
             fi
-            if [ -n "${JNI_SRC:-}" ]; then
-              cp -f "$JNI_SRC" "$DEST/libskrootpatch.so"
-              echo "JNI_ENGINE_SRC=$JNI_SRC"
-            else
-              echo "::warning::engine artifact 中未找到 JNI 引擎库"
-            fi
-            find "$E" -name 'magiskboot' -exec cp -f {} "$DEST/libmagiskboot.so" \; 2>/dev/null || true
-            # 裸名 CLI（skroot-patch）绝不进 jniLibs（ET_EXEC 混入 lib*.so 会被误当库）
-          fi
-          # 兼容：若 patcher 单独发布 magiskboot artifact
-          if [ ! -f "$DEST/libmagiskboot.so" ]; then
-            M=/tmp/art-magiskboot
-            if fetch_to magiskboot-arm64 "$M"; then
-              f=$(find "$M" -type f \( -name 'magiskboot' -o -name 'libmagiskboot.so' \) | head -1)
-              [ -n "${f:-}" ] && cp -f "$f" "$DEST/libmagiskboot.so"
-              find "$M" -name '*meta*.txt' -exec cp -f {} "$ASSETS/" \; 2>/dev/null || true
-            fi
-          fi
+            echo "OK $3 sha256=$got size=$size（与 native.lock.json 一致）"
+          }
 
-          # 2) AP 守护（sys-guard：libapd-arm64.so + apd-version.txt）
-          A=/tmp/art-apd
-          if fetch_to apd-aarch64-latest "$A"; then
-            f=$(find "$A" -type f -name 'libapd*.so' | head -1)
-            [ -n "${f:-}" ] && cp -f "$f" "$DEST/libapd.so"
-            find "$A" -name 'apd-version.txt' -exec cp -f {} "$ASSETS/" \; 2>/dev/null || true
-          fi
-
-          echo "--- jniLibs ---"; ls -la "$DEST" || true
-          for f in "$DEST"/*.so; do
-            [ -f "$f" ] || continue
-            file "$f" || true
-            MACHINE=$(od -An -tu2 -j18 -N2 "$f" | tr -d ' ')
-            echo "ELF machine=$MACHINE ($(basename "$f"))"
-            if [ "$MACHINE" != "183" ]; then echo "::warning::$(basename "$f") 不是 AArch64 ELF (machine=$MACHINE)"; fi
+          # ---- engine (JNI) ----
+          E=/tmp/pin-engine
+          fetch_run_artifact "$(lock engine run_id)" "$(lock engine artifact)" "$E"
+          verify_file "$E/$(lock engine file)" "$(lock engine sha256)" "engine JNI"
+          cp -f "$E/$(lock engine file)" "$DEST/$(lock engine target)"
+          # 校验材料随包
+          for m in ENGINE-META.txt SYMBOLS-libskrootpatch.txt SHA256SUMS; do
+            [ -f "$E/$m" ] && cp -f "$E/$m" "$ASSETS/$m" || echo "::warning::engine artifact 缺 $m"
           done
-          if [ -f "$DEST/libmagiskboot.so" ]; then
-            sha256sum "$DEST/libmagiskboot.so" || true
-            echo "MAGISKBOOT_PRESENT=1" >> "$GITHUB_ENV"
-          fi
-          if [ -f "$DEST/libskrootpatch.so" ]; then echo "ENGINE_PRESENT=1" >> "$GITHUB_ENV"; fi
-          if [ -f "$DEST/libapd.so" ]; then echo "APD_PRESENT=1" >> "$GITHUB_ENV"; fi
+
+          # ---- apd ----
+          A=/tmp/pin-apd
+          fetch_run_artifact "$(lock apd run_id)" "$(lock apd artifact)" "$A"
+          verify_file "$A/$(lock apd file)" "$(lock apd sha256)" "apd"
+          cp -f "$A/$(lock apd file)" "$DEST/$(lock apd target)"
+          for m in apd-version.txt apd-capabilities.txt; do
+            [ -f "$A/$m" ] && cp -f "$A/$m" "$ASSETS/$m" || echo "::warning::apd artifact 缺 $m"
+          done
+
+          # ---- magiskboot ----
+          M=/tmp/pin-mb
+          fetch_run_artifact "$(lock magiskboot run_id)" "$(lock magiskboot artifact)" "$M"
+          verify_file "$M/$(lock magiskboot file)" "$(lock magiskboot sha256)" "magiskboot"
+          cp -f "$M/$(lock magiskboot file)" "$DEST/$(lock magiskboot target)"
+          [ -f "$M/magiskboot-meta.txt" ] && cp -f "$M/magiskboot-meta.txt" "$ASSETS/magiskboot-meta.txt"
+
+          echo "--- jniLibs ---"; ls -la "$DEST"
+          for f in "$DEST"/*.so; do
+            file "$f"
+            MACHINE=$(od -An -tu2 -j18 -N2 "$f" | tr -d ' ')
+            [ "$MACHINE" = "183" ] || { echo "::error::$(basename "$f") 非 AArch64 (machine=$MACHINE)"; exit 1; }
+          done
+          sha256sum "$DEST"/*.so
 
       - name: Assemble NOTICE assets (single source of truth)
         run: |

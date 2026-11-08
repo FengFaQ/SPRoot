@@ -1,0 +1,46 @@
+{
+  "_comment": "SPRoot Manager 原生二进制锁定表（可复现构建）。CI 只按本文件精确下载并校验 sha256，不在 latest artifact 上浮动。任何升级须显式修改本文件并单独 commit。",
+  "_updated": "2026-11-08",
+  "engine": {
+    "description": "SKRoot 修补引擎 JNI 共享库（aarch64 ET_DYN，Android 侧 System.loadLibrary(\"skrootpatch\")）",
+    "artifact": "skroot-engine-arm64",
+    "run_id": 42489595614,
+    "file": "libskrootpatch.so",
+    "target": "libskrootpatch.so",
+    "sha256": "258ebc221d58817ca62849313c368258bcc0f8d917dbc134884e6926b6261e1a",
+    "size": 2998040,
+    "extra_assets": {
+      "ENGINE-META.txt": "1e7c86b63db1ebc2ef0974c205c2bf6655863626bea6e6c55ecf691e3caec46d",
+      "SYMBOLS-libskrootpatch.txt": "374addb55ef4f4f321d63a8737207aa2cb4814036ebf2842d4ffe5ab094c3cac",
+      "SHA256SUMS": "70f24ded7b8670ff93919443d45d5f0acfcd8749d345a22e6d5c3ceac428bff7"
+    }
+  },
+  "apd": {
+    "description": "SPRoot AP 守护（aarch64 PIE 可执行 ELF；部署时复制为 /data/adb/apd）",
+    "artifact": "apd-aarch64-latest",
+    "run_id": 42490165535,
+    "file": "libapd-arm64.so",
+    "target": "libapd.so",
+    "sha256": "62c0075cab0eefe012e6328ef3699fe3030bb7df6e945a1963200d54d5238cb6",
+    "size": 2061888,
+    "commit": "d45822b6f5a159bafbc8d9fddc351ddf12ede353",
+    "version": "d45822b",
+    "extra_assets": {
+      "apd-version.txt": "de4136e0a4195fa9880e1176c55d93834ba9645fa81b68a33c98ff39c0a039d5",
+      "apd-capabilities.txt": "2abb17a825e71c0cc22d6eb91b9a66eee7b008347f0f49d91b6f2412e37cc269"
+    }
+  },
+  "magiskboot": {
+    "description": "Magisk v31.1 magiskboot（aarch64 静态可执行 ELF，保持 lib*.so 命名以便解压到 nativeLibraryDir 后执行）",
+    "artifact": "magiskboot-arm64",
+    "run_id": 42488321400,
+    "file": "magiskboot",
+    "target": "libmagiskboot.so",
+    "sha256": "97e9ec75731103d31c9e1effca7a50c6444309ce8f78c2ec27e9fe721da4bb54",
+    "size": 988984,
+    "version": "31.1",
+    "extra_assets": {
+      "magiskboot-meta.txt": "b94d6c3e0c1912889827c278ef570fc7de9ada5948794cada12ceb069164e451"
+    }
+  }
+}

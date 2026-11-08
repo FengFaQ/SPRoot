@@ -290,10 +290,20 @@ UI 铁律：**原始码与可读文案同时展示**（错误区"错误码"字�
     "author": "作者",
     "description": "一句话描述",
     "enabled": true,
-    "update_pending": false
+    "update_pending": false,
+    "install_status": "installed"
   }
 ]
 ```
+
+> **状态：Schema v1 已由 sys-guard 定稿（v2 commit `8b28e87`）**：上列 8 字段（含 `versionCode`）为正式字段，
+> `install_status` 为 **v2 待定**占位（客户端容忍缺失）。排序按 `id` 字典序稳定；stdout 纯 JSON 数组，
+> 日志只走 stderr/logcat；无模块时输出 `[]` + exit 0。
+
+**写操作（子命令待 AP 定稿，客户端已按此接线）**：
+- `apd module install <zip路径> [--json]`：App 先把用户选的 zip 复制到私有 cache 并校验 PK 头/大小，再传绝对路径；超时 300s；
+- `apd module uninstall <id> [--json]`；`apd module enable|disable <id>`；
+- 全部经 `root-exec`；`--json` 输出 schema 未定稿期间，客户端**只依赖 exit code**，并把原始 stdout/stderr 常驻展示（不猜进度字段）。
 
 客户端解析规则（`core/Modules.kt`）：
 - **容忍缺字段**：缺失显示 "—"，未知字段忽略；
@@ -330,6 +340,35 @@ engineVersion()=<引擎返回>
 2. 随包许可证全文：`assets/licenses/AGPL-3.0.txt`（= 仓库根 `LICENSE`）、`assets/licenses/LICENSE`（同全文，供门禁按名查找）、`assets/licenses/NOTICE`（同 NOTICE 内容）、`assets/licenses/GPL-3.0.txt`（magiskboot 义务）；
 3. 构建期校验材料（`ENGINE-META.txt`、`SYMBOLS-libskrootpatch.txt`、`SHA256SUMS`、`magiskboot-meta.txt`、`apd-version.txt`）一并入 assets；
 4. CI 硬断言（构建失败条件）：上列 6 个 asset 必须存在；`assets/NOTICE` 必含 `SKRoot`/`All Rights Reserved`/`AGPL-3.0`/`GPL-3.0`/`magiskboot`/`asmjit`/`capstone`/`cJSON`；`assets/licenses/LICENSE` 必须 >20KB 且含 AGPL 标题。
+
+### 7A.5 原生二进制锁定表 `app/native.lock.json`（可复现构建）
+
+**问题**：早期 CI "动态拉取最新 artifact" → 同一 commit 重跑会得到不同 APK（引擎/apd 的 sha256 会漂移），
+`release.yml` 的三方 sha256 一致性与 qa 的 T8（产物可复现）必然失败。
+
+**方案**：`app/native.lock.json` 入 git，锁定每个原生件的 `run_id / artifact / file / sha256 / size / commit`：
+
+```json
+{
+  "engine":      { "artifact": "skroot-engine-arm64", "run_id": 42489595614,
+                   "file": "libskrootpatch.so", "target": "libskrootpatch.so",
+                   "sha256": "258ebc22…", "size": 2998040 },
+  "apd":         { "artifact": "apd-aarch64-latest", "run_id": 42490165535,
+                   "file": "libapd-arm64.so", "target": "libapd.so",
+                   "sha256": "62c0075c…", "size": 2061888, "commit": "d45822b6…" },
+  "magiskboot":  { "artifact": "magiskboot-arm64", "run_id": 42488321400,
+                   "file": "magiskboot", "target": "libmagiskboot.so",
+                   "sha256": "97e9ec75…", "size": 988984, "version": "31.1" }
+}
+```
+
+CI 行为（硬失败）：
+1. 按 lock 的 `run_id` + artifact 名**精确下载**（不在 latest 上浮动）；
+2. 逐文件校验 `sha256`，不匹配 → `::error::` → 构建失败（禁止出包）；
+3. 校验材料（`ENGINE-META.txt`/`SYMBOLS-libskrootpatch.txt`/`SHA256SUMS`/`apd-version.txt`/`magiskboot-meta.txt`）随包入 assets；
+4. 升级 native 必须**显式修改 native.lock.json 并单独 commit**（可审计、可回溯）。
+
+> 效果：同一 commit + 同一 lock ⇒ 同一 sha256 的 APK，满足 T8 与 release 门禁的按 commit 断言。
 
 ---
 
