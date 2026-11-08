@@ -131,6 +131,17 @@ jobs:
             cat "$A/NOTICE-APK.md"
           } > "$A/NOTICE"
           cp -f LICENSE "$A/licenses/AGPL-3.0.txt"
+          cp -f "$A/licenses/AGPL-3.0.txt" "$A/licenses/LICENSE"
+          cp -f "$A/NOTICE" "$A/licenses/NOTICE"
+          # 发布门禁要求的必备字样自检（缺一即构建失败）
+          NOTICE_FILE="$A/NOTICE"
+          for phrase in "SKRoot" "All Rights Reserved" "保留所有权利" "AGPL-3.0" "GPL-3.0" "magiskboot" "asmjit" "capstone" "cJSON"; do
+            if grep -q "$phrase" "$NOTICE_FILE"; then
+              echo "NOTICE phrase OK: $phrase"
+            else
+              echo "::error::NOTICE 缺少必备声明字样：$phrase"; exit 1
+            fi
+          done
           echo "--- assets ---"; ls -la "$A" "$A/licenses"
           echo "NOTICE bytes=$(stat -c %s "$A/NOTICE")"
 
@@ -196,16 +207,28 @@ jobs:
             echo "::error::APK 内出现已作废的 libskpatchjni.so"; exit 1
           fi
           # NOTICE / 许可证断言：第三方声明与 GPL-3.0、AGPL-3.0 全文必须随包
-          for asset in assets/NOTICE assets/NOTICE-APK.md assets/licenses/GPL-3.0.txt assets/licenses/AGPL-3.0.txt; do
+          for asset in assets/NOTICE assets/licenses/NOTICE assets/licenses/LICENSE assets/licenses/GPL-3.0.txt assets/licenses/AGPL-3.0.txt assets/NOTICE-APK.md; do
             if unzip -l "$APK" | grep -q "$asset"; then
               echo "OK $asset present"
             else
               echo "::error::APK 缺少 $asset（第三方声明/许可证文本缺失）"; exit 1
             fi
           done
-          unzip -p "$APK" assets/NOTICE | grep -q "magiskboot" \
-            && echo "OK NOTICE mentions magiskboot" \
-            || { echo "::error::NOTICE 未包含 magiskboot 声明"; exit 1; }
+          NOTICE_TMP=/tmp/notice-from-apk.txt
+          unzip -p "$APK" assets/NOTICE > "$NOTICE_TMP"
+          for phrase in "SKRoot" "All Rights Reserved" "AGPL-3.0" "GPL-3.0" "magiskboot"; do
+            grep -q "$phrase" "$NOTICE_TMP" \
+              && echo "OK NOTICE(from APK) contains: $phrase" \
+              || { echo "::error::APK 的 assets/NOTICE 缺少字样：$phrase"; exit 1; }
+          done
+          # AGPL-3.0 全文断言（LICENSE 应显著大于 20KB 且含 AGPL 标题）
+          unzip -p "$APK" assets/licenses/LICENSE > /tmp/license-from-apk.txt
+          SIZE=$(stat -c %s /tmp/license-from-apk.txt)
+          [ "$SIZE" -gt 20000 ] && echo "OK AGPL full text size=$SIZE" \
+            || { echo "::error::assets/licenses/LICENSE 过小（$SIZE B），疑似非全文"; exit 1; }
+          grep -q "GNU AFFERO GENERAL PUBLIC LICENSE" /tmp/license-from-apk.txt \
+            && echo "OK AGPL header present" \
+            || { echo "::error::LICENSE 缺 AGPL 标题"; exit 1; }
           # extractNativeLibs 断言（Android 需解压 nativeLibraryDir 才能 exec magiskboot/apd）
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | tail -1)
           "$BT/aapt2" dump xmltree --file AndroidManifest.xml "$APK" | grep -i "extractNativeLibs" || true
