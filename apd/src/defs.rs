@@ -33,6 +33,8 @@ pub const METAMODULE_DIR: &str = concatcp!(ADB_DIR, "metamodule/");
 
 // Module config
 pub const MODULE_CONFIG_DIR: &str = concatcp!(WORKING_DIR, "module_configs/");
+/// Per-module install state (audit trail written by `module install --json`).
+pub const MODULE_STATE_DIR: &str = concatcp!(WORKING_DIR, "module_state/");
 pub const PERSIST_CONFIG_NAME: &str = "persist.config";
 pub const TEMP_CONFIG_NAME: &str = "tmp.config";
 

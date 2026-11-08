@@ -121,7 +121,7 @@
 
 | 类别 | 子命令 | 决策 | 说明 |
 |---|---|---|---|
-| 模块域（保留） | `module install/uninstall/undo-uninstall/enable/disable/action/list/config` | ✅ 保留 | 行为、返回码、stdout JSON 与 APatch 一致（模块生态零迁移） |
+| 模块域（保留） | `module install/uninstall/undo-uninstall/enable/disable/action/list/config` | ✅ 保留 | 行为与 APatch 一致；`install`/`uninstall`/`list` 新增 `--json` 机器接口（schema/退出码见 §3.1.1/§3.1.2） |
 | 模块域（保留） | `module lua <id> <fn>` | ✅ 保留 | 存量模块能力 |
 | 阶段编排 | `post-fs-data` / `services` / `boot-completed` | ✅ 保留（仅 init 调用） | 加 `--superkey-file`，由 rc 传入 |
 | 多调用 | argv[0]=`su` / `resetprop` / `magiskpolicy` | ✅ 保留（`kp` 已删，契约 §3.4） | 分发为 **basename 精确匹配**（P1 已修）。`resetprop` 为**条件能力**：默认构建启用 `resetprop` feature；`--no-default-features` 的许可干净构建下，`resetprop` 子命令与 `system.prop` 返回明确「本构建未启用」错误（不静默缺失） |
@@ -169,6 +169,66 @@
 **契约保证**：① stdout **纯 JSON 数组**，日志只走 stderr/logcat（契约 v1.1 §8.4）；② 无模块输出 `[]` 且 exit 0；③ 不含密钥/路径前缀等敏感字段；④ 数组按 `id` 字典序稳定排序。
 
 `apd selftest --json` 同步定稿：`{ok: bool, stage: "undeployed"|"deployed", summary: "undeployed"|"deployed"|"daemon_ready"|"needs_repair", checks: [{name, ok, critical, detail}]}`；`stage=undeployed`（App 首启自检）exit 0。
+
+#### 3.1.2 模块安装 / 卸载（`--json`，v1.0 定稿，app-client 接线用）
+
+**两阶段语义（Magisk/APatch 兼容，勿误解为“直接写 modules/”）**：`module install` 把 zip 解包到 `/data/adb/modules_update/<id>/` 并执行安装脚本；**下次 post-fs-data** 由 `handle_updated_modules()` 原子搬运到 `/data/adb/modules/<id>/` 生效。因此结果里是 `update_pending: true` / `active_after_reboot: true`，不会在半安装状态下覆盖正在运行的模块。`uninstall` 同样写 `remove` 标志，由下次 post-fs-data 清理（`remove_pending: true`）。
+
+`apd module install <zip> --json` → stdout 单行 JSON：
+
+```json
+{"ok":true,"id":"example","name":"Example","version":"1.2.3","versionCode":12,
+ "metamodule":false,"enabled":true,"update_pending":true,"active_after_reboot":true,
+ "changed":true,"previous_version":null,"uncompressed_bytes":12345,"avb_untouched":true}
+```
+
+`apd module uninstall <id> --json` →
+
+```json
+{"ok":true,"id":"example","remove_pending":true,"applied_after_reboot":true,"avb_untouched":true}
+```
+
+失败统一：`{"ok":false,"code":<exit code>,"id":<id|null>,"error":"<可读原因>"}`，进程 exit code = `code`。
+
+**安装前置校验与限制**：
+
+| 项 | 规则 |
+|---|---|
+| zip 大小 | ≤ 512 MiB（`MAX_MODULE_ZIP_BYTES`） |
+| 解压总量 | ≤ 1 GiB（累计 `entry.size()`，zip-bomb 防护） |
+| 条目数 | ≤ 100,000 |
+| 路径安全 | 拒绝绝对路径、反斜杠、`.`/`..` 组件（zip-slip） |
+| 符号链接 | 拒绝 zip 内 symlink 条目（防解包后逃逸） |
+| `module.prop` | 必需 `id`（`^[a-zA-Z][a-zA-Z0-9._-]+$`）、`name`、`version`、`versionCode`（整数）；`author`/`description` 缺失仅告警 |
+| 磁盘空间 | `/data` 可用 ≥ 解压量 + 64 MiB（`statvfs` 前置检查） |
+| 超时 | 安装脚本 300s，超时 kill 进程组（对应 exit 124 语义） |
+| id 冲突 | 同 id = 升级（保留 `disable`/`remove` 状态）；目录内 `module.prop id` 不一致 → 116 |
+| 幂等 | 重复安装同版本：成功且 `changed=false`，不破坏既有 `disable`/`remove`/state |
+| **AVB** | 安装/卸载**零** vbmeta/AVB 操作；结果带 `avb_untouched:true`，并写 `module_state/<id>.json` 审计 |
+
+**退出码（沿用体系：1xx 参数/输入，2xx 执行，124 超时，126/127 部署）**：
+
+| code | 含义 |
+|---|---|
+| 0 | 成功 |
+| 2 | 用法错误（clap 参数解析） |
+| 110 | 输入不存在/不可读（zip 路径、模块 id） |
+| 111 | zip 损坏/无法解析 |
+| 112 | `module.prop` 缺失 / 必填字段缺失 / id 非法 |
+| 113 | 不安全 zip（zip-slip / 符号链接 / 绝对路径） |
+| 114 | 超限（zip 大小 / 解压量 / 条目数） |
+| 115 | 磁盘空间不足 |
+| 116 | id 冲突（目录内 `module.prop id` 不一致，疑似损坏） |
+| 120 | 安装脚本执行失败 |
+| 121 | 解包 / IO 失败（含「Android is Booting」等状态门禁） |
+| 122 | 安装 state 写入失败 |
+| 124 | 超时 |
+| 125 | 提权失败（`root-exec` 层，非本子命令返回） |
+| 126 / 127 | 部署类（apd 未部署 / 命令缺失） |
+
+**stdout 契约**：`--json` 时 stdout 只有 JSON（安装器/进度输出重定向到 stderr/logcat，契约 §8.4）；非 `--json` 保持原 APatch 人类可读输出不变。
+
+> 客户端交叉引用：`docs/NEW-DOC-04-客户端方案.md` §7A.1 已加指针（模块安装/卸载 JSON + 退出码以本节为准）。
 
 ### 3.2 部署路径（/data/adb 与隐藏目录）
 

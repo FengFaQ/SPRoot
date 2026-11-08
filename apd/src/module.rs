@@ -12,10 +12,11 @@ use std::{
     env::var as env_var,
     fs::{self, remove_dir_all},
     io::{Cursor, Read},
+    os::fd::FromRawFd,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     str::FromStr,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[allow(clippy::wildcard_imports)]
@@ -43,7 +44,32 @@ pub enum ModuleType {
     Updated,
 }
 
-fn exec_install_script(module_file: &str, is_metamodule: bool, module_id: &str) -> Result<()> {
+/// Install-time limits (NEW-DOC-05 §3.1.2). Values chosen to be generous for
+/// real modules but bounded against zip bombs / accidental huge uploads.
+const MAX_MODULE_ZIP_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_UNCOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_ZIP_ENTRIES: usize = 100_000;
+const MIN_FREE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Installer scripts may legitimately take a while (unpacking, patching files),
+/// but must never hang the manager forever.
+const INSTALL_TIMEOUT_SECS: u64 = 300;
+
+/// Print human-facing progress unless `quiet` (JSON mode keeps stdout pure).
+fn say(quiet: bool, msg: &str) {
+    if quiet {
+        log::info!("{msg}");
+    } else {
+        println!("{msg}");
+    }
+}
+
+fn exec_install_script(
+    module_file: &str,
+    is_metamodule: bool,
+    module_id: &str,
+    quiet_stdout: bool,
+) -> Result<()> {
     let realpath = std::fs::canonicalize(module_file)
         .with_context(|| format!("realpath: {module_file} failed"))?;
 
@@ -51,13 +77,33 @@ fn exec_install_script(module_file: &str, is_metamodule: bool, module_id: &str) 
     let install_script =
         metamodule::get_install_script(is_metamodule, INSTALLER_CONTENT, INSTALL_MODULE_SCRIPT)?;
 
-    let result = Command::new(assets::BUSYBOX_PATH)
+    let mut command = Command::new(assets::BUSYBOX_PATH);
+    command
         .args(["sh", "-c", &install_script])
         .envs(get_common_script_envs(Some(module_id)))
         .env("OUTFD", "1")
         .env("ZIPFILE", realpath)
-        .status()?;
-    ensure!(result.success(), "Failed to install module script");
+        .process_group(0);
+    if quiet_stdout {
+        // `--json` contract (§8.4): stdout must stay pure JSON. Installer chat
+        // (banner, progress, errors) goes to stderr instead.
+        unsafe {
+            let fd = libc::dup(2);
+            if fd >= 0 {
+                command.stdout(Stdio::from_raw_fd(fd));
+            }
+        }
+    }
+    let mut child = command.spawn().context("spawn module installer")?;
+    match wait_timeout(
+        &mut child,
+        Duration::from_secs(INSTALL_TIMEOUT_SECS),
+    )? {
+        Some(status) => ensure!(status.success(), "Failed to install module script"),
+        None => bail!(
+            "module installer timed out after {INSTALL_TIMEOUT_SECS}s (process group killed)"
+        ),
+    }
     Ok(())
 }
 
@@ -377,11 +423,10 @@ pub fn prune_modules() -> Result<()> {
     Ok(())
 }
 
-fn _install_module(zip: &str) -> Result<()> {
+fn _install_module_inner(zip: &str, quiet: bool) -> Result<()> {
     ensure_boot_completed()?;
 
-    // print banner
-    println!(include_str!("../assets/banner"));
+    say(quiet, include_str!("../assets/banner"));
 
     assets::ensure_binaries().with_context(|| "binary missing")?;
 
@@ -435,18 +480,14 @@ fn _install_module(zip: &str) -> Result<()> {
         && needs_mount
         && let Err(is_disabled) = metamodule::check_install_safety()
     {
-        println!("\n❌ Installation Blocked");
-        println!("┌────────────────────────────────");
-        println!("│ A metamodule with custom installer is active");
-        println!("│");
+        let mut msg = String::from("\n❌ Installation Blocked\n┌────────────────────────────────\n│ A metamodule with custom installer is active\n│\n");
         if is_disabled {
-            println!("│ Current state: Disabled");
-            println!("│ Action required: Re-enable or uninstall it, then reboot");
+            msg.push_str("│ Current state: Disabled\n│ Action required: Re-enable or uninstall it, then reboot\n");
         } else {
-            println!("│ Current state: Pending changes");
-            println!("│ Action required: Reboot to apply changes first");
+            msg.push_str("│ Current state: Pending changes\n│ Action required: Reboot to apply changes first\n");
         }
-        println!("└─────────────────────────────────\n");
+        msg.push_str("└─────────────────────────────────\n");
+        say(quiet, &msg);
         bail!("Metamodule installation blocked");
     }
 
@@ -457,6 +498,7 @@ fn _install_module(zip: &str) -> Result<()> {
         let permissions = fs::Permissions::from_mode(0o700);
         fs::set_permissions(modules_dir, permissions).expect("Failed to set permissions");
     }
+    ensure_dir_exists(modules_update_dir).with_context(|| "Failed to create modules_update dir")?;
 
     if is_metamodule {
         info!("Installing metamodule: {module_id}");
@@ -471,18 +513,10 @@ fn _install_module(zip: &str) -> Result<()> {
                 .unwrap_or_else(|| "unknown".to_string());
 
             if existing_id != module_id {
-                println!("\n❌ Installation Failed");
-                println!("┌────────────────────────────────");
-                println!("│ A metamodule is already installed");
-                println!("│   Current metamodule: {existing_id}");
-                println!("│");
-                println!("│ Only one metamodule can be active at a time.");
-                println!("│");
-                println!("│ To install this metamodule:");
-                println!("│   1. Uninstall the current metamodule");
-                println!("│   2. Reboot your device");
-                println!("│   3. Install the new metamodule");
-                println!("└─────────────────────────────────\n");
+                let msg = format!(
+                    "\n❌ Installation Failed\n┌────────────────────────────────\n│ A metamodule is already installed\n│   Current metamodule: {existing_id}\n│\n│ Only one metamodule can be active at a time.\n│\n│ To install this metamodule:\n│   1. Uninstall the current metamodule\n│   2. Reboot your device\n│   3. Install the new metamodule\n└─────────────────────────────────\n"
+                );
+                say(quiet, &msg);
                 bail!("Cannot install multiple metamodules");
             }
         }
@@ -501,8 +535,8 @@ fn _install_module(zip: &str) -> Result<()> {
     let mut archive = zip::ZipArchive::new(file)?;
     archive.extract(&_module_update_dir)?;
 
-    println!("- Running module installer");
-    exec_install_script(zip, is_metamodule, module_id)?;
+    say(quiet, "- Running module installer");
+    exec_install_script(zip, is_metamodule, module_id, quiet)?;
 
     // set permission and selinux context for $MOD/system
     let module_system_dir = PathBuf::from(module_dir.clone()).join("system");
@@ -514,7 +548,7 @@ fn _install_module(zip: &str) -> Result<()> {
 
     // Create symlink for metamodule
     if is_metamodule {
-        println!("- Creating metamodule symlink");
+        say(quiet, "- Creating metamodule symlink");
         metamodule::ensure_symlink(&module_dir)?;
     }
 
@@ -523,7 +557,345 @@ fn _install_module(zip: &str) -> Result<()> {
 }
 
 pub fn install_module(zip: &str) -> Result<()> {
-    _install_module(zip)
+    _install_module_inner(zip, false)
+}
+
+// ---------------------------------------------------------------------------
+// Machine-readable module install / uninstall (NEW-DOC-05 §3.1.2).
+//
+// `--json` contract: stdout is one JSON object and nothing else (all chat goes
+// to stderr/logcat); exit code carries the classified failure. `list --json`
+// schema stays the frozen 8-field one.
+// ---------------------------------------------------------------------------
+
+pub const EXIT_INPUT_MISSING: i32 = 110;
+pub const EXIT_ZIP_CORRUPT: i32 = 111;
+pub const EXIT_MANIFEST_INVALID: i32 = 112;
+pub const EXIT_UNSAFE_ZIP: i32 = 113;
+pub const EXIT_LIMIT_EXCEEDED: i32 = 114;
+pub const EXIT_NO_SPACE: i32 = 115;
+pub const EXIT_CONFLICT: i32 = 116;
+pub const EXIT_SCRIPT_FAILED: i32 = 120;
+pub const EXIT_IO_FAILED: i32 = 121;
+pub const EXIT_STATE_FAILED: i32 = 122;
+pub const EXIT_TIMEOUT: i32 = 124;
+
+struct ModuleZipInfo {
+    id: String,
+    name: String,
+    version: String,
+    version_code: i64,
+    uncompressed: u64,
+    metamodule: bool,
+}
+
+fn json_emit(code: i32, payload: serde_json::Value) -> ! {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
+    );
+    std::process::exit(code);
+}
+
+fn json_fail(code: i32, id: Option<&str>, error: &str) -> ! {
+    json_emit(
+        code,
+        serde_json::json!({"ok": false, "code": code, "id": id, "error": error}),
+    )
+}
+
+fn free_bytes(path: &str) -> Option<u64> {
+    let cpath = std::ffi::CString::new(path).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+fn module_meta_from_dir(dir: &Path) -> Option<(String, i64)> {
+    let props = read_module_prop(dir).ok()?;
+    let version = props.get("version").cloned().unwrap_or_default();
+    let code = props
+        .get("versionCode")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    Some((version, code))
+}
+
+/// Pre-flight validation of a module zip: size caps, zip-slip/symlink rejection,
+/// `module.prop` required fields, uncompressed-size accounting.
+fn inspect_module_zip(zip_path: &Path) -> Result<ModuleZipInfo, (i32, String)> {
+    let meta = fs::metadata(zip_path)
+        .map_err(|e| (EXIT_INPUT_MISSING, format!("zip not readable: {e}")))?;
+    if !meta.is_file() {
+        return Err((EXIT_INPUT_MISSING, "not a regular file".to_string()));
+    }
+    if meta.len() > MAX_MODULE_ZIP_BYTES {
+        return Err((
+            EXIT_LIMIT_EXCEEDED,
+            format!(
+                "zip is {} B, over the {} B limit",
+                meta.len(),
+                MAX_MODULE_ZIP_BYTES
+            ),
+        ));
+    }
+    let file =
+        fs::File::open(zip_path).map_err(|e| (EXIT_INPUT_MISSING, format!("open: {e}")))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| (EXIT_ZIP_CORRUPT, format!("corrupt zip: {e}")))?;
+    if archive.len() > MAX_ZIP_ENTRIES {
+        return Err((
+            EXIT_LIMIT_EXCEEDED,
+            format!("zip has {} entries, over {MAX_ZIP_ENTRIES}", archive.len()),
+        ));
+    }
+
+    let mut uncompressed: u64 = 0;
+    let mut prop_bytes: Option<Vec<u8>> = None;
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| (EXIT_ZIP_CORRUPT, format!("entry #{i}: {e}")))?;
+        let name = entry.name().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        // zip-slip: absolute paths, backslashes, `..` components.
+        if name.starts_with('/') || name.starts_with('\\') || name.contains('\\') {
+            return Err((EXIT_UNSAFE_ZIP, format!("unsafe absolute path: {name}")));
+        }
+        if name
+            .split('/')
+            .any(|c| c == ".." || c == "." || c.is_empty() && name.contains("//"))
+        {
+            return Err((EXIT_UNSAFE_ZIP, format!("unsafe relative path: {name}")));
+        }
+        // symlink entries could escape the module dir after extraction.
+        if let Some(mode) = entry.unix_mode()
+            && mode & 0o170000 == 0o120000
+        {
+            return Err((EXIT_UNSAFE_ZIP, format!("symlink entry: {name}")));
+        }
+        uncompressed = uncompressed.saturating_add(entry.size());
+        if uncompressed > MAX_UNCOMPRESSED_BYTES {
+            return Err((
+                EXIT_LIMIT_EXCEEDED,
+                format!("uncompressed size over {MAX_UNCOMPRESSED_BYTES} B"),
+            ));
+        }
+        if name == "module.prop" {
+            let mut buf = Vec::new();
+            entry
+                .read_to_end(&mut buf)
+                .map_err(|e| (EXIT_ZIP_CORRUPT, format!("module.prop read: {e}")))?;
+            prop_bytes = Some(buf);
+        }
+    }
+
+    let prop_bytes = prop_bytes.ok_or((
+        EXIT_MANIFEST_INVALID,
+        "zip has no module.prop".to_string(),
+    ))?;
+    let mut props: HashMap<String, String> = HashMap::new();
+    PropertiesIter::new_with_encoding(Cursor::new(prop_bytes), encoding_rs::UTF_8)
+        .read_into(|k, v| {
+            props.insert(k, v);
+        })
+        .map_err(|e| (EXIT_MANIFEST_INVALID, format!("parse module.prop: {e}")))?;
+
+    let id = props
+        .get("id")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or((
+            EXIT_MANIFEST_INVALID,
+            "module.prop missing required `id`".to_string(),
+        ))?;
+    let id_re = regex_lite::Regex::new(r"^[a-zA-Z][a-zA-Z0-9._-]+$")
+        .map_err(|e| (EXIT_MANIFEST_INVALID, format!("id regex: {e}")))?;
+    if !id_re.is_match(&id) {
+        return Err((EXIT_MANIFEST_INVALID, format!("invalid module id: {id}")));
+    }
+    for field in ["name", "version", "versionCode"] {
+        if props.get(field).map(|v| v.trim().is_empty()).unwrap_or(true) {
+            return Err((
+                EXIT_MANIFEST_INVALID,
+                format!("module.prop missing required `{field}`"),
+            ));
+        }
+    }
+    for field in ["author", "description"] {
+        if props.get(field).map(|v| v.trim().is_empty()).unwrap_or(true) {
+            log::warn!("[module install] module.prop has no `{field}` (recommended by Magisk spec)");
+        }
+    }
+    let version = props.get("version").cloned().unwrap_or_default();
+    let version_code = props
+        .get("versionCode")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .ok_or((
+            EXIT_MANIFEST_INVALID,
+            "module.prop `versionCode` is not an integer".to_string(),
+        ))?;
+    let name = props
+        .get("name")
+        .cloned()
+        .unwrap_or_else(|| id.clone());
+    let metamodule = metamodule::is_metamodule(&props);
+
+    Ok(ModuleZipInfo {
+        id,
+        name,
+        version,
+        version_code,
+        uncompressed,
+        metamodule,
+    })
+}
+
+fn write_module_state(id: &str, version: &str, version_code: i64, zip: &str) -> Result<()> {
+    ensure_dir_exists(defs::MODULE_STATE_DIR)?;
+    let state = serde_json::json!({
+        "id": id,
+        "version": version,
+        "versionCode": version_code,
+        "installed_at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        "source_zip": zip,
+        "avb_untouched": true,
+    });
+    let path = Path::new(defs::MODULE_STATE_DIR).join(format!("{id}.json"));
+    fs::write(&path, serde_json::to_string_pretty(&state)?)
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+/// `apd module install <zip> --json`.
+pub fn install_module_json(zip: &str) -> ! {
+    let started = Instant::now();
+    let zip_path = Path::new(zip);
+    let info = match inspect_module_zip(zip_path) {
+        Ok(info) => info,
+        Err((code, msg)) => json_fail(code, None, &msg),
+    };
+
+    // Disk-space pre-flight: extraction needs the payload plus headroom.
+    if let Some(free) = free_bytes("/data")
+        && free < info.uncompressed.saturating_add(MIN_FREE_BYTES)
+    {
+        json_fail(
+            EXIT_NO_SPACE,
+            Some(&info.id),
+            &format!(
+                "insufficient space on /data: free={free} B, need>={} B",
+                info.uncompressed.saturating_add(MIN_FREE_BYTES)
+            ),
+        );
+    }
+
+    // Conflict policy: same id = upgrade (allowed, state preserved); a module
+    // dir whose module.prop id differs from its directory name is corruption.
+    let active_dir = Path::new(defs::MODULE_DIR).join(&info.id);
+    if let Ok(props) = read_module_prop(&active_dir)
+        && let Some(existing_id) = props.get("id")
+        && existing_id.trim() != info.id
+    {
+        json_fail(
+            EXIT_CONFLICT,
+            Some(&info.id),
+            &format!("module dir id mismatch: {existing_id} != {}", info.id),
+        );
+    }
+
+    let prev = module_meta_from_dir(&active_dir);
+    let changed = match &prev {
+        Some((version, code)) => version != &info.version || *code != info.version_code,
+        None => true,
+    };
+
+    if let Err(e) = _install_module_inner(zip, true) {
+        let msg = format!("{e:#}");
+        let code = if msg.contains("script") || msg.contains("installer") {
+            EXIT_SCRIPT_FAILED
+        } else {
+            EXIT_IO_FAILED
+        };
+        json_fail(code, Some(&info.id), &msg);
+    }
+
+    // Installing cancels a pending removal; the `disable` flag is user state and
+    // is preserved (idempotent re-install of the same version changes nothing).
+    let _ = fs::remove_file(active_dir.join(defs::REMOVE_FILE_NAME));
+    if let Err(e) = write_module_state(&info.id, &info.version, info.version_code, zip) {
+        json_fail(EXIT_STATE_FAILED, Some(&info.id), &format!("{e:#}"));
+    }
+    let enabled = !active_dir.join(defs::DISABLE_FILE_NAME).exists();
+
+    if started.elapsed() > Duration::from_secs(INSTALL_TIMEOUT_SECS + 120) {
+        log::warn!("[module install] install took unusually long: {:?}", started.elapsed());
+    }
+    json_emit(
+        0,
+        serde_json::json!({
+            "ok": true,
+            "id": info.id,
+            "name": info.name,
+            "version": info.version,
+            "versionCode": info.version_code,
+            "metamodule": info.metamodule,
+            "enabled": enabled,
+            "update_pending": true,
+            "active_after_reboot": true,
+            "changed": changed,
+            "previous_version": prev.map(|(v, _)| v),
+            "uncompressed_bytes": info.uncompressed,
+            "avb_untouched": true,
+        }),
+    );
+}
+
+/// `apd module uninstall <id> --json`.
+pub fn uninstall_module_json(id: &str) -> ! {
+    let id_re = match regex_lite::Regex::new(r"^[a-zA-Z][a-zA-Z0-9._-]+$") {
+        Ok(re) => re,
+        Err(e) => json_fail(EXIT_MANIFEST_INVALID, Some(id), &format!("id regex: {e}")),
+    };
+    if !id_re.is_match(id) {
+        json_fail(EXIT_MANIFEST_INVALID, Some(id), "invalid module id");
+    }
+    let active = Path::new(defs::MODULE_DIR).join(id);
+    let staged = Path::new(defs::MODULE_UPDATE_DIR).join(id);
+    if !active.exists() && !staged.exists() {
+        json_fail(EXIT_INPUT_MISSING, Some(id), "module not installed");
+    }
+
+    if active.exists()
+        && let Err(e) = _uninstall_module(id, defs::MODULE_DIR)
+    {
+        json_fail(EXIT_IO_FAILED, Some(id), &format!("{e:#}"));
+    }
+    if staged.exists()
+        && let Err(e) = remove_dir_all(&staged)
+    {
+        json_fail(EXIT_IO_FAILED, Some(id), &format!("{e:#}"));
+    }
+    let _ = module_config::clear_module_configs(id);
+    let _ = fs::remove_file(Path::new(defs::MODULE_STATE_DIR).join(format!("{id}.json")));
+
+    json_emit(
+        0,
+        serde_json::json!({
+            "ok": true,
+            "id": id,
+            "remove_pending": active.exists(),
+            "applied_after_reboot": active.exists(),
+            "avb_untouched": true,
+        }),
+    );
 }
 
 pub fn _uninstall_module(id: &str, update_dir: &str) -> Result<()> {

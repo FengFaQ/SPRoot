@@ -150,12 +150,18 @@ enum Module {
     Install {
         /// module zip file path
         zip: String,
+        /// machine-readable result on stdout; classified failure in the exit code
+        #[arg(long)]
+        json: bool,
     },
 
     /// Uninstall module <id>
     Uninstall {
         /// module id
         id: String,
+        /// machine-readable result on stdout; classified failure in the exit code
+        #[arg(long)]
+        json: bool,
     },
 
     /// UudoUninstall module <id>
@@ -366,8 +372,20 @@ pub fn run() -> Result<()> {
                 utils::switch_mnt_ns(1)?;
             }
             match command {
-                Module::Install { zip } => module::install_module(&zip),
-                Module::Uninstall { id } => module::uninstall_module(&id),
+                Module::Install { zip, json } => {
+                    if json {
+                        module::install_module_json(&zip)
+                    } else {
+                        module::install_module(&zip)
+                    }
+                }
+                Module::Uninstall { id, json } => {
+                    if json {
+                        module::uninstall_module_json(&id)
+                    } else {
+                        module::uninstall_module(&id)
+                    }
+                }
                 Module::UndoUninstall { id } => module::undo_uninstall_module(&id),
                 Module::Action { id } => module::run_action(&id),
                 Module::Lua { id, function } => {

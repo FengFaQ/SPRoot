@@ -312,6 +312,8 @@ UI 铁律：**原始码与可读文案同时展示**（错误区"错误码"字�
 - 启用/禁用：`apd module enable|disable <id>`（同样 root-exec），退出码映射见 §6.1；
 - 模块列表加载失败时也保留原始输出（绝不静默）。
 
+> **模块安装/卸载（cross-ref）**：`apd module install <zip> --json` / `apd module uninstall <id> --json` 的 JSON schema、两阶段语义（`update_pending`/`active_after_reboot`）与退出码（110–122/124/126/127）以 **NEW-DOC-05 §3.1.2** 为准，本文不重复定义。
+
 ### 7A.2 AP 首启自检 `apd selftest --json`
 
 - 启动时 `SPRootApp` 后台执行一次；有密钥走 `root-exec`，无密钥回退直接 exec（只读探测）。
