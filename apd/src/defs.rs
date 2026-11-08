@@ -81,3 +81,7 @@ pub const BOOT_COMPLETED_PROP: &str = "sys.boot_completed";
 
 pub const VERSION_CODE: &str = include_str!(concat!(env!("OUT_DIR"), "/VERSION_CODE"));
 pub const VERSION_NAME: &str = include_str!(concat!(env!("OUT_DIR"), "/VERSION_NAME"));
+/// Commit the binary was built from (`unknown` outside a git checkout). Used by
+/// `version --json` so the manager can compare the APK-bundled libapd.so with
+/// the deployed `/data/adb/apd` (NEW-DOC-05 §6.2 version consistency check).
+pub const VERSION_COMMIT: &str = include_str!(concat!(env!("OUT_DIR"), "/VERSION_COMMIT"));

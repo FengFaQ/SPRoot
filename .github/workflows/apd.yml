@@ -87,7 +87,7 @@ jobs:
       - name: Cross build (release)
         run: cargo build --release --locked --target aarch64-linux-android
 
-      - name: Stage artifact as libapd.so
+      - name: Stage artifact as libapd.so (+ fixed-name copy + version manifest)
         run: |
           set -euo pipefail
           mkdir -p ../dist
@@ -95,9 +95,31 @@ jobs:
           test -f "$SRC"
           cp "$SRC" ../dist/libapd.so
           "${STRIP_aarch64_linux_android}" ../dist/libapd.so
+          # Fixed-name copy for the app CI: download this artifact and put it in
+          # newapp/app/src/main/jniLibs/arm64-v8a/libapd.so (version pinned by
+          # apd-version.txt).
+          cp ../dist/libapd.so ../dist/libapd-arm64.so
           ls -l ../dist/libapd.so
           ( cd ../dist && sha256sum libapd.so | tee libapd.so.sha256 )
           file ../dist/libapd.so | tee ../dist/libapd.elf-info.txt
+          # Version manifest: the manager compares this against the deployed
+          # /data/adb/apd (`apd version --json` -> commit field) to detect skew.
+          digest=$(sha256sum ../dist/libapd.so | cut -d' ' -f1)
+          size=$(stat -c%s ../dist/libapd.so)
+          version=$(git describe --tags --always 2>/dev/null || echo 0.0.0)
+          commit_short=$(git rev-parse --short=12 HEAD)
+          {
+            echo "name=apd"
+            echo "version=${version}"
+            echo "commit=${GITHUB_SHA}"
+            echo "commit_short=${commit_short}"
+            echo "ref=${GITHUB_REF_NAME}"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "size_bytes=${size}"
+            echo "sha256=${digest}"
+          } > ../dist/apd-version.txt
+          cat ../dist/apd-version.txt
 
       # ELF assertion: ELFCLASS64 + little-endian + ET_DYN (PIE) + EM_AARCH64.
       - name: Assert ELF is aarch64 PIE
@@ -122,7 +144,8 @@ jobs:
           print("ELF assertion passed: aarch64 PIE")
           PY
 
-      - name: Upload artifact
+      # Per-commit artifact (immutable, keeps history in the UI).
+      - name: Upload artifact (commit-pinned)
         uses: actions/upload-artifact@v4
         with:
           name: apd-aarch64-${{ github.sha }}
@@ -130,5 +153,18 @@ jobs:
             dist/libapd.so
             dist/libapd.so.sha256
             dist/libapd.elf-info.txt
+            dist/apd-version.txt
           if-no-files-found: error
           retention-days: 14
+
+      # Fixed-name artifact for the app CI: stable download path + manifest.
+      # Client usage: gh run download -n apd-aarch64-latest -R FengFaQ/SPRoot
+      - name: Upload artifact (fixed name for app CI)
+        uses: actions/upload-artifact@v4
+        with:
+          name: apd-aarch64-latest
+          path: |
+            dist/libapd-arm64.so
+            dist/apd-version.txt
+          if-no-files-found: error
+          retention-days: 30

@@ -340,7 +340,7 @@ apd daemon --superkey-file /data/adb/sproot/key
 | # | 动作 | 校验 |
 |---|---|---|
 | 1 | `mkdir -p /data/adb/{ap/{bin,log,module_configs},sproot,modules,modules_update}`，权限 0700/0755 | 存在性 + mode |
-| 2 | 复制 `libapd.so` → `/data/adb/apd`（0755） | **sha256 与源一致** |
+| 2 | 复制 `libapd.so` → `/data/adb/apd`（0755） | **sha256 与源一致**；并校验 `apd-version.txt`（见 §6.2 版本一致性检查） |
 | 3 | 复制 `libbusybox.so` → `/data/adb/ap/bin/busybox`（0755） | sha256 |
 | 4 | `ln -sfn /data/adb/apd /data/adb/ap/bin/{resetprop,magiskpolicy}` | `readlink` 目标 |
 | 5 | 从临时 key 文件读密钥 → 写 `/data/adb/sproot/key`（0600 root，无换行） | 长度 48、字符集 `[A-Za-z0-9]` |
@@ -348,6 +348,11 @@ apd daemon --superkey-file /data/adb/sproot/key
 | 7 | 初始化 `/data/adb/ap/allow_list`（表头 + 空）+ `.lock`（0600） | 可被 daemon 解析 |
 | 8 | 写 `/data/adb/sproot/state.json`（版本、部署时间、隐藏文件名——**不含密钥任何片段**）+ 清空 `boot_count` + 写抽象 socket 名 `/data/adb/ap/bin/.su.sock`（0644，名字不含密钥） | JSON 可解析；socket 名可被客户端读取 |
 | 9 | 冒烟：`/data/adb/apd version --json`（以 root）+ `su -c id`（经 root-exec） | exit 0 |
+
+**版本一致性检查（APK 内 libapd.so ↔ /data/adb/apd，2026-11-08 lead 要求）**：
+1. 客户端 CI 从 apd 工作流拉取**固定命名 artifact** `apd-aarch64-latest`（含 `libapd-arm64.so` + `apd-version.txt`，字段：`commit / version / sha256 / size_bytes / run_id`），打进 APK `jniLibs/arm64-v8a/libapd.so`；
+2. 管理器调 `apd version --json` 读已部署二进制的 `commit`（由 `build.rs` 编译期注入 `VERSION_COMMIT`），与 APK 内置 `apd-version.txt.commit` 比对；
+3. 不一致 → 管理器提示「需重新部署」并允许 `deploy` 覆盖（`deploy` 幂等，写入的 `state.json` 同样带 `commit`）；**禁止**静默用旧二进制提供 root-exec（行为差异会导致授权/部署语义漂移）。
 
 **失败回滚（T2 内）**：deploy 整体是「先写临时目录 → rename 就位」的两段式；第 2~8 步任一步失败 → 删除已就位物（只删本步清单内文件，不碰 `/data/adb/modules` 用户数据）→ 状态仍为未部署，可重试。
 
@@ -421,6 +426,7 @@ apd daemon --superkey-file /data/adb/sproot/key
 | R9 | 固定路径 `/data/adb/apd` 被卸载器/检测器清理 | 守护失效 | 中 | `su`/隐藏副本冗余；deploy 可重建；`state.json` 可探测 | 删除 AP 后重新 deploy 实测 |
 | R10 | daemon 与旧 APatch 语义漂移（模块兼容） | 存量模块静默失效 | 中 | 「行为不变」硬约束 + 模块兼容用例集（module.rs 语义逐条） | 模块生态回归用例 |
 | R11 | 契约 v1.1 未及时修订（E1–E5） | 实现照旧契约写必然失败/返工 | 高 | 本文 §4.6 作为修订依据，lead 终审后同步契约 | 契约 v1.1 会签 |
+| R13 | APK 内置 libapd.so 与已部署 /data/adb/apd 版本漂移 | root-exec/授权/部署语义不一致，故障难定位 | 中 | `apd-version.txt`（固定 artifact）+ `version --json.commit` + `state.json.commit` 三方比对；不一致禁止静默使用 | 版本一致性验收项（§9-8） |
 | R12 | 二进制体积/冷启动（rc 关键路径） | 开机变慢、用户可感 | 低 | 体积实测 + 必要时拆小二进制 / 延迟加载 lua | 开机耗时对比（原厂 vs 修补） |
 
 ---
@@ -434,6 +440,7 @@ apd daemon --superkey-file /data/adb/sproot/key
 5. **bootloop 守卫**：故意放一个挂死模块 → 第 2 次启动自动 safemode + 模块全禁用 + 系统可进桌面。
 6. **回滚**：刷回原厂 boot → 系统正常；`undeploy` 后 `/data/<key16>`、`/data/adb/sproot`、`/data/adb/apd` 均不存在。
 7. **契约一致性**：E1–E5 在契约 v1.1 中已修订或明确接受（会签记录）。
+8. **版本一致性**：APK 内置 libapd.so 的 commit 与 `/data/adb/apd` 的 `version --json.commit` 一致；不一致时 UI 有明确「重新部署」提示。
 
 ---
 

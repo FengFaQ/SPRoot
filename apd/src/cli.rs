@@ -554,6 +554,7 @@ fn print_version(json: bool) -> Result<()> {
     let payload = serde_json::json!({
         "version": defs::VERSION_NAME.trim(),
         "version_code": defs::VERSION_CODE.trim(),
+        "commit": defs::VERSION_COMMIT.trim(),
         "deployed": deployed,
         "key_prefix_sha256": key_prefix_sha256,
         "daemon_pid": daemon::daemon_pid(),

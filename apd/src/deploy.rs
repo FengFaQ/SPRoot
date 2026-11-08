@@ -37,6 +37,10 @@ const HIDDEN_NAME_LEN: usize = 16;
 #[derive(Serialize, Deserialize, Debug)]
 pub struct DeployState {
     pub version: String,
+    /// Build commit of the deployed binary; compared by the manager against the
+    /// APK-bundled `libapd.so` (version consistency check).
+    #[serde(default)]
+    pub commit: String,
     pub deployed_at: u64,
     /// Random file name inside `/data/<key16>/`, needed by `undeploy`.
     /// Contains no key material (the directory name is derived from the key
@@ -278,6 +282,7 @@ fn init_allow_list() -> Result<()> {
 fn write_state(hidden_file: &str, source_dir: &Path) -> Result<()> {
     let state = DeployState {
         version: defs::VERSION_NAME.trim().to_string(),
+        commit: defs::VERSION_COMMIT.trim().to_string(),
         deployed_at: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())

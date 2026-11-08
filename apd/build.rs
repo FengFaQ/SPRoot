@@ -44,6 +44,15 @@ fn get_git_version() -> Option<(u32, String)> {
     Some((version_code, name))
 }
 
+/// Full commit hash the binary was built from (short form for display).
+/// `unknown` when the build is not from a git checkout (source tarball).
+fn get_git_commit() -> String {
+    run_git(&["rev-parse", "--short=12", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 fn main() {
     // Rebuild the version stamp whenever the git state or epoch file changes.
     println!("cargo:rerun-if-changed=../.git/HEAD");
@@ -71,4 +80,11 @@ fn main() {
         .expect("Failed to create VERSION_NAME")
         .write_all(name.trim().as_bytes())
         .expect("Failed to write VERSION_NAME");
+
+    // Commit the manager can compare against the APK-bundled apd-version.txt
+    // (version consistency check, NEW-DOC-05 §6.2).
+    File::create(out_dir.join("VERSION_COMMIT"))
+        .expect("Failed to create VERSION_COMMIT")
+        .write_all(get_git_commit().as_bytes())
+        .expect("Failed to write VERSION_COMMIT");
 }
