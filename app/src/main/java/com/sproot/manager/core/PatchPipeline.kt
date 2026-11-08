@@ -147,6 +147,7 @@ object PatchPipeline {
 
     private fun execute(context: Context, sourceUri: Uri) {
         var workDir: File? = null
+        var rcResult: RcInject.Result? = null
         val key = runCatching { SecretStore.get(context).getOrCreateRootKey() }.getOrElse {
             finishFailure(
                 title = "无法取得 Root 密钥",
@@ -371,6 +372,31 @@ object PatchPipeline {
                 return
             }
 
+            // ---------- ⑥.5 D1：注入 AP 开机自启 rc（init.sproot.rc + init.rc import） ----------
+            // 目标优先级（D-12）：init_boot.img 的 ramdisk 优先，boot.img 回退；
+            // 无 ramdisk → 跳过记 rc_injected=false（不算失败）。
+            val ramdisk = File(workDir, "ramdisk.cpio")
+            val rcTarget = if (state.value.sourceName?.contains("init_boot", ignoreCase = true) == true) {
+                "init_boot"
+            } else {
+                "boot"
+            }
+            stage(PatchStage.REPACK, 80f, "尝试注入开机自启 rc（target=$rcTarget）")
+            rcResult = RcInject.inject(context, workDir, ramdisk.takeIf { it.isFile }, rcTarget)
+            state.value = state.value.copy(
+                rcInjected = rcResult!!.injected,
+                rcTarget = rcResult!!.target,
+                rcReason = rcResult!!.reason,
+            )
+            AppLog.info(
+                TAG,
+                "自启注入：" + if (rcResult!!.injected) {
+                    "已注入（target=${rcResult!!.target}，幂等命中=${rcResult!!.idempotentHit}）"
+                } else {
+                    "未注入（原因=${rcResult!!.reason}，不影响产物合规）"
+                },
+            )
+
             // ---------- ⑦ 重打包 ----------
             stage(PatchStage.REPACK, 82f, "magiskboot repack")
             val repack = MagiskBoot.exec(context, listOf("repack", "boot.img"), workDir!!) { line ->
@@ -462,18 +488,76 @@ object PatchPipeline {
                 )
                 return
             }
-            val avbOrig = Elf.hasAvbFooter(bootImg)
-            val avbNew = Elf.hasAvbFooter(newBoot)
-            AppLog.info(TAG, "AVB footer：原始=$avbOrig 产物=$avbNew（不修改 AVB，仅确认保留）")
-            if (avbOrig != avbNew) {
-                AppLog.warn(TAG, "AVB footer 存在性变化（原始=$avbOrig 产物=$avbNew），请质测关注")
-            }
-            if (newBoot.length() != bootImg.length()) {
-                AppLog.warn(
-                    TAG,
-                    "产物总长与输入不同（${newBoot.length()} vs ${bootImg.length()} 字节）；" +
-                        "若分区大小固定，刷入前需确认未超分区（magiskboot repack 可能重排对齐）",
+            // ---------- ⑦.6 D6：AVB 硬断言（AVB-1/2/3） ----------
+            val avbInputFooter = Elf.readAvbFooter(bootImg)
+            val avbCheck = checkAvb(bootImg, newBoot, avbInputFooter)
+            if (!avbCheck.ok) {
+                // AVB-2 等长冲突且已注入 rc → 回滚 rc 重新 repack（宁可失去自启，也不产出不合规镜像）
+                if (avbCheck.rollbackCandidate && rcResult?.injected == true) {
+                    AppLog.warn(TAG, "AVB-2 等长冲突：回滚 rc 注入并重新 repack（rc_injected=false, reason=avb_length_conflict）")
+                    val rolledBack = RcInject.rollback(workDir!!, File(workDir, "ramdisk.cpio"))
+                    if (rolledBack) {
+                        rcResult = RcInject.Result(false, rcTarget, "avb_length_conflict", false)
+                        state.value = state.value.copy(rcInjected = false, rcReason = "avb_length_conflict")
+                        val repack2 = MagiskBoot.exec(context, listOf("repack", "boot.img"), workDir!!) { line ->
+                            AppLog.debug("magiskboot", line)
+                        }
+                        if (repack2.timedOut || repack2.exitCode != 0) {
+                            finishFailure(
+                                "回滚 rc 后重新 repack 失败（magiskboot exit=${repack2.exitCode}）",
+                                "完整输出：\n${repack2.lines.joinToString("\n").ifBlank { "<无输出>" }}",
+                                "AVB-2",
+                            )
+                            return
+                        }
+                        // T-12 不能放松：对第二次产物重新回读 kernel
+                        val readbackSha = kernelReadbackSha(context, workDir!!, compression)
+                        if (readbackSha != patchedSha) {
+                            finishFailure(
+                                "回滚 rc 后补丁未生效（T-12）",
+                                "回读 kernel sha256=$readbackSha，期望 kernel.patched=$patchedSha。已中止，未导出。",
+                                "T-12",
+                            )
+                            return
+                        }
+                        val avbRetry = checkAvb(bootImg, newBoot, avbInputFooter)
+                        state.value = state.value.copy(
+                            avbStatus = avbRetry.describe,
+                            avbFooterPresent = avbRetry.footerPresent,
+                            avbLengthEqual = avbRetry.lengthEqual,
+                            avbVbmetaEqual = avbRetry.vbmetaEqual,
+                        )
+                        if (!avbRetry.ok) {
+                            finishFailure(
+                                "AVB 结构不合规（回滚自启后仍未通过：${avbRetry.code}）",
+                                avbRetry.detail,
+                                avbRetry.code,
+                            )
+                            return
+                        }
+                        AppLog.warn(TAG, "已回滚自启，产物 AVB 校验通过（${avbRetry.describe}）")
+                    } else {
+                        finishFailure("AVB-2 等长冲突且无法回滚 rc 注入", avbCheck.detail, "AVB-2")
+                        return
+                    }
+                } else {
+                    state.value = state.value.copy(
+                        avbStatus = avbCheck.describe,
+                        avbFooterPresent = avbCheck.footerPresent,
+                        avbLengthEqual = avbCheck.lengthEqual,
+                        avbVbmetaEqual = avbCheck.vbmetaEqual,
+                    )
+                    finishFailure("AVB 结构不合规（${avbCheck.code}）", avbCheck.detail, avbCheck.code)
+                    return
+                }
+            } else {
+                state.value = state.value.copy(
+                    avbStatus = avbCheck.describe,
+                    avbFooterPresent = avbCheck.footerPresent,
+                    avbLengthEqual = avbCheck.lengthEqual,
+                    avbVbmetaEqual = avbCheck.vbmetaEqual,
                 )
+                AppLog.info(TAG, "AVB 校验通过：${avbCheck.describe}")
             }
             stage(PatchStage.VERIFY, 92f, "回读校验通过：补丁已在产物中真实生效")
             val outSha = sha256(newBoot)
@@ -585,6 +669,140 @@ object PatchPipeline {
             TAG,
             "阶段耗时汇总（总 ${total}ms）：" + stageDurations.joinToString("；") { "${it.first} ${it.second}ms" },
         )
+    }
+
+
+    /** AVB 校验结果 */
+    private data class AvbCheck(
+        val ok: Boolean,
+        val code: String,
+        val describe: String,
+        val detail: String,
+        val footerPresent: Boolean,
+        val lengthEqual: Boolean,
+        val vbmetaEqual: Boolean,
+        val rollbackCandidate: Boolean,
+    )
+
+    /**
+     * D6 AVB 硬断言：
+     *  - AVB-1：输入有 footer ⇒ 产物必须有；
+     *  - AVB-2：输入有 footer ⇒ 产物总长必须严格等于输入（否则可回滚 rc 后重试）；
+     *  - AVB-3：输入有 footer 且字段合法 ⇒ 内嵌 vbmeta 区段逐字节相同（打印首个差异偏移）；
+     * 输入无 footer（无 AVB 厂商镜像）⇒ 仅告警（仅检查总长差异），不阻断。
+     */
+    private fun checkAvb(input: File, output: File, inputFooter: Elf.AvbFooter?): AvbCheck {
+        val outputFooter = Elf.readAvbFooter(output)
+        val footerPresent = inputFooter != null
+        val lengthEqual = input.length() == output.length()
+        if (inputFooter == null) {
+            AppLog.warn(
+                TAG,
+                "输入无 AVB footer（兼容无 AVB 镜像）：仅记录总长 ${input.length()} → ${output.length()}，不阻断",
+            )
+            return AvbCheck(
+                ok = true,
+                code = "AVB-N/A",
+                describe = "输入无 AVB footer，已跳过 AVB-1/2/3（仅记录总长差 ${output.length() - input.length()} B）",
+                detail = "",
+                footerPresent = false,
+                lengthEqual = lengthEqual,
+                vbmetaEqual = false,
+                rollbackCandidate = false,
+            )
+        }
+        // AVB-1
+        if (outputFooter == null) {
+            return AvbCheck(
+                ok = false,
+                code = "AVB-1",
+                describe = "AVB 结构丢失",
+                detail = "输入含 AVB footer（magic AVBf），但产物不含。可能 repack 改写了尾部布局。禁止刷入。",
+                footerPresent = false,
+                lengthEqual = lengthEqual,
+                vbmetaEqual = false,
+                rollbackCandidate = false,
+            )
+        }
+        // AVB-2
+        if (!lengthEqual) {
+            val diff = output.length() - input.length()
+            return AvbCheck(
+                ok = false,
+                code = "AVB-2",
+                describe = "产物总长与输入不等",
+                detail = "输入=${input.length()} B，产物=${output.length()} B，差值=${if (diff > 0) "+" else ""}$diff B。" +
+                    "AVB footer 的 original_image_size/vbmeta 偏移是绝对布局，长度变化会导致校验失败。",
+                footerPresent = true,
+                lengthEqual = false,
+                vbmetaEqual = false,
+                rollbackCandidate = true,
+            )
+        }
+        // AVB-3
+        val start = inputFooter.vbmetaStart()
+        if (start == null) {
+            AppLog.warn(
+                TAG,
+                "AVB footer 字段异常（vbmeta_offset=${inputFooter.vbmetaOffset}, " +
+                    "vbmeta_size=${inputFooter.vbmetaSize}, len=${inputFooter.fileLength}）→ AVB-3 降级为 WARN",
+            )
+            return AvbCheck(
+                ok = true,
+                code = "AVB-3-SKIP",
+                describe = "AVB footer 字段越界/为 0，AVB-3 未执行（已记录原因，不静默跳过）",
+                detail = "",
+                footerPresent = true,
+                lengthEqual = true,
+                vbmetaEqual = false,
+                rollbackCandidate = false,
+            )
+        }
+        val diffOffset = Elf.firstDiffOffset(input, output, start, inputFooter.vbmetaSize)
+        if (diffOffset != null) {
+            return AvbCheck(
+                ok = false,
+                code = "AVB-3",
+                describe = "内嵌 vbmeta 区段被改写",
+                detail = "内嵌 vbmeta 区段 [${start}, ${start + inputFooter.vbmetaSize}) " +
+                    "逐字节比对失败，首个差异偏移=$diffOffset（相对区段 +${diffOffset - start}）。" +
+                    "本流程不修改 AVB，出现差异说明 repack 移动/改写了该区段，禁止刷入。",
+                footerPresent = true,
+                lengthEqual = true,
+                vbmetaEqual = false,
+                rollbackCandidate = false,
+            )
+        }
+        return AvbCheck(
+            ok = true,
+            code = "AVB-OK",
+            describe = "AVB-1/2/3 通过（footer 保留、总长相等、vbmeta 区段逐字节一致）",
+            detail = "",
+            footerPresent = true,
+            lengthEqual = true,
+            vbmetaEqual = true,
+            rollbackCandidate = false,
+        )
+    }
+
+    /** 重新 unpack 产物并回读 kernel（必要时 decompress），返回 sha256；失败返回 null */
+    private fun kernelReadbackSha(context: Context, workDir: File, compression: String?): String? {
+        return runCatching {
+            val dir = File(workDir, "verify2").apply {
+                check(mkdirs() || isDirectory) { "无法创建 verify2 目录" }
+            }
+            File(workDir, "new-boot.img").copyTo(File(dir, "new-boot.img"), overwrite = true)
+            val unpack = MagiskBoot.exec(context, listOf("unpack", "new-boot.img"), dir, 180_000) { }
+            if (unpack.exitCode != 0 || unpack.timedOut) return null
+            val kernel = File(dir, "kernel")
+            if (!kernel.isFile || kernel.length() == 0L) return null
+            if (compression == null) return sha256(kernel)
+            val dec = MagiskBoot.exec(context, listOf("decompress", "kernel", "kernel.check"), dir, 180_000) { }
+            if (dec.exitCode != 0 || dec.timedOut) return null
+            val check = File(dir, "kernel.check")
+            if (!check.isFile || check.length() == 0L) return null
+            sha256(check)
+        }.getOrNull()
     }
 
     private fun finishFailure(title: String, detail: String, code: String?) {

@@ -93,4 +93,91 @@ object Elf {
             String(buf, 0, 4, Charsets.US_ASCII) == "AVBf"
         }
     }.getOrDefault(false)
+
+    /**
+     * AVB footer 结构（`AvbFooter`，小端，共 64 B，位于镜像最后 64 字节）：
+     * ```
+     * offset  0  magic[4] = "AVBf"
+     * offset  4  version_major  (u32)
+     * offset  8  version_minor  (u32)
+     * offset 12  original_image_size (u64)
+     * offset 20  vbmeta_offset  (u64)
+     * offset 28  vbmeta_size    (u64)
+     * offset 36  reserved[28]
+     * ```
+     * 内嵌 vbmeta 区段 = `[len - vbmeta_offset - vbmeta_size, len - vbmeta_offset)`。
+     */
+    data class AvbFooter(
+        val magic: String,
+        val versionMajor: Long,
+        val versionMinor: Long,
+        val originalImageSize: Long,
+        val vbmetaOffset: Long,
+        val vbmetaSize: Long,
+        val fileLength: Long,
+    ) {
+        /** vbmeta 区段在整个文件中的起点；非法时返回 null */
+        fun vbmetaStart(): Long? {
+            if (vbmetaSize <= 0L) return null
+            val start = fileLength - vbmetaOffset - vbmetaSize
+            if (start < 0L || start + vbmetaSize > fileLength) return null
+            return start
+        }
+    }
+
+    fun readAvbFooter(file: File): AvbFooter? = runCatching {
+        val len = file.length()
+        if (len < 64) return null
+        RandomAccessFile(file, "r").use { raf ->
+            raf.seek(len - 64)
+            val buf = ByteArray(64)
+            if (raf.read(buf) < 64) return null
+            fun u32(off: Int): Long = (buf[off].toLong() and 0xFF) or
+                ((buf[off + 1].toLong() and 0xFF) shl 8) or
+                ((buf[off + 2].toLong() and 0xFF) shl 16) or
+                ((buf[off + 3].toLong() and 0xFF) shl 24)
+
+            fun u64(off: Int): Long = u32(off) or (u32(off + 4) shl 32)
+            val magic = String(buf, 0, 4, Charsets.US_ASCII)
+            if (magic != "AVBf") return null
+            AvbFooter(
+                magic = magic,
+                versionMajor = u32(4),
+                versionMinor = u32(8),
+                originalImageSize = u64(12),
+                vbmetaOffset = u64(20),
+                vbmetaSize = u64(28),
+                fileLength = len,
+            )
+        }
+    }.getOrNull()
+
+    /**
+     * 比对两个文件中同一区段是否逐字节相同。
+     * @return null = 相同；否则返回**首个差异的文件绝对偏移**
+     */
+    fun firstDiffOffset(a: File, b: File, offset: Long, size: Long): Long? = runCatching {
+        if (offset < 0L || size <= 0L) return null
+        RandomAccessFile(a, "r").use { ra ->
+            RandomAccessFile(b, "r").use { rb ->
+                if (ra.length() < offset + size || rb.length() < offset + size) return offset
+                ra.seek(offset)
+                rb.seek(offset)
+                val bufA = ByteArray(64 * 1024)
+                val bufB = ByteArray(64 * 1024)
+                var consumed = 0L
+                while (consumed < size) {
+                    val want = minOf((size - consumed), bufA.size.toLong()).toInt()
+                    val readA = ra.read(bufA, 0, want)
+                    val readB = rb.read(bufB, 0, want)
+                    if (readA != readB) return offset + consumed
+                    if (readA <= 0) break
+                    for (i in 0 until readA) {
+                        if (bufA[i] != bufB[i]) return offset + consumed + i
+                    }
+                    consumed += readA
+                }
+                null
+            }
+        }.getOrNull()
 }

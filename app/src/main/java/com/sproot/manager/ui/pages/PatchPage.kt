@@ -241,6 +241,23 @@ fun PatchPage(modifier: Modifier = Modifier) {
                             valueColor = if (state.kernelEqualLength) MiuixTheme.colorScheme.onSurfaceContainer
                             else MiuixTheme.colorScheme.error,
                         )
+                        // D6：AVB 结构校验（阻断式；此处展示通过后的结论/降级原因）
+                        if (state.avbStatus.isNotBlank()) {
+                            InfoRow("AVB 校验（AVB-1/2/3）", state.avbStatus)
+                        }
+                        // D1：开机自启注入结果
+                        if (state.rcTarget.isNotBlank()) {
+                            InfoRow(
+                                "开机自启（AP daemon）",
+                                if (state.rcInjected) {
+                                    "已注入（target=${state.rcTarget}）"
+                                } else {
+                                    "未注入（target=${state.rcTarget}，原因=${state.rcReason}）—— 产物仍合规，可手动启动 AP"
+                                },
+                                valueColor = if (state.rcInjected) MiuixTheme.colorScheme.onSurfaceContainer
+                                else MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            )
+                        }
                         state.reportPath?.let { InfoRow("引擎报告", it, monospace = true) }
                         state.backupSha1?.let { InfoRow("原镜像备份", "sha1=$it", monospace = true) }
 

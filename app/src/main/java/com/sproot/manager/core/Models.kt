@@ -70,6 +70,15 @@ data class PatchUiState(
     val kernelBytes: Long = 0L,
     val kernelEqualLength: Boolean = false,
     val backupSha1: String? = null,
+    // D6 AVB 断言结果
+    val avbStatus: String = "",
+    val avbFooterPresent: Boolean = false,
+    val avbLengthEqual: Boolean = false,
+    val avbVbmetaEqual: Boolean = false,
+    // D1 开机自启注入结果
+    val rcInjected: Boolean = false,
+    val rcTarget: String = "",
+    val rcReason: String = "",
     val reportPath: String? = null,
     val logPath: String? = null,
     val rootKey: String? = null,
