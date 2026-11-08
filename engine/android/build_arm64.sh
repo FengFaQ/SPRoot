@@ -113,6 +113,10 @@ write_meta() {
       echo "jni_soname=$("$readelf" -dW "$so" | awk '/SONAME/{gsub(/[][]/,"",$NF); print $NF}')"
       echo "jni_needed=$("$readelf" -dW "$so" | awk '/NEEDED/{print $NF}' | tr '\n' ',' | sed 's/,$//')"
       echo "jni_layout=$("$readelf" -hW "$so" | awk -F: '/Type/{gsub(/ /,"",$2); print $2}')"
+      echo "jni_class=me.sproot.patch.NativeEngine"
+      echo "jni_load_library=skrootpatch"
+      echo "jni_binding_version=2"
+      echo "jni_symbols=$("$nm" -D --defined-only "$so" | awk '{print $3}' | grep '^Java_' | sort | tr '\n' ',' | sed 's/,$//')"
     fi
   } > "$OUTROOT/ENGINE-META.txt"
   if [[ -f "$so" ]]; then

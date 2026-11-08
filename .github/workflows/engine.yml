@@ -110,6 +110,21 @@ jobs:
           set -e
           echo "qemu contract: 101/102 + no-output-on-failure OK"
 
+      - name: JNI 符号与客户端包名对齐断言（防 UnsatisfiedLinkError）
+        # 客户端类：me.sproot.patch.NativeEngine（object，@JvmStatic external fun）
+        # → JNI 符号必须严格为 Java_me_sproot_patch_NativeEngine_<method>
+        run: |
+          set -euo pipefail
+          J=engine/android/build/arm64/jni/libskrootpatch.so
+          NM=$(ls "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm)
+          SYMS=$("$NM" -D --defined-only "$J" | awk '{print $3}' | grep '^Java_' | sort)
+          echo "$SYMS"
+          echo "$SYMS" | grep -qx 'Java_me_sproot_patch_NativeEngine_patch'
+          echo "$SYMS" | grep -qx 'Java_me_sproot_patch_NativeEngine_engineVersion'
+          # 不能残留旧 ABI 符号（旧命名/旧包名）
+          ! echo "$SYMS" | grep -q 'Java_com_sproot_manager'
+          echo "JNI symbols OK: me.sproot.patch.NativeEngine {patch, engineVersion}"
+
       - name: T-12 强断言（合成 bootimg，无需样本，必跑）
         # 强判据：repack 后回读 kernel 段 sha256 必须 == patch 输出 sha256（不是只比长度）。
         # verify_artifact.sh 的 A7 段用合成 boot.img 覆盖这条回归；此处断言其 PASS 文本。

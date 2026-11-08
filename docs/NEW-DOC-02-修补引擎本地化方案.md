@@ -15,10 +15,10 @@
 | 项 | 结论 |
 |---|---|
 | 旧病根 | 唯一产物 `engine/src/skroot-patch` 是**宿主 x86-64 glibc 动态 ELF**（`e_machine=0x3E`、带 `PT_INTERP=/lib64/ld-linux-x86-64.so.2`），并且从未进 APK。详见 NEW-DOC-03。 |
-| 本方案 | `engine/android/build_arm64.sh` 用 **NDK r27c clang 18.0.3** 交叉编译同一份 C++ 源码（含新增内置 bootimg 处理），产出 **AArch64** 两种形态：①静态可执行 `libskrootpatch.so`（2,909,504 B）②JNI 共享库 `libskpatchjni.so`（2,975,528 B）。两者均通过 ELF/契约断言。 |
+| 本方案 | `engine/android/build_arm64.sh` 用 **NDK r27c clang 18.0.3** 交叉编译同一份 C++ 源码（含新增内置 bootimg 处理），产出 **AArch64** 两种形态：①静态可执行 `skroot-patch`（2,909,504 B，工具/排障用，**不进 APK**）②**JNI 共享库 `libskrootpatch.so`**（2,975,560 B，`System.loadLibrary("skrootpatch")`，进 `jniLibs`）。两者均通过 ELF/契约断言。 |
 | 关键坑（已实测） | NDK 静态可执行文件必须用 **`ANDROID_API>=29`** 编译，否则 `PT_TLS p_align=8`，bionic 启动即 abort；API≥29 才输出 `p_align=0x40`。 |
 | 无真机验证 | `verify_artifact.sh`：Tier A（ELF/契约，qemu-user 可跑，**ALL PASS**）+ Tier B（真内核字节级断言）。**已用魅族 21 官方 boot.img 全链实测**：抽 kernel sha256 与 qa ground truth 一致、补丁 rc=0、等长、可确定性复现、重打包等长。 |
-| 推荐集成 | **主形态 JNI（`libskpatchjni.so` + `System.loadLibrary`）**，次形态静态 exec（从 `nativeLibraryDir` 真实路径 exec，**禁止** symlink 到 `filesDir`）。 |
+| 推荐集成 | **主形态 JNI（`libskrootpatch.so` + `System.loadLibrary("skrootpatch")`）**，次形态静态 exec（`skroot-patch` 从 `nativeLibraryDir` 真实路径 exec，**禁止** symlink 到 `filesDir`；该可执行件默认不进 APK）。 |
 | 实测编译耗时 | 全量 100+ TU，12 核并行 **18 秒**（`make objs`，见 §3.4）。 |
 | 打包工具 | **magiskboot v31.1 ARM64**（SKRoot 官方路径；988,984 B，静态 AArch64，sha256 `97e9ec75…bb54`），CI 内固定版本+哈希校验并随 artifact 分发；自研 bootimg 保留为交叉校验/回退（§7）。**禁止 AIK**。 |
 | CI 证据 | ✅ **run 42486757913**（engine-arm64, v2, aee97046）**success**，artifact `skroot-engine-arm64`（1,846,449 B）；ELF/契约 6 项断言全绿（§5.2）。 |
@@ -125,9 +125,9 @@ make -C engine/src objs -j12 OBJDIR=<build>/jni/obj-a29 \
   CXX=$NDKB/aarch64-linux-android29-clang++ CC=$NDKB/aarch64-linux-android29-clang \
   CXXFLAGS="-std=c++2a -O2 -Wall -fPIC -fexceptions -frtti -DSPROOT_NO_CLI_MAIN=1 <同 INCLUDES/DEFINES>"
 $NDKB/aarch64-linux-android29-clang++ -std=c++2a -O2 -fPIC -c jni/skroot_patch_jni.cpp -o <obj>/jni_wrapper.o
-$NDKB/aarch64-linux-android29-clang++ -shared -static-libstdc++ -o <build>/jni/libskpatchjni.so \
+$NDKB/aarch64-linux-android29-clang++ -shared -static-libstdc++ -Wl,-soname,libskrootpatch.so -o <build>/jni/libskrootpatch.so \
   <obj>/jni_wrapper.o $(find <obj> -name '*.o' ! -name jni_wrapper.o)
-llvm-strip --strip-all <build>/jni/libskpatchjni.so
+llvm-strip --strip-all <build>/jni/libskrootpatch.so
 ```
 
 **asmjit / capstone 如何编**：两者都是**源码内编**（非预编译库），asmjit 只编 `asmjit/arm/*` + `asmjit/core/*`（**裁掉 x86 后端可省 ~200 KB**，当前 Makefile 仍包含 x86 源，见 §10-R3），capstone 只编 `arch/AArch64` + 公共 `cs.c/MC*.c/SStream.c/utils.c/Mapping.c`。两者与目标架构无关（asmjit 是「生成 arm64 机器码」，capstone 是「反汇编 arm64」），可在任意宿主上交叉编译，实测 0 报错（仅 263 处 `-Wunused-function` 类告警）。
@@ -202,6 +202,25 @@ object NativeEngine {
 - 优点：**完全绕过 exec 限制**（Android 10+ `untrusted_app` 对 app 私有目录 executables 的 W^X/app_data_file 约束不适用）；一次 `System.loadLibrary` 即可调用；无 shell/busybox 依赖。
 - 代价：引擎崩溃（asmjit/capstone 断错）会连带 App 进程；建议在 `Thread` + `try/catch` 中调用，并把「引擎进程级崩溃」纳入验收（见 §6 Tier C 建议）。
 
+#### 4.1.1 JNI ABI 契约（与客户端逐字对齐，防 UnsatisfiedLinkError）
+
+| 项 | 值（**权威**） |
+|---|---|
+| 库文件名（进 `jniLibs/arm64-v8a/`） | **`libskrootpatch.so`** |
+| `System.loadLibrary` 实参 | **`"skrootpatch"`** |
+| ELF SONAME | `libskrootpatch.so`（与文件名一致；loadLibrary 按**文件名**查找，SONAME 仅用于依赖解析，二者保持一致最不易出错） |
+| Java 类（FQCN） | `me.sproot.patch.NativeEngine`（Kotlin `object` + `@JvmStatic external fun`） |
+| 方法 1 | `patch(inPath: String, outPath: String, key: String?, jsonSink: String?, workdir: String?): Int` |
+| 符号 1 | `Java_me_sproot_patch_NativeEngine_patch` |
+| 方法 2 | `engineVersion(): String` |
+| 符号 2 | `Java_me_sproot_patch_NativeEngine_engineVersion` |
+| C 侧签名 | `(JNIEnv*, jclass, jstring, jstring, jstring, jstring, jstring) -> jint` / `(JNIEnv*, jclass) -> jstring` |
+
+- `@JvmStatic` 只是把 Kotlin object 的方法变成静态桥接；JNI **按符号名查找**，静态/实例两种形态下符号名相同，故当前 C 侧第二参用 `jclass` 均安全（现有客户端用 `@JvmStatic`）。
+- **CI 强断言**（`engine.yml`「JNI 符号与客户端包名对齐断言」）：`llvm-nm -D` 必须精确出现上述两个符号，且**不得残留**旧包名符号（如 `Java_com_sproot_manager_*`），否则 CI 红。
+- `ENGINE-META.txt` 已固化：`jni_class=me.sproot.patch.NativeEngine`、`jni_load_library=skrootpatch`、`jni_soname=libskrootpatch.so`、`jni_symbols=…`、`jni_binding_version=2`，客户端可机器校验。
+- ⚠️ **旧名作废**：`libskpatchjni.so` / `System.loadLibrary("skpatchjni")` 为过渡期旧命名，客户端 `PatchEngine.kt` 的 `LIB_NAME` 必须改为 `"skrootpatch"`、`LIB_FILE_NAME` 改为 `"libskrootpatch.so"`（lead 已通知客户端，方案 A：改客户端、不加别名副本，保持单一事实源）。
+
 ### 4.2 形态 B（备选/排障）：静态可执行文件
 
 - 产物：`skroot-patch`（**裸名，不进 jniLibs**）；如需随 APK 分发再额外命名 `libskrootpatchexec.so`（仅 exec、永不 loadLibrary），二选一不得同名
@@ -215,12 +234,12 @@ object NativeEngine {
 
 ```kotlin
 val copyEngine by tasks.registering(Copy::class) {
-    from(rootProject.file("engine/dist/libskpatchjni-arm64.so"))
+    from(rootProject.file("engine/dist/libskrootpatch-arm64-jni.so"))
     into(layout.projectDirectory.dir("src/main/jniLibs/arm64-v8a"))
-    rename { "libskpatchjni.so" }
+    rename { "libskrootpatch.so" }
 }
 val assertEngine by tasks.registering {
-    val f = file("src/main/jniLibs/arm64-v8a/libskpatchjni.so")
+    val f = file("src/main/jniLibs/arm64-v8a/libskrootpatch.so")
     doLast {
         require(f.isFile) { "引擎缺失：${f.absolutePath}（先跑 engine/android/build_arm64.sh）" }
         val bytes = f.readBytes()
