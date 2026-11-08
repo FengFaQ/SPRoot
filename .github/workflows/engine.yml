@@ -110,6 +110,15 @@ jobs:
           set -e
           echo "qemu contract: 101/102 + no-output-on-failure OK"
 
+      - name: T-12 强断言（合成 bootimg，无需样本，必跑）
+        # 强判据：repack 后回读 kernel 段 sha256 必须 == patch 输出 sha256（不是只比长度）。
+        # verify_artifact.sh 的 A7 段用合成 boot.img 覆盖这条回归；此处断言其 PASS 文本。
+        run: |
+          set -euo pipefail
+          LOG=$(bash engine/android/verify_artifact.sh 2>&1 | tee /dev/stderr)
+          echo "$LOG" | grep -q 'PASS  A7b' || { echo "T-12 强断言未通过"; exit 1; }
+          echo "$LOG" | grep -q 'RESULT: ALL PASS' || { echo "verify_artifact 存在失败项"; exit 1; }
+
       - name: Bootimg chain regression（有样本才跑）
         if: hashFiles('samples/meizu21/boot.img') != ''
         run: |
