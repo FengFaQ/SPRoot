@@ -258,7 +258,8 @@ tasks.named("preBuild") { dependsOn(copyEngine, assertEngine) }
 | 本地等价 CI 构建（同脚本/同 NDK/同断言） | ✅ 通过（§6.1 ALL PASS） |
 | 本地 qemu 跑**真实内核**（arm64 产物） | ✅ 通过：33,892,864 B 真内核 `rc=0`，耗时 226 s，产物 sha256 与宿主构建**完全一致**（跨架构确定性，§6.2 B9） |
 | GitHub Actions 运行 | 🔴 **第 1 次 run 失败**（[run 42486267958](https://github.com/FengFaQ/SPRoot/actions/runs/42486267958)，commit b53c58e）：**失败点为 `Install qemu-user-static` 步骤**（ubuntu-latest 的 `apt-get update` 因第三方源 403 失败），构建/断言步骤全部 skipped。已修复：`update` 容错 + apt 安装失败回落下载静态 `qemu-aarch64-static`（multiarch release），并重推 v2 触发新 run |
-| CI 链接归档 | 待第 2 次 run 通过后归档正式链接（人类规则：交付物只认 CI artifacts） |
+| **正式绿 run（含 magiskboot）** | ✅ **run 42487185268**（engine-arm64, v2, 5749ef48）**success**：11/11 步骤全绿，artifacts **2 个** → `skroot-engine-arm64`（2,337,542 B，含两形态 + SHA256SUMS + magiskboot）与 `magiskboot-arm64`（491,115 B，含 `magiskboot` + `magiskboot-meta.txt`）。链接：https://github.com/FengFaQ/SPRoot/actions/runs/42487185268 |
+| 历史绿 run（无 magiskboot） | run 42486757913（aee97046）success，1 artifact（1,846,449 B） |
 
 ---
 
