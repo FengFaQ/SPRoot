@@ -156,28 +156,40 @@ object Elf {
      * 比对两个文件中同一区段是否逐字节相同。
      * @return null = 相同；否则返回**首个差异的文件绝对偏移**
      */
-    fun firstDiffOffset(a: File, b: File, offset: Long, size: Long): Long? = runCatching {
+    fun firstDiffOffset(a: File, b: File, offset: Long, size: Long): Long? {
         if (offset < 0L || size <= 0L) return null
-        RandomAccessFile(a, "r").use { ra ->
-            RandomAccessFile(b, "r").use { rb ->
-                if (ra.length() < offset + size || rb.length() < offset + size) return offset
-                ra.seek(offset)
-                rb.seek(offset)
-                val bufA = ByteArray(64 * 1024)
-                val bufB = ByteArray(64 * 1024)
-                var consumed = 0L
-                while (consumed < size) {
-                    val want = minOf((size - consumed), bufA.size.toLong()).toInt()
-                    val readA = ra.read(bufA, 0, want)
-                    val readB = rb.read(bufB, 0, want)
-                    if (readA != readB) return offset + consumed
-                    if (readA <= 0) break
-                    for (i in 0 until readA) {
-                        if (bufA[i] != bufB[i]) return offset + consumed + i
+        return runCatching {
+            RandomAccessFile(a, "r").use { ra ->
+                RandomAccessFile(b, "r").use { rb ->
+                    if (ra.length() < offset + size || rb.length() < offset + size) {
+                        return@runCatching offset
                     }
-                    consumed += readA
+                    ra.seek(offset)
+                    rb.seek(offset)
+                    val bufA = ByteArray(64 * 1024)
+                    val bufB = ByteArray(64 * 1024)
+                    var consumed = 0L
+                    var diff: Long? = null
+                    while (consumed < size && diff == null) {
+                        val want = minOf(size - consumed, bufA.size.toLong()).toInt()
+                        val readA = ra.read(bufA, 0, want)
+                        val readB = rb.read(bufB, 0, want)
+                        if (readA != readB) {
+                            diff = offset + consumed
+                            break
+                        }
+                        if (readA <= 0) break
+                        for (i in 0 until readA) {
+                            if (bufA[i] != bufB[i]) {
+                                diff = offset + consumed + i
+                                break
+                            }
+                        }
+                        consumed += readA
+                    }
+                    diff
                 }
-                null
             }
         }.getOrNull()
+    }
 }
