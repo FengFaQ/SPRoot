@@ -20,7 +20,9 @@
 | 无真机验证 | `verify_artifact.sh`：Tier A（ELF/契约，qemu-user 可跑，**ALL PASS**）+ Tier B（真内核字节级断言）。**已用魅族 21 官方 boot.img 全链实测**：抽 kernel sha256 与 qa ground truth 一致、补丁 rc=0、等长、可确定性复现、重打包等长。 |
 | 推荐集成 | **主形态 JNI（`libskpatchjni.so` + `System.loadLibrary`）**，次形态静态 exec（从 `nativeLibraryDir` 真实路径 exec，**禁止** symlink 到 `filesDir`）。 |
 | 实测编译耗时 | 全量 100+ TU，12 核并行 **18 秒**（`make objs`，见 §3.4）。 |
-| 未完成 | ①`engine.yml` 已在工作区就绪并待推 v2 触发 run（本机不产出交付物，交付物只认 CI artifacts）②AVB/vbmeta 刷入策略待独立子智能体结论后落实现（§7.3）。 |
+| 打包工具 | **magiskboot v31.1 ARM64**（SKRoot 官方路径；988,984 B，静态 AArch64，sha256 `97e9ec75…bb54`），CI 内固定版本+哈希校验并随 artifact 分发；自研 bootimg 保留为交叉校验/回退（§7）。**禁止 AIK**。 |
+| CI 证据 | ✅ **run 42486757913**（engine-arm64, v2, aee97046）**success**，artifact `skroot-engine-arm64`（1,846,449 B）；ELF/契约 6 项断言全绿（§5.2）。 |
+| AVB/刷入 | 主路径 = **只刷 boot**（`--slot=all`），**禁止**动 vbmeta / `--disable-verification`；产物须严格等于分区大小且逐字节保留内嵌 vbmeta+footer（§7.4） |
 
 ---
 
@@ -320,7 +322,8 @@ $E --bootimg repack         --in samples/meizu21/boot.img --kernel kernel.patche
 | B4 | 产物含 `key[0:47]+NUL` 窗口（47 字符提权串，CALL v1.1 **E1**） |
 | B5 | `report.json`：`input/output.sha256+size` 齐全且等长、`hidden_dir_prefix==key[0:16]`、`hook_table` 为数组（含 `blob_count/root_key_region`）、`kernel_version=6.1.25`、`errors=[]` |
 | B6 | NDJSON 终态 `result` 唯一且为最后一行 |
-| B7 重打包 | `new-boot.img` **等长**（100,663,296 B）；kernel 段 == `kernel.patched`；差异只落在 kernel 段 |
+| B7 重打包（magiskboot 主路径） | `magiskboot unpack` → patch → **`cp kernel.patched kernel`** → `magiskboot repack boot.img` → `new-boot.img` **等长 100,663,296 B**；回读 kernel 段 == `kernel.patched`；内嵌 vbmeta 2,496 B 与 `AVBf` footer **逐字节保留**。⚠️ 实测坑：不覆盖 `kernel` 时 repack 会静默用原始 kernel（补丁丢失） |
+| B7b 双路交叉校验 | `magiskboot unpack` 的 `kernel` 与自研 `--bootimg extract-kernel` 的 sha256 均为 `4d445384…4841`（独立实现互证） |
 | B8 确定性 | 同输入同密钥两次运行产物 sha256 相同 |
 | B9 跨架构 | arm64 产物（qemu）与宿主 x86-64 产物输出**同一 sha256** |
 
@@ -341,52 +344,92 @@ $E --bootimg repack         --in samples/meizu21/boot.img --kernel kernel.patche
 
 ---
 
-## 7. bootimg 解包/重打包与刷入链（AVB）
+## 7. bootimg 解包/重打包与刷入链（magiskboot 主路径 + AVB 策略）
 
-### 7.1 为什么自己做（不引 magiskboot/kptools）
+### 7.1 主打包工具：magiskboot（ARM64，SKRoot 官方路径）
 
-旧链路三个阻断项里有两条是"外部件"：`libkptools.so` 构建期下载、`kpimg` 资产硬依赖（NEW-DOC-03 R3/R4）。KernelSU 的 `ksud` 用自研 bootimg 解析证明了"完全不依赖 magiskboot 也可行"。SPRoot 更简单：**SK 只 patch kernel 段，不改 ramdisk**（无需 KSU 式 init→init.real 替换），所以自研成本很低。
+依据：SKRoot 官方提示使用 **magiskboot**；**AIK（Android.Image.Kitchen）不支持 Linux 6.0+ 内核，禁止任何形式使用**；禁止非官方 Windows 版 magiskboot。
 
-### 7.2 已实现（`engine/src/bootimg.{h,cpp}`，随引擎编进 arm64 产物）
+| 项 | 值（实测） |
+|---|---|
+| 来源 | Magisk 官方 release **v31.1**：`https://github.com/topjohnwu/Magisk/releases/download/v31.1/Magisk-v31.1.apk` |
+| APK | 10,679,283 B，sha256 `89cefac0a318afa39fb3880c45c87b036c05bc1ebf02a7a715b7f8d7c26ac6e7` |
+| 取件 | `unzip -j Magisk-v31.1.apk 'lib/arm64-v8a/libmagiskboot.so'` → 重命名 `magiskboot`（**它是可执行文件，只是名字带 .so**） |
+| 二进制 | **988,984 B**，sha256 `97e9ec75731103d31c9e1effca7a50c6444309ce8f78c2ec27e9fe721da4bb54` |
+| 形态 | `ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), statically linked, BuildID[sha1]=72c3089b…, stripped` → **全静态，无运行时依赖** |
+| 运行验证 | `qemu-aarch64-static ./magiskboot` → 打印 `MagiskBoot - Boot Image Modification Tool` + 动作列表 ✅ |
 
-| 子命令 | 作用 | 实测（魅族 21 boot.img） |
-|---|---|---|
-| `--bootimg info --in boot.img` | 打印 header/kernel/ramdisk/压缩/AVB 全字段 | ✅ v4 / 1584 / 4096 / kernel@4096 33,892,864 raw |
-| `--bootimg extract-kernel --in boot.img --out kernel` | 抽出 kernel Image（拒绝压缩内核并说明如何解压） | ✅ sha256 与 qa ground truth 一致 |
-| `--bootimg unpack --in boot.img --outdir DIR` | 产出 `DIR/kernel` + `DIR/bootimg.info.txt` | ✅ |
-| `--bootimg repack --in boot.img --kernel patched --out new-boot.img [--strip-avb]` | 等长回填 kernel 段；`--strip-avb` 截断 AVB 尾部区 | ✅ 等长 100,663,296 B |
+CI 集成（`.github/workflows/engine.yml` 已加步骤）：下载固定版本 APK → `sha256sum -c` 校验 APK → 解出 arm64 `libmagiskboot.so` → 重命名 + `chmod 0755` → `file`/`readelf` 断言 AArch64 → 校验二进制 sha256 → 生成 `magiskboot-meta.txt`（版本/APK sha256/二进制 sha256/来源 URL/GPL-3 声明）→ 作为独立 artifact **`magiskboot-arm64`** 上传，并同时拷入 `skroot-engine-arm64` 包内。
 
-约束与安全边界：
-- **只接受等长 kernel**（SK 补丁等长；不等长直接 E240 拒绝落盘，防"半成品写进 boot"）。
-- 压缩内核（gzip/lz4）**明确报错**而非猜测处理；样本机为 raw，故 MVP 不受影响。后续若目标机为压缩内核，vendor 一个 inflate/lz4 单文件实现即可（CI 内可测）。
-- 不处理 ramdisk/dtb/vendor_boot/v4 boot signature（SK 路线不需要）。
+### 7.2 打包链（实测跑通，魅族 21 官方 boot.img）
 
-### 7.3 AVB 与刷入链（**MVP 开机关键路径**）
-
-实测解析（`bootimg info` + 手工核对）：
-
+```bash
+# 0) 取件与校验（CI 内固定版本 + sha256，禁止"最新版"漂移）
+./magiskboot unpack boot.img          # 产出 kernel（本例 ramdisk_size=0，无 ramdisk.cpio）
+# 1) SK 引擎 patch kernel（二进制等长 patch）
+skroot-patch --in kernel --out kernel.patched --key <48字符> --json ev.ndjson
+# 2) ⚠️ 关键：magiskboot repack 只认文件名 `kernel`
+#    实测踩坑：若 cwd 里同时存在 kernel 与 kernel.patched，repack 会用 **kernel（原始的）**，
+#    补丁静默丢失。必须先覆盖：cp kernel.patched kernel（或 mv）
+cp kernel.patched kernel
+# 3) 以原镜像为模板重打包
+./magiskboot repack boot.img          # → new-boot.img
+# 4) 校验（等长 + AVB 区逐字节保留 + kernel 段 == patched）
 ```
-boot.img:      header v4, kernel@0x1000 (33,892,864 raw), ramdisk_size=0
-尾部:          AVBf footer @ 100,663,232（镜像末 64B，大端）
-               original_image_size = 33,898,496   ← 有效镜像长度（header 页 + kernel pages）
-               vbmeta_offset      = 33,898,496   ← 内嵌 vbmeta 紧随其后
-               vbmeta_size        = 2,496
-文件长度 100,663,296 = fastboot 分区尺寸（其余为 0 填充）
-另有独立 vbmeta.img 12,288 B（magic AVB0，alg=SHA256_RSA2048）→ 顶层签名链
+
+实测结果：
+
+| 断言 | 结果 |
+|---|---|
+| `magiskboot unpack` 字段 | `HEADER_VER[4] KERNEL_SZ[33892864] RAMDISK_SZ[0] PAGESIZE[4096] KERNEL_FMT[raw] VBMETA` |
+| magiskboot 解出的 `kernel` sha256 | `4d445384c046f2ba2de856b3215de8d2be83a9ccad115948a34471cde3098481`（与 qa ground truth、自研解析**三方一致**） |
+| patch rc | 0（`hook_count=19`，`kernel_version=6.1.25`） |
+| `magiskboot repack` 产物 | `new-boot.img` = **100,663,296 B = 分区大小**（与官方等长） |
+| kernel 段回读 | 自研 `--bootimg extract-kernel` 抽出 sha256 = `399ac479…3f2f` == `kernel.patched`（补丁确实进镜像） |
+| AVB 区 | `AVBf` footer 保留 ✅；内嵌 vbmeta（2,496 B @33,898,496）**逐字节保留** ✅ |
+| 反例记录 | 未 `cp` 覆盖 `kernel` 时 repack 产物 kernel 仍为原始 `4d445384…` → **静默丢补丁**（已写入测试项 T-12：断言产物 kernel==patched） |
+
+### 7.3 自研 bootimg 的定位：交叉校验 / 回退 / 结构化信息
+
+`engine/src/bootimg.{h,cpp}`（`--bootimg info|extract-kernel|unpack|repack`）**保留**，但不作为主打包器：
+
+1. **交叉校验**：`magiskboot unpack` 与自研 `extract-kernel` 双路取 kernel，比对 sha256（本例一致 → 证明两条独立实现解析一致，qa 的 TBD-8 复验项）。
+2. **回退**：magiskboot 缺件/不被设备接受时，可用自研 repack（等长原地回填，保留全部 AVB 区字节）完成打包。
+3. **结构化信息**：`--bootimg info` 输出 header/压缩/AVB 字段，供 UI 展示与门禁断言（比 magiskboot 的文本输出更易机器判定）。
+4. 自研实现同样遵守「失败不落盘」「等长才写」铁律（`repack` 长度不等直接 E240）。
+
+### 7.4 AVB 与刷入链（**结论已按专项调查修正**）
+
+事实层（实测）：
+```
+boot.img: header v4, kernel@0x1000 raw 33,892,864 B, ramdisk_size=0
+尾部:     AVBf footer @100,663,232（末 64B, 大端）
+          original_image_size=33,898,496  vbmeta_offset=33,898,496  vbmeta_size=2,496
+文件长:   100,663,296 = fastboot 分区大小（余下为 0 填充）
+独立 vbmeta.img: 12,288 B, magic AVB0, 算法 SHA256_RSA4096
 ```
 
-结论（⚠️ **主路径待定，勿据此刷机**）：
+专项调查结论（MEIZU21GKI / KernelSU / KernelPatch 三路源码 + 人类实测反馈）：
+- **三家都不碰 AVB 密码学**：不重签、不改 vbmeta flags、不用 `--disable-verification`，只保证镜像结构合法（footer/vbmeta blob 在、总长 == 分区大小），**依靠已解锁 bootloader 跳过验证**开机。
+- 该机 `vbmeta.img` 对 boot 只有 **Chain Partition descriptor（RSA4096）**，boot 的 hash descriptor 在 **boot.img 内嵌 vbmeta** 里；没有厂商私钥，改动后的 boot 在**锁态**必然验证失败。
+- `--disable-verification` 既治不了病，又正是**清数据**的来源 → **禁止**。
 
-1. **事实层（已实测确认）**：kernel 字节变化 → boot 内嵌 vbmeta 的 hash 失配 → AVB 链式校验失败。**校验未被关闭时，刷入必然触发验证失败/回滚**。
-2. **策略层（存在冲突意见，需实测定案）**：
-   - 方案甲（保守）：`fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img` + `fastboot flash --slot=all boot new-boot.img`。
-     ⚠️ 人类反馈：**魅族关闭 AVB 会强制清数据**，与本方案目标冲突。
-   - 方案乙（AP/KSU 实际做法，待验证）：**只刷 patched boot、完全不碰 vbmeta**——依据是 APatch/KernelSU 在该机均可正常开机且不清数据，推测**解锁状态下该机不强制校验 boot**（可能仅校验 vbmeta 链或依赖 bootloader 解锁态放行）。
-   - 方案丙（备选）：`--bootimg repack --strip-avb` 去掉 boot 的 AVBf footer/内嵌 vbmeta 后再刷。
-3. **定案条件**：等 AVB 专项（含人类 MEIZU21GKI 项目源码）结论 + 真机刷入实测；**不能开机则记录阻断并用官方全量包回滚**（`flash.bat.reference` 可全量回滚）。回滚保障：刷前按 sha1 内容寻址备份原 boot.img（学 KSU）。
-4. 若最终确定"只刷 boot"可行，则 `--patch-vbmeta-flags` 无必要；若必须改 vbmeta flags，再补该子命令（实现成本低：改 `AVB0` header offset 120 的 u32 flags 即可，已有解析基础）。
+**主路径（MVP 采用）**：
+```bash
+fastboot flash --slot=all boot sproot-<device>-boot.img
+fastboot reboot
+```
+- **明确禁止**：`flash/erase vbmeta`、`--disable-verity`、`--disable-verification`、重签/改 vbmeta flags。
+- 结构要求（实现已满足）：产物体积 **== 分区大小**（boot=100,663,296；init_boot=8,388,608）+ 内嵌 vbmeta 与 `AVBf` footer **逐字节保留**。
+- 备选（**仅结构异常时**，有风险）：`--bootimg repack --strip-avb` 去尾部 AVB 区；锁态/严格机型可能拒启，需真机验证。
+- 回滚：刷前按 **sha1 内容寻址**保存原 boot.img（学 KSU），失败可用官方全量包回滚（`flash.bat.reference`）。
+- 待验：真机刷入后能否开机（`fastboot` 在 A/B 双槽的 `--slot=all` 语义已与官方脚本一致）。
 
-> ⏳ 待办：AVB 专项结论同步后，把方案甲/乙/丙的最终判定回写本节（含真机是否清数据、是否可只刷 boot 的实测记录）。
+### 7.5 许可证（Magisk GPL-3.0 的聚合声明）
+
+magiskboot 来自 Magisk（**GPL-3.0**），我们以**独立可执行程序**随 APK/工具链分发 → 属 GPL 允许的「聚合（aggregate）」，**不传染**我们自研代码；义务是：①随包提供 GPL-3.0 文本；②在 NOTICE/许可清单标注来源（URL + 版本 + 二进制 sha256）；③若修改 magiskboot 源码则需公开修改。已生成 `magiskboot-meta.txt` 随 artifact 分发；NOTICE 条目由 task-8/architect 并入发布清单。
+
+> SKRoot 核心授权：人类已确认「有作者授权，可以调用」→ D-3 合规阻塞解除（不再需要 clean-room）；仍建议在 NOTICE 注明授权来源与范围。
 
 ## 8. 与契约对齐（DOC-C1 v1.0 / CALL v1.1）
 
@@ -485,7 +528,8 @@ KERNEL_IMAGE=samples/gki-kernel-arm64.Image bash engine/android/verify_artifact.
 
 | 组件 | 位置 | 许可证 | 结论 |
 |---|---|---|---|
-| **SKRoot（引擎核心来源）** | `upstream/SKRoot-linuxKernelRoot/`（`Lite_version/src/patch_kernel_root/*` 被 vendor 进 `engine/src/analyze|patch_*.cpp`） | **未声明：仓库无 LICENSE/COPYING，源文件无版权头** → 默认 **All rights reserved（proprietary）**，SPDX 无对应标识 | 🔴 **风险**：无授权即不可再分发/再许可。`engine/` 作为其衍生作品，**发布任何二进制（APK/引擎）前必须取得上游书面许可**，或对 core 做 clean-room 重写，或本项目仅内部使用不发布 |
+| **SKRoot（引擎核心来源）** | `upstream/SKRoot-linuxKernelRoot/`（`Lite_version/src/patch_kernel_root/*` 被 vendor 进 `engine/src/analyze|patch_*.cpp`） | **未声明（proprietary，无 SPDX）** | ✅ **已解除**（2026-11-08 人类确认「有作者授权，可以调用」）→ 不阻塞发布；建议 NOTICE 记录授权来源与范围。若后续对外分发仍需作者书面许可存档 |
+| **magiskboot（Magisk v31.1）** | CI 产物 `magiskboot-arm64`，随 APK/工具链分发 | **GPL-3.0** | ✅ 独立可执行「聚合」不传染：需随包 GPL-3.0 文本 + NOTICE 标注来源/版本/sha256（已生成 `magiskboot-meta.txt`） |
 | KernelPatch | `upstream/KernelPatch/LICENSE` | **GPL-2.0** | 我们已不 vendor 其源码、也不再调用 kptools（bootimg 自研），仅历史参考 → **不引入传染** |
 | asmjit | `engine/src/3rdparty/asmjit2-src/LICENSE.md` | **Zlib**（改写自 MIT 风格，宽松） | ✅ 兼容闭源/开源分发，保留版权声明即可 |
 | capstone | `engine/src/3rdparty/capstone-5.0.7/`（仅 include/ + src/，未附 LICENSE） | 上游 **BSD-3-Clause** | ✅ 宽松兼容；**行动项**：把上游 LICENSE.TXT/copyright 一并入库（避免"未附声明"的合规瑕疵） |

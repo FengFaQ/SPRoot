@@ -134,6 +134,27 @@ jobs:
           test "$(stat -c%s "$WORK/new-boot.img")" = "$(stat -c%s samples/meizu21/boot.img)"
           echo "bootimg chain OK: kernel 等长 + boot.img 等长"
 
+      - name: magiskboot ARM64（SKRoot 官方打包工具，固定版本 + 哈希断言）
+        run: |
+          set -euo pipefail
+          MK_VER=v31.1
+          MK_APK=Magisk-v31.1.apk
+          MK_APK_SHA=89cefac0a318afa39fb3880c45c87b036c05bc1ebf02a7a715b7f8d7c26ac6e7
+          MK_BIN_SHA=97e9ec75731103d31c9e1effca7a50c6444309ce8f78c2ec27e9fe721da4bb54
+          curl -sSL -o "$MK_APK" "https://github.com/topjohnwu/Magisk/releases/download/${MK_VER}/${MK_APK}"
+          echo "${MK_APK_SHA}  ${MK_APK}" | sha256sum -c -
+          mkdir -p dist
+          unzip -o -j "$MK_APK" "lib/arm64-v8a/libmagiskboot.so" -d dist/
+          mv dist/libmagiskboot.so dist/magiskboot
+          chmod 0755 dist/magiskboot
+          file dist/magiskboot | grep -q 'ARM aarch64'
+          readelf -h dist/magiskboot | grep -q 'AArch64'
+          echo "${MK_BIN_SHA}  dist/magiskboot" | sha256sum -c -
+          printf 'magisk_version=%s\nmagisk_apk=%s\nmagisk_apk_sha256=%s\nmagiskboot_sha256=%s\nsource=%s\nnote=GPL-3.0 aggregate; see NOTICE\n' \
+            "$MK_VER" "$MK_APK" "$MK_APK_SHA" "$MK_BIN_SHA" \
+            "https://github.com/topjohnwu/Magisk/releases/download/${MK_VER}/${MK_APK}" > dist/magiskboot-meta.txt
+          cat dist/magiskboot-meta.txt
+
       - name: Stage artifacts + checksums
         if: always()
         run: |
@@ -141,6 +162,8 @@ jobs:
           mkdir -p out
           cp engine/android/build/arm64/exec/libskrootpatch.so out/
           cp engine/android/build/arm64/jni/libskpatchjni.so   out/
+          if [ -f dist/magiskboot ]; then cp dist/magiskboot out/; fi
+          if [ -f dist/magiskboot-meta.txt ]; then cp dist/magiskboot-meta.txt out/; fi
           (cd out && sha256sum *.so > SHA256SUMS && cat SHA256SUMS)
 
       - uses: actions/upload-artifact@v4
@@ -148,4 +171,13 @@ jobs:
         with:
           name: skroot-engine-arm64
           path: out/
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: magiskboot-arm64
+          path: |
+            dist/magiskboot
+            dist/magiskboot-meta.txt
           retention-days: 30
