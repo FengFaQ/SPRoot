@@ -41,11 +41,25 @@ pub const KERNEL_KEY_LEN: usize = 47;
 /// Return the escalation token: the key truncated to [`KERNEL_KEY_LEN`].
 ///
 /// Accepts both 47- and 48-char keys so callers never have to care. Anything
-/// shorter than 47 is returned unchanged (the kernel compare will fail).
+/// shorter than 47 is returned unchanged (the kernel compare will fail). A key
+/// longer than the 48-position display format is an ABI mix-up: it is still
+/// reduced to 47 (the kernel's only notion of the key) but the anomaly is
+/// logged — never silent — so a wrong-ABI key does not look like a mere
+/// "kernel rejected the token" failure later (HANDOFF §6.8).
 pub fn escalation_token(key: &str) -> &str {
     let key = key.trim();
     match key.char_indices().nth(KERNEL_KEY_LEN) {
-        Some((idx, _)) => &key[..idx],
+        Some((idx, _)) => {
+            // 48 = 47 + the display-only position (C1 §2.2); only lengths
+            // beyond that mean two ABIs were mixed up.
+            if key.len() > KERNEL_KEY_LEN + 1 {
+                warn!(
+                    "[supercall] key is {} chars but the ABI is 47 (+1 display); using the first 47",
+                    key.len()
+                );
+            }
+            &key[..idx]
+        }
         None => key,
     }
 }

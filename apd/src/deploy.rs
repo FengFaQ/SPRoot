@@ -28,8 +28,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{assets, defs, secret, supercall};
 
-/// Minimum accepted key length: the kernel compares the first 47 characters.
-const MIN_KEY_LEN: usize = supercall::KERNEL_KEY_LEN;
+/// Key ABI length, **exact**: the AP-side key file holds 47 plain-text bytes and
+/// the kernel compares exactly those 47. Anything else is rejected (or, for the
+/// documented 48-position display format only, mapped once with a log line)
+/// rather than silently truncated — a 48/49-byte input truncated to 47 yields a
+/// token the kernel rejects, which turns an ABI mix-up into a silent
+/// privilege-escalation failure (HANDOFF §6.8, Skroot-Next lesson).
+const KEY_ABI_LEN: usize = supercall::KERNEL_KEY_LEN;
 
 /// Random hidden-file name length (contract v1.1 E2: random 16 chars, NOT `su`).
 const HIDDEN_NAME_LEN: usize = 16;
@@ -65,7 +70,10 @@ pub fn deploy(source: Option<PathBuf>) -> Result<()> {
         None => secret::read_key_file(Path::new(defs::SPROOT_KEY_FILE))
             .context("no key available (use --superkey-file)")?,
     };
-    validate_key(key.as_str())?;
+    // ABI normalisation happens exactly once, here, and is logged. Every writer
+    // below receives a value that is *already* 47 bytes, so no code path can
+    // truncate silently: `key_material` refuses anything that is not 47.
+    let key_abi = abi_key(key.as_str())?;
 
     let source_dir = match source {
         Some(dir) => dir,
@@ -104,13 +112,13 @@ pub fn deploy(source: Option<PathBuf>) -> Result<()> {
     // The key file is the start-chain's single point of failure: `?` aborts
     // deploy (non-zero exit, no "pretend success") when it cannot be written.
     info!("[deploy] step 5/10: key file (47 chars, no NUL)");
-    write_key_file(key.as_str())?;
+    write_key_file(key_abi.as_str())?;
 
     info!("[deploy] step 6/10: rc audit copy");
     install_rc_template()?;
 
     info!("[deploy] step 7/10: hidden su deployment");
-    let hidden_file = install_su(key.as_str(), &apd_src)?;
+    let hidden_file = install_su(key_abi.as_str(), &apd_src)?;
 
     info!("[deploy] step 8/10: allow list");
     init_allow_list()?;
@@ -173,19 +181,65 @@ pub fn undeploy(keep_modules: bool) -> Result<()> {
     Ok(())
 }
 
-fn validate_key(key: &str) -> Result<()> {
+/// Derive the **exactly 47-byte** key ABI material from the raw input, once, at
+/// the deployment boundary.
+///
+/// * 47 chars — canonical AP-side format, used as is;
+/// * 48 bytes — accepted with an explicit `warn!` (never silently). This is
+///   either the manager's 48-position display format (`SecretStore` generates
+///   48 chars and the last one is display-only — C1 §2.2 / contract v1.1 E1) or
+///   the kernel-inlined `47 + NUL` shape; both resolve to the first 47 bytes.
+///   The 48th byte must then be NUL, blank or `[A-Za-z0-9]`, otherwise it is a
+///   typo, not a display position;
+/// * every other length — hard error. 49+ is a *different* key from another ABI
+///   (the Skroot-Next mix-up); truncating it to 47 would produce a token the
+///   kernel silently rejects, i.e. exactly the silent escalation failure this
+///   function exists to prevent.
+///
+/// The result is a [`secret::SecretKey`] (mlock'ed, wiped on drop) and the only
+/// shape [`write_key_file`] accepts.
+fn abi_key(key: &str) -> Result<secret::SecretKey> {
     let trimmed = key.trim();
     ensure!(
-        trimmed.len() >= MIN_KEY_LEN,
-        "key too short ({} < {} chars)",
-        trimmed.len(),
-        MIN_KEY_LEN
+        trimmed.is_ascii(),
+        "key must be ASCII: 密钥 ABI 为 47 个 ASCII 字符 [A-Za-z0-9]"
     );
+    let len = trimmed.len();
+    if len == KEY_ABI_LEN + 1 {
+        let last = trimmed.as_bytes()[KEY_ABI_LEN];
+        ensure!(
+            last == 0 || (last as char).is_ascii_alphanumeric()
+                || (last as char).is_ascii_whitespace(),
+            "key length {len} but byte 48 is not NUL/blank/[A-Za-z0-9]: \
+             本项目密钥 ABI 为 47 字符（展示为 48 位含 NUL），请勿带 NUL 或多余字符"
+        );
+        if last == 0 || (last as char).is_ascii_whitespace() {
+            warn!(
+                "[deploy] 输入 {len} 字节（47 字符 + NUL/空白）：本项目密钥 ABI 为 47 字符，按 47 字节取前 47"
+            );
+        } else {
+            warn!(
+                "[deploy] 输入 {len} 位（管理器 48 位展示格式，第 48 位仅供展示）：按 47 字节 ABI 取前 47"
+            );
+        }
+    } else if len != KEY_ABI_LEN {
+        bail!(
+            "key length {len} invalid: 本项目密钥 ABI 为 47 字符（展示为 48 位含 NUL），\
+             请勿带 NUL 或多余字符（48 位仅记录后取前 47，49 位及以上一律拒绝）"
+        );
+    }
+    let material = &trimmed[..KEY_ABI_LEN];
     ensure!(
-        trimmed.chars().all(|c| c.is_ascii_alphanumeric()),
-        "key contains non-alphanumeric characters"
+        material.chars().all(|c| c.is_ascii_alphanumeric()),
+        "key contains non-alphanumeric characters: 密钥 ABI 为 47 个 ASCII 字符 [A-Za-z0-9]"
     );
-    Ok(())
+    let key = secret::SecretKey::new(material);
+    ensure!(
+        key.len() == KEY_ABI_LEN,
+        "internal error: normalised key is {} bytes, expected {KEY_ABI_LEN}",
+        key.len()
+    );
+    Ok(key)
 }
 
 /// `/data/adb/{ap/bin,ap/log,sproot,modules,modules_update}` with 0700/0755.
@@ -255,15 +309,22 @@ fn key_material(key: &str) -> Result<Vec<u8>> {
         trimmed.is_ascii(),
         "key must be ASCII for the 47-char on-disk ABI"
     );
+    // Strict, no truncation: a 48/49-byte value reaching this writer means it
+    // never went through `abi_key`. Refuse it instead of writing a key that
+    // would not match the kernel token (silent escalation failure).
     ensure!(
-        trimmed.len() >= MIN_KEY_LEN,
-        "key too short for the 47-char ABI ({} < {} chars)",
-        trimmed.len(),
-        MIN_KEY_LEN
+        trimmed.len() == KEY_ABI_LEN,
+        "key length {} != {KEY_ABI_LEN}: 本项目密钥 ABI 为 47 字符（展示为 48 位含 NUL），\
+         请勿带 NUL 或多余字符",
+        trimmed.len()
     );
-    let material = trimmed.as_bytes()[..MIN_KEY_LEN].to_vec();
     ensure!(
-        material.len() == MIN_KEY_LEN && !material.contains(&0),
+        trimmed.chars().all(|c| c.is_ascii_alphanumeric()),
+        "key contains non-alphanumeric characters: 密钥 ABI 为 47 个 ASCII 字符 [A-Za-z0-9]"
+    );
+    let material = trimmed.as_bytes().to_vec();
+    ensure!(
+        material.len() == KEY_ABI_LEN && !material.contains(&0),
         "internal error: key material is not 47 NUL-free bytes"
     );
     Ok(material)
@@ -457,8 +518,8 @@ fn smoke_check() -> Result<()> {
     // SAFETY: `key_bytes` is a live, uniquely-owned buffer we no longer use.
     unsafe { secret::wipe_bytes(key_bytes.as_mut_ptr(), key_bytes.len()) };
     ensure!(
-        len == MIN_KEY_LEN,
-        "key file length {len} != {MIN_KEY_LEN} (47 chars, AP-side format)"
+        len == KEY_ABI_LEN,
+        "key file length {len} != {KEY_ABI_LEN} (47 chars, AP-side format)"
     );
     ensure!(nul_free, "key file contains a NUL (AP-side format is plain text)");
 
@@ -545,4 +606,77 @@ pub fn set_key_source_env(path: &Path) -> io::Result<()> {
     // SAFETY: single-threaded CLI startup, before any child is spawned.
     unsafe { std::env::set_var("SPROOT_KEY_SOURCE", path) };
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn alnum_key(len: usize) -> String {
+        "a".repeat(len)
+    }
+
+    #[test]
+    fn abi_key_accepts_exactly_47() {
+        let key = alnum_key(KEY_ABI_LEN);
+        assert_eq!(abi_key(&key).unwrap().as_str(), key);
+    }
+
+    #[test]
+    fn abi_key_maps_48_and_47_plus_nul_to_47() {
+        // 48 = manager display format: first 47 bytes, always logged (warn!).
+        let display = alnum_key(KEY_ABI_LEN + 1);
+        assert_eq!(abi_key(&display).unwrap().len(), KEY_ABI_LEN);
+        // 47 + NUL = kernel-inlined shape: same 47 bytes.
+        let mut kernelled = alnum_key(KEY_ABI_LEN);
+        kernelled.push('\0');
+        assert_eq!(abi_key(&kernelled).unwrap().len(), KEY_ABI_LEN);
+        // A 48th byte that is neither NUL/blank nor [A-Za-z0-9] is a typo.
+        let mut typo = alnum_key(KEY_ABI_LEN);
+        typo.push('-');
+        assert!(abi_key(&typo).is_err());
+    }
+
+    #[test]
+    fn abi_key_rejects_49_short_and_symbols() {
+        // Negative samples for the P0: 49 chars is a *different* key from
+        // another ABI, so it must fail loudly instead of being truncated into
+        // a token the kernel silently rejects.
+        assert!(abi_key(&alnum_key(KEY_ABI_LEN + 2)).is_err());
+        assert!(abi_key(&alnum_key(KEY_ABI_LEN - 1)).is_err());
+        let mut symbolic = alnum_key(KEY_ABI_LEN - 1);
+        symbolic.push('-');
+        assert!(abi_key(&symbolic).is_err());
+        // The writer itself never truncates either: 48/49 are refused outright.
+        assert!(key_material(&alnum_key(KEY_ABI_LEN + 1)).is_err());
+        assert!(key_material(&alnum_key(KEY_ABI_LEN + 2)).is_err());
+        assert_eq!(
+            key_material(&alnum_key(KEY_ABI_LEN)).unwrap(),
+            alnum_key(KEY_ABI_LEN).into_bytes()
+        );
+    }
+
+    #[test]
+    fn rc_template_matches_defs_and_writer_path() {
+        // Start-chain contract (NEW-DOC-05 §3.1.3): the Lead-owned rc asset,
+        // `defs::SPROOT_KEY_FILE` and `write_key_file` must agree byte for byte,
+        // and `--superkey-file` must precede the `daemon` subcommand (clap
+        // top-level arg: reversed order = rc=2 and the daemon never starts).
+        let expected = format!(
+            "service sproot-apd {} --superkey-file {} daemon",
+            defs::DAEMON_PATH,
+            defs::SPROOT_KEY_FILE
+        );
+        let line = assets::INIT_RC_TEMPLATE
+            .lines()
+            .find(|l| l.trim_start().starts_with("service sproot-apd "))
+            .expect("rc template lost its service line");
+        assert_eq!(line.trim(), expected);
+        // Pinned ABI paths: changing either breaks the ramdisk template and the
+        // already-deployed artifacts, so it must be a deliberate contract bump.
+        assert_eq!(defs::SPROOT_KEY_FILE, "/data/adb/sproot/key");
+        assert_eq!(defs::DAEMON_PATH, "/data/adb/apd");
+        // The writer targets that same constant (no second literal path).
+        assert!(defs::SPROOT_KEY_FILE.starts_with(defs::SPROOT_DIR));
+    }
 }
