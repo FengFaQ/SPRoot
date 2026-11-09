@@ -116,17 +116,32 @@ kotlin {
     }
 }
 
+// miuix 的 ui/nav/preference 都会传递 material3-window-size-class（CMP 的 alpha 版），
+// 其 runtime 变体会把 material3 约束抬到 alpha，造成编译期/运行期版本不一致。
+// miuix 源码对 WindowSizeClass 零引用（docs/research/miuix-integration.md §1.3），全局排除最稳。
+configurations.configureEach {
+    exclude(group = "org.jetbrains.compose.material3", module = "material3-window-size-class")
+    exclude(group = "org.jetbrains.compose.material3", module = "material3-window-size-class-android")
+}
+
 dependencies {
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.compose.runtime)
     implementation(libs.androidx.compose.foundation)
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.activity.compose)
+    // KSU miuix 版底栏/首页使用 Material Icons（Icons.Rounded.Cottage 等）
+    implementation(libs.androidx.compose.material.icons.extended)
 
-    // miuix 核心 UI。exclude 必须保留：其 runtime 变体把 material3 约束抬到 1.5.0-alpha22，
-    // 会让编译期 1.4.0 / 运行期 alpha 版本不一致（详见 docs/research/miuix-integration.md §1.3）。
-    implementation(libs.miuix.ui) {
-        exclude(group = "org.jetbrains.compose.material3", module = "material3-window-size-class")
-    }
+    // miuix 五模块（照抄 KernelSU 的 miuix 实现所需的最小集）
+    //  ui        —— 基础组件（Scaffold/TopAppBar/Card/NavigationBar/NavigationRail…）
+    //  icons     —— MiuixIcons
+    //  nav       —— NavDisplay/backstack（关于页等子页面转场）
+    //  preference—— 设置页的 SwitchPreference/ArrowPreference/DropdownPreference
+    //  blur      —— TopAppBar/底栏毛玻璃；minSdk 33，用 manifest tools:overrideLibrary + isRenderEffectSupported() 守卫
+    implementation(libs.miuix.ui)
     implementation(libs.miuix.icons)
+    implementation(libs.miuix.nav)
+    implementation(libs.miuix.preference)
+    implementation(libs.miuix.blur)
 }
