@@ -331,3 +331,41 @@ apd root-exec --superkey-file <PATH> [--uid <N>] [--scontext <CTX>] [--timeout <
 ---
 
 *附：每条修订的「原文→修订文→证据→影响面」均见 §0；patcher/app-client 若有异议，请对 §0 逐条批注，避免在 §2–§8 全文里改散。*
+
+---
+
+## 附件 A：勘误 E6（errata，2026-11-10 追加）
+
+> **性质**：勘误（errata）。**本附录为追加内容，不修改本契约正文（§1–§10）任何条文**；正文保持 **v1.1-FROZEN（2026-11-08 21:23 +08）** 原样。
+> **触发**：人类需求「增加 root 授权功能页面」→ 每应用三态（`allow | deny | ask`）+ 授权日志 + 每应用元数据（`last_grant_at` / `request_count` / `sctx` / `exclude`），v1.1 §3.2 / E4 的 csv 六列无法承载。
+> **关联**：`docs/NEW-DOC-05-模块与守护方案.md` §13（授权模型：三态 + 日志）与 §4.6 勘误表 E6 行；实现：`apd/src/auth_list.rs`、`apd/src/cli.rs`、`apd/src/daemon.rs`。
+
+### A.1 变更内容（E6）
+
+| 项 | v1.1 正文口径（§3.2 / E4） | E6 后实现口径 |
+|---|---|---|
+| 授权决策源 | `/data/adb/ap/allow_list`（csv：`pkg,exclude,allow,uid,to_uid,sctx`） | `/data/adb/sproot/auth_list.json`（JSON 文档 `{"version":1,"entries":[...]}`；每 uid：`state ∈ allow\|deny\|ask` + `package/label/app_icon_path/last_grant_at/last_deny_at/request_count/to_uid/sctx/exclude`） |
+| 表外 uid | 拒绝 | **`ask`**（默认态）。Phase 1 中 `ask` 显式拒绝（`decision=ask_pending`），Phase 2 接交互式弹窗 |
+| 旧 csv | 唯一决策源 | **只读**：升级后首次加载**一次性迁移**（`allow==1 && exclude==0` → `allow`；其它已持久化行 → `deny`；`exclude/to_uid/sctx` 原样保留），此后不再写入，仅留作审计/回滚留档。**升级不丢授权** |
+| 写一致性 | 单写者 + tmp/rename | 不变：`flock` 单写者、tmp+rename 原子写、torn-read 熔断、uid 0/2000 保护逐条保留 |
+| 审计 | —（未定义） | 新增 `/data/adb/sproot/auth_log.jsonl`（0600、JSONL、上限 256 KiB 时重写为最新 500 条）。每行仅 `cmd_name`（可执行名）+ `cmd_args`（参数个数）+ `cmd_sha256`（SHA-256 前 16 hex），**不含完整命令、参数或任何密钥** |
+
+### A.2 调用契约兼容性（正文 §8 不变）
+
+- App ↔ apd 的**调用**契约未变：仍是 `root-exec --uid <n> --scontext <ctx> -- <cmd...>`；`auth list/set/log/revoke --json` 属新增**管理**命令（root-only，经 `root-exec` 包裹调用）。
+- daemon socket 响应仅新增**加法**字段 `"decision": "allow" | "deny" | "ask_pending"`（§8 未定义该响应结构，故不构成破坏性变更；老客户端忽略该字段即可）。
+- 密钥/提权链（§4、E1）与 rc 自启链（§7）不受影响。
+
+### A.3 行为后果（必须让使用者知道）
+
+**默认态为 `ask`，而 Phase 1 中 `ask` 等同拒绝** → **新装应用第一次请求 root 会被拒绝**（`decision=ask_pending`），用户必须到授权页把该应用手动设为 `allow`。这是 Phase 1 的既定取舍：**安全（绝不隐式放行）但需要一次手动放行**。
+
+### A.4 会签需求
+
+| 方 | 状态 |
+|---|---|
+| 系统守护（apd 实现方） | ✅ 2026-11-10 提交 |
+| 客户端（app-client / ui-client） | ⏳ 待确认（按 NEW-DOC-05 §13 的 JSON 契约实现授权页） |
+| leader | ✅ 2026-11-10 裁决：以勘误形式追加，不改冻结正文 |
+
+> 若后续开 v1.2：应把 E6 合并进 §0 修订明细，并按 §9 重新会签；届时删除本附件。

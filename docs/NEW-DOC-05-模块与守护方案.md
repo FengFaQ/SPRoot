@@ -728,6 +728,8 @@ apd --superkey-file /data/adb/sproot/key daemon
 - **无行 = `ask`**（绝不隐式 allow）；表不可读 = **deny**（fail closed，与旧内核拒绝的一致可见行为）。
 - 迁移：旧 `/data/adb/ap/allow_list`（csv，契约 v1.1 §3.2/E4）在升级后**首次加载时一次性导入**：`allow==1 && exclude==0` → `allow`，其它已持久化行 → `deny`（旧纯白名单语义），`exclude/to_uid/sctx` 原样保留。csv **不再写入**，仅作只读迁移源与审计留档。**升级不丢授权。**
 
+> ⚠️ **Phase 1 行为后果（必须让使用者知道）**：默认态是 `ask`，而 Phase 2 之前 `ask` 等同拒绝 → **新装应用第一次请求 root 会被拒绝**（`decision=ask_pending`），用户必须到授权页把该应用手动设为 `allow`。这是 Phase 1 的既定取舍：**安全但需要一次手动放行**（见契约文档 `phase2_skroot_ap_call_contract_v1.1.md` 附件 A §A.3）。
+
 ### 13.2 存储 ABI
 
 - 权威文件：`/data/adb/sproot/auth_list.json`（0600 from creation，tmp+rename 原子，`flock` 单写者）。文档结构：
@@ -787,6 +789,15 @@ apd --superkey-file /data/adb/sproot/key daemon
 
 `event` 取值：`request`（每次 root 请求，`decision` ∈ `allow|deny|ask_pending`）、`set_state`、`revoke`、`grant`、`migrate`（一次性迁移摘要）。`state`/`previous` 为 `allow|deny|ask`。
 
+**`package` 字段可靠性与 `null` 情形（给 ui-client）**：daemon 以 root 读 `/data/system/packages.list`（`包名 uid ...`，主用户表）做 uid→包名解析；`auth set`/`revoke`/`grant`、`request` 记录与 `auth list` 都会补全。`package` 为 `null` 仅限以下情形，均**不报错**：
+
+1. **uid 无对应包**：系统 uid（如 0/1000/2000）、已卸载但残留的授权行（`refresh` 会另行清理）、非 App uid（脚本/守护）；
+2. **多用户 / 工作资料**：secondary user 的 uid = 基础 uid + `100000 × userId`，不在主用户 `packages.list` 中；
+3. **`packages.list` 不可读/撕裂**（升级瞬间）：条目仍在，只是包名解析不到；
+4. **sharedUserId**：多个包共用 uid 时只返回首个匹配包名。
+
+UI 兜底（推荐）：拿 `uid` 直接调 `PackageManager.getPackagesForUid(uid)` 反查包名、再取 label/图标——**apd 侧刻意不做 label/图标解析**（无 PackageManager、避免 aapt/xml 解析风险与新增依赖），方案 C。
+
 ### 13.4 daemon / socket 判定语义
 
 1. socket 收请求 → `SO_PEERCRED` 取 uid（不可伪造）→ 三态判定；
@@ -809,9 +820,9 @@ apd --superkey-file /data/adb/sproot/key daemon
 `auth_list::tests::iso8601_matches_known_epochs` | UTC ISO-8601 无日期依赖
 `utils::tests::sha256_matches_known_vectors` | 纯 Rust SHA-256 对照 FIPS 向量
 
-### 13.6 与契约 v1.1 的偏差（新勘误 E6，待会签）
+### 13.6 与契约 v1.1 的偏差（勘误 E6，已按「不改冻结正文」追加）
 
-契约 v1.1 §3.2/E4 规定授权表为单文件 csv（`allow_list`）。三态升级后**决策源改为 JSON**（csv 仅迁移源）。影响：`package.rs` 的 csv 读写/同步路径标记为 legacy（保留不调用）；`selftest` 的 `allow_list` 检查名不变，detail 改为 JSON 计数（`allow=/deny=/ask=` + `legacy_migrated`）。其余安全语义（单写者、原子写、uid 保护、torn-read 熔断）逐条保留。
+契约 v1.1 §3.2/E4 规定授权表为单文件 csv（`allow_list`）。三态升级后**决策源改为 JSON**（csv 仅迁移源）。正式勘误记录于契约文档 **`docs/phase2_skroot_ap_call_contract_v1.1.md` 附件 A（errata E6，追加于正文之后，v1.1-FROZEN 正文 1–333 行未改动）**，本节与之互相引用。影响：`package.rs` 的 csv 读写/同步路径标记为 legacy（保留不调用）；`selftest` 的 `allow_list` 检查名不变，detail 改为 JSON 计数（`allow=/deny=/ask=` + `legacy_migrated`）。其余安全语义（单写者、原子写、uid 保护、torn-read 熔断）逐条保留。
 
 ### 13.7 待办
 
