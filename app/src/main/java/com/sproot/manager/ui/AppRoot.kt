@@ -33,7 +33,7 @@ import com.sproot.manager.ui.components.rememberBlurBackdrop
 import com.sproot.manager.ui.components.rememberMainPagerState
 import com.sproot.manager.ui.components.shouldShowSplitPane
 import com.sproot.manager.ui.pages.HomePager
-import com.sproot.manager.ui.pages.ModulesPage
+import com.sproot.manager.ui.pages.ModulePager
 import com.sproot.manager.ui.pages.PatchPager
 import com.sproot.manager.ui.pages.SettingsPage
 import com.sproot.manager.ui.theme.AppSettings
@@ -130,7 +130,10 @@ private fun MainScreen(
                         bottomInnerPadding = bottomInnerPadding,
                         isCurrentPage = page == mainPagerState.selectedPage,
                     )
-                    2 -> ModuleTab(blurBackdrop)
+                    2 -> ModulePager(
+                        bottomInnerPadding = bottomInnerPadding,
+                        isCurrentPage = page == mainPagerState.selectedPage,
+                    )
                     else -> SettingsTab(
                         backdrop = blurBackdrop,
                         appSettings = appSettings,
@@ -194,13 +197,6 @@ private fun TabScaffold(
             .only(WindowInsetsSides.Horizontal),
     ) { innerPadding ->
         content(innerPadding)
-    }
-}
-
-@Composable
-private fun ModuleTab(backdrop: LayerBackdrop?) {
-    TabScaffold(title = "模块", backdrop = backdrop) { inner ->
-        ModulesPage(modifier = Modifier.padding(inner))
     }
 }
 
