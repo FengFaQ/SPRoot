@@ -86,6 +86,25 @@ object PatchPipeline {
         AppLog.info(TAG, "已选择镜像：${displayName ?: "<未命名>"} uri=$uri")
     }
 
+    /**
+     * P2 双镜像：选择可选的 init_boot.img。
+     *
+     * 为什么需要它：魅族 21 等机型的 ramdisk 在 init_boot 分区（boot 的 ramdisk_size=0），
+     * 只修 boot 时 rc 注入只能记 no_ramdisk → AP 永远无法开机自启。
+     */
+    fun selectInitBootInput(uri: Uri?, displayName: String?) {
+        val current = state.value
+        if (current.running) {
+            AppLog.warn(TAG, "修补进行中，忽略重新选择 init_boot 的请求")
+            return
+        }
+        state.value = current.copy(
+            initBootSourceUri = uri?.toString(),
+            initBootSourceName = displayName,
+        )
+        AppLog.info(TAG, "已选择 init_boot：${displayName ?: "<未选择>"} uri=$uri")
+    }
+
     /** 重置为初始态（唯一允许清空错误信息的入口） */
     fun reset() {
         if (state.value.running) {
@@ -132,6 +151,9 @@ object PatchPipeline {
             outputPath = null,
             outputSha256 = null,
             outputBytes = 0L,
+            initBootOutputPath = null,
+            initBootOutputSha256 = null,
+            initBootBytes = 0L,
             kernelBytes = 0L,
             kernelEqualLength = false,
             backupSha1 = null,
@@ -152,6 +174,14 @@ object PatchPipeline {
     private fun execute(context: Context, sourceUri: Uri) {
         var workDir: File? = null
         var rcResult: RcInject.Result? = null
+        // P2 双镜像：init_boot 产物与 rc 注入归属
+        var initBootProduct: Exporter.Exported? = null
+        var initBootSha: String? = null
+        var initBootBytesOut = 0L
+        var initBootRcInjected = false
+        var bootRcInjected = false
+        var rcTarget = "boot"
+        val initBootUriString = state.value.initBootSourceUri
         val key = runCatching { SecretStore.get(context).getOrCreateRootKey() }.getOrElse {
             finishFailure(
                 title = "无法取得 Root 密钥",
@@ -378,37 +408,209 @@ object PatchPipeline {
                 return
             }
 
-            // ---------- ⑥.5 D1：注入 AP 开机自启 rc（init.sproot.rc + init.rc import） ----------
-            // 目标优先级（D-12）：init_boot.img 的 ramdisk 优先，boot.img 回退；
-            // 无 ramdisk → 跳过记 rc_injected=false（不算失败）。
-            val ramdisk = File(workDir, "ramdisk.cpio")
-            val rcTarget = if (state.value.sourceName?.contains("init_boot", ignoreCase = true) == true) {
-                "init_boot"
-            } else {
-                "boot"
-            }
-            stage(PatchStage.REPACK, 88f, "尝试注入开机自启 rc（target=$rcTarget）")
-            rcResult = RcInject.inject(context, workDir, ramdisk.takeIf { it.isFile }, rcTarget)
-            state.value = state.value.copy(
-                rcInjected = rcResult!!.injected,
-                rcTarget = rcResult!!.target,
-                rcReason = rcResult!!.reason,
-                rcSource = rcResult!!.source,
-            )
-            AppLog.info(
-                TAG,
-                "rc_injected=${rcResult!!.injected}, rc_target=${rcResult!!.target}, " +
-                    "rc_source=${rcResult!!.source}, rc_reason=${rcResult!!.reason}, " +
-                    "rc_idempotent_hit=${rcResult!!.idempotentHit}" +
-                    (if (rcResult!!.injected) {
-                        "（rc 已注入 ≠ 已开启自启：需 AP 部署完成并写入 /data/adb/sproot/key(0600) 后，开机才会拉起 AP daemon）"
+            // ---------- ⑥.4 P2：init_boot.img 修补（ramdisk 的权威落点，D-12） ----------
+            // 真机（魅族 21）：boot 的 ramdisk_size=0，ramdisk 在 init_boot。
+            // 因此**双镜像输入时 init_boot 优先注入 rc**；失败/未选才回退到 boot ramdisk。
+            // 产物断言与 boot 同等严格：ramdisk 级回读（rc/import 真在最终镜像里）+ AVB-1/2/3；
+            // 任一失败即中止，且**不导出任何产物**（不允许"一半成功"的半成品被刷入）。
+            if (!initBootUriString.isNullOrBlank()) {
+                stage(PatchStage.REPACK, 82f, "解包 init_boot.img（自启注入权威落点）")
+                val initWork = File(workDir, "init_boot").apply {
+                    check(mkdirs() || isDirectory) { "无法创建 init_boot 工作目录：${absolutePath}" }
+                }
+                val initImg = File(initWork, "init_boot.img")
+                val copiedInit = copyUriToFile(context, Uri.parse(initBootUriString), initImg)
+                if (copiedInit <= 0L) {
+                    finishFailure(
+                        "init_boot.img 读取失败",
+                        "从 URI 读到的字节数为 0。请确认文件可读（不是被其他 App 独占的在线文件）。",
+                        null,
+                    )
+                    return
+                }
+                val initInputSha = sha256(initImg)
+                AppLog.info(TAG, "init_boot.img 已落地：${initImg.absolutePath}（${Capabilities.formatBytes(copiedInit)}）sha256=$initInputSha")
+                runCatching { BackupStore.backup(context, initImg, state.value.initBootSourceName) }
+                    .onFailure { AppLog.error(TAG, "备份 init_boot 失败（不阻断修补）", it) }
+
+                val initUnpack = MagiskBoot.exec(context, listOf("unpack", "init_boot.img"), initWork) { line ->
+                    AppLog.debug("magiskboot", line)
+                }
+                if (initUnpack.timedOut || initUnpack.exitCode != 0) {
+                    finishFailure(
+                        "init_boot.img 解包失败（magiskboot exit=${initUnpack.exitCode}）",
+                        "完整输出：\n${initUnpack.lines.joinToString("\n").ifBlank { "<无输出>" }}",
+                        null,
+                    )
+                    return
+                }
+                val initRamdisk = File(initWork, "ramdisk.cpio")
+                rcResult = RcInject.inject(context, initWork, initRamdisk.takeIf { it.isFile }, "init_boot")
+                initBootRcInjected = rcResult!!.injected
+                rcTarget = rcResult!!.target
+                state.value = state.value.copy(
+                    rcInjected = rcResult!!.injected,
+                    rcTarget = rcResult!!.target,
+                    rcReason = rcResult!!.reason,
+                    rcSource = rcResult!!.source,
+                )
+                AppLog.info(
+                    TAG,
+                    "init_boot rc_injected=${rcResult!!.injected}, rc_target=${rcResult!!.target}, " +
+                        "rc_source=${rcResult!!.source}, rc_reason=${rcResult!!.reason}, " +
+                        "rc_idempotent_hit=${rcResult!!.idempotentHit}",
+                )
+
+                val initRepack = MagiskBoot.exec(context, listOf("repack", "init_boot.img"), initWork) { line ->
+                    AppLog.debug("magiskboot", line)
+                }
+                if (initRepack.timedOut || initRepack.exitCode != 0) {
+                    finishFailure(
+                        "init_boot 重打包失败（magiskboot exit=${initRepack.exitCode}）",
+                        "完整输出：\n${initRepack.lines.joinToString("\n").ifBlank { "<无输出>" }}",
+                        null,
+                    )
+                    return
+                }
+                val initNew = File(initWork, "new-boot.img")
+                if (!initNew.isFile || initNew.length() == 0L) {
+                    finishFailure(
+                        "init_boot 重打包产物缺失",
+                        "magiskboot repack 成功但未生成 new-boot.img。目录内容：\n" +
+                            (initWork.listFiles()?.joinToString("\n") { it.name } ?: "<空>"),
+                        null,
+                    )
+                    return
+                }
+                val initPatched = File(initWork, "init_boot_patched.img")
+                initNew.copyTo(initPatched, overwrite = true)
+
+                // 回读（T-12 等价）：rc 必须真的在最终 init_boot 镜像的 ramdisk 里
+                if (initBootRcInjected) {
+                    val rcVerify = RcInject.verifyProduct(context, initPatched, initWork)
+                    if (!rcVerify.ok) {
+                        finishFailure(
+                            "init_boot 回读校验失败（rc 未进最终镜像，T-12）",
+                            rcVerify.detail + "\n\n已中止，未导出任何产物。工作目录：" + (workDir?.absolutePath ?: "—"),
+                            "T-12",
+                        )
+                        return
+                    }
+                    AppLog.info(TAG, "init_boot 回读校验通过：${rcVerify.detail}")
+                } else {
+                    AppLog.info(TAG, "init_boot 未注入 rc（${rcResult?.reason}）→ 产物仍导出，但本机自启不会生效")
+                }
+
+                // AVB 硬断言（与 boot 同等严格）
+                val initAvb = checkAvb(initImg, initPatched, Elf.readAvbFooter(initImg))
+                if (!initAvb.ok) {
+                    if (initAvb.rollbackCandidate && initBootRcInjected) {
+                        AppLog.warn(TAG, "init_boot AVB-2 等长冲突：回滚 rc 注入并重新 repack")
+                        val rolledBack = RcInject.rollback(initWork, initRamdisk)
+                        if (!rolledBack) {
+                            finishFailure("init_boot AVB-2 冲突且无法回滚 rc 注入", initAvb.detail, "AVB-2")
+                            return
+                        }
+                        initBootRcInjected = false
+                        rcResult = RcInject.Result(
+                            injected = false,
+                            target = "init_boot",
+                            reason = "avb_length_conflict",
+                            idempotentHit = false,
+                            source = rcResult?.source ?: RcInject.TEMPLATE_SOURCE,
+                        )
+                        state.value = state.value.copy(rcInjected = false, rcReason = "avb_length_conflict")
+                        val initRepack2 = MagiskBoot.exec(context, listOf("repack", "init_boot.img"), initWork) { line ->
+                            AppLog.debug("magiskboot", line)
+                        }
+                        if (initRepack2.timedOut || initRepack2.exitCode != 0) {
+                            finishFailure(
+                                "回滚 rc 后 init_boot 重新 repack 失败（magiskboot exit=${initRepack2.exitCode}）",
+                                "完整输出：\n${initRepack2.lines.joinToString("\n").ifBlank { "<无输出>" }}",
+                                "AVB-2",
+                            )
+                            return
+                        }
+                        val initNew2 = File(initWork, "new-boot.img")
+                        if (!initNew2.isFile) {
+                            finishFailure("回滚 rc 后 init_boot 产物缺失", "magiskboot repack 未生成 new-boot.img。", "AVB-2")
+                            return
+                        }
+                        initNew2.copyTo(initPatched, overwrite = true)
+                        val initAvbRetry = checkAvb(initImg, initPatched, Elf.readAvbFooter(initImg))
+                        if (!initAvbRetry.ok) {
+                            finishFailure(
+                                "init_boot ${initAvbRetry.describe}（${initAvbRetry.code}，回滚自启后仍未通过）",
+                                initAvbRetry.detail,
+                                initAvbRetry.code,
+                            )
+                            return
+                        }
+                        AppLog.warn(TAG, "init_boot 已回滚自启，AVB 校验通过（${initAvbRetry.describe}）")
                     } else {
-                        "（不影响产物合规，可手动启动 AP）"
-                    }),
-            )
+                        finishFailure(
+                            "init_boot ${initAvb.describe}（${initAvb.code}）",
+                            initAvb.detail,
+                            initAvb.code,
+                        )
+                        return
+                    }
+                } else {
+                    AppLog.info(TAG, "init_boot AVB 校验通过：${initAvb.describe}")
+                }
+                initBootSha = sha256(initPatched)
+                initBootBytesOut = initPatched.length()
+                state.value = state.value.copy(
+                    initBootOutputSha256 = initBootSha,
+                    initBootBytes = initBootBytesOut,
+                )
+                AppLog.info(
+                    TAG,
+                    "init_boot 产物就绪：sha256=$initBootSha size=$initBootBytesOut rc_injected=$initBootRcInjected",
+                )
+            } else {
+                AppLog.warn(
+                    TAG,
+                    "未选择 init_boot.img：ramdisk 若在 init_boot 分区（如魅族 21），rc 将无法注入 → 自启不会生效。",
+                )
+            }
+
+            // ---------- ⑥.5 D1：注入 AP 开机自启 rc（init.sproot.rc + init.rc import） ----------
+            // 目标优先级（D-12）：init_boot.img 的 ramdisk 优先，boot.img 回退。
+            // 双镜像时若 init_boot 已注入成功，则 boot 不再重复注入（一个落点，避免二义性）。
+            val ramdisk = File(workDir, "ramdisk.cpio")
+            if (rcResult?.injected == true) {
+                AppLog.info(
+                    TAG,
+                    "rc 已在 ${rcResult?.target} 注入成功，boot ramdisk 不再重复注入" +
+                        "（rc_target=${rcResult?.target}，rc_source=${rcResult?.source}）",
+                )
+            } else {
+                rcTarget = "boot"
+                stage(PatchStage.REPACK, 86f, "尝试注入开机自启 rc（target=boot，init_boot 回退）")
+                rcResult = RcInject.inject(context, workDir, ramdisk.takeIf { it.isFile }, rcTarget)
+                bootRcInjected = rcResult?.injected == true
+                state.value = state.value.copy(
+                    rcInjected = rcResult!!.injected,
+                    rcTarget = rcResult!!.target,
+                    rcReason = rcResult!!.reason,
+                    rcSource = rcResult!!.source,
+                )
+                AppLog.info(
+                    TAG,
+                    "rc_injected=${rcResult!!.injected}, rc_target=${rcResult!!.target}, " +
+                        "rc_source=${rcResult!!.source}, rc_reason=${rcResult!!.reason}, " +
+                        "rc_idempotent_hit=${rcResult!!.idempotentHit}" +
+                        (if (rcResult!!.injected) {
+                            "（rc 已注入 ≠ 已开启自启：需 AP 部署完成并写入 /data/adb/sproot/key(0600) 后，开机才会拉起 AP daemon）"
+                        } else {
+                            "（不影响产物合规，可手动启动 AP）"
+                        }),
+                )
+            }
 
             // ---------- ⑦ 重打包 ----------
-            stage(PatchStage.REPACK, 82f, "magiskboot repack")
+            stage(PatchStage.REPACK, 88f, "magiskboot repack")
             val repack = MagiskBoot.exec(context, listOf("repack", "boot.img"), workDir!!) { line ->
                 AppLog.debug("magiskboot", line)
             }
@@ -432,7 +634,7 @@ object PatchPipeline {
             }
 
             // ---------- ⑦.5 回读断言（T-12：patch 必须在最终 boot.img 里真实生效） ----------
-            stage(PatchStage.VERIFY, 88f, "回读 new-boot.img 校验补丁是否真实生效")
+            stage(PatchStage.VERIFY, 90f, "回读 new-boot.img 校验补丁是否真实生效")
             val verifyDir = File(workDir, "verify").apply {
                 check(mkdirs() || isDirectory) { "无法创建校验目录：${absolutePath}" }
             }
@@ -503,7 +705,7 @@ object PatchPipeline {
             val avbCheck = checkAvb(bootImg, newBoot, avbInputFooter)
             if (!avbCheck.ok) {
                 // AVB-2 等长冲突且已注入 rc → 回滚 rc 重新 repack（宁可失去自启，也不产出不合规镜像）
-                if (avbCheck.rollbackCandidate && rcResult?.injected == true) {
+                if (avbCheck.rollbackCandidate && bootRcInjected) {
                     AppLog.warn(TAG, "AVB-2 等长冲突：回滚 rc 注入并重新 repack（rc_injected=false, reason=avb_length_conflict）")
                     val rolledBack = RcInject.rollback(workDir!!, File(workDir, "ramdisk.cpio"))
                     if (rolledBack) {
@@ -584,6 +786,28 @@ object PatchPipeline {
                 TAG,
                 "产物就绪：${exported.displayPath} size=${newBoot.length()} sha256=$outSha",
             )
+            // P2：init_boot 产物（与 boot 同批导出；此前任一校验失败都已中止，不会只出一半）
+            if (initBootUriString.isNullOrBlank()) {
+                state.value = state.value.copy(initBootOutputPath = null)
+            } else {
+                val initWork = File(workDir, "init_boot")
+                val initPatched = File(initWork, "init_boot_patched.img")
+                if (!initPatched.isFile || initBootSha == null) {
+                    finishFailure(
+                        "init_boot 产物缺失",
+                        "约定输出 ${initPatched.absolutePath} 不存在或未通过校验。已中止。",
+                        "E_INTERNAL",
+                    )
+                    return
+                }
+                val initExportName = "init_boot_patched_$stamp.img"
+                initBootProduct = Exporter.exportToDownloads(context, initPatched, initExportName)
+                state.value = state.value.copy(initBootOutputPath = initBootProduct.displayPath)
+                AppLog.info(
+                    TAG,
+                    "init_boot 产物就绪：${initBootProduct.displayPath} size=$initBootBytesOut sha256=$initBootSha",
+                )
+            }
 
             // 引擎 report 里的 root_key 是其 48 字符入参；内核真正内嵌的是前 47 位
             val rootKey = PatchEngine.lastRootKey()?.let { SecretStore.kernelKeyOf(it) } ?: key
@@ -595,12 +819,28 @@ object PatchPipeline {
                 outputPath = exported.displayPath,
                 outputSha256 = outSha,
                 outputBytes = newBoot.length(),
+                initBootOutputPath = state.value.initBootOutputPath,
+                initBootOutputSha256 = initBootSha,
+                initBootBytes = initBootBytesOut,
                 kernelEqualLength = true,
                 reportPath = File(workDir, "kernel.patched.report.json")
                     .takeIf { it.isFile }?.absolutePath,
                 rootKey = rootKey,
                 finishedAt = System.currentTimeMillis(),
             )
+            val artifacts = buildList {
+                add(InstallState.Artifact("boot", exported.displayPath, outSha, newBoot.length()))
+                initBootProduct?.let { product ->
+                    add(
+                        InstallState.Artifact(
+                            "init_boot",
+                            product.displayPath,
+                            initBootSha ?: "",
+                            initBootBytesOut,
+                        ),
+                    )
+                }
+            }
             InstallState.markPatchedPendingFlash(
                 context = context,
                 artifactDisplayPath = exported.displayPath,
@@ -608,7 +848,9 @@ object PatchPipeline {
                 artifactBytes = newBoot.length(),
                 kernelEqualLength = true,
                 audit = "AVB=${state.value.avbStatus}；rc_injected=${state.value.rcInjected}；" +
-                    "rc_target=${state.value.rcTarget}；rc_source=${state.value.rcSource}；rc_reason=${state.value.rcReason}",
+                    "rc_target=${state.value.rcTarget}；rc_source=${state.value.rcSource}；rc_reason=${state.value.rcReason}；" +
+                    "products=" + artifacts.joinToString(",") { "${it.label}:${it.sha256.take(12)}@${it.bytes}" },
+                artifacts = artifacts,
             )
             AppLog.info(TAG, "==== 修补成功 ==== 产物=${exported.displayPath} sha256=$outSha")
             logStageDurations()

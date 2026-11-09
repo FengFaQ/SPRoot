@@ -67,6 +67,12 @@ data class PatchUiState(
     val mode: PatchMode = PatchMode.EXPORT_AND_GUIDE,
     val sourceUri: String? = null,
     val sourceName: String? = null,
+    // P2 双镜像：init_boot.img（可选；ramdisk 的权威落点，D-12）
+    val initBootSourceUri: String? = null,
+    val initBootSourceName: String? = null,
+    val initBootOutputPath: String? = null,
+    val initBootOutputSha256: String? = null,
+    val initBootBytes: Long = 0L,
     val workDir: String? = null,
     val outputPath: String? = null,
     val outputSha256: String? = null,

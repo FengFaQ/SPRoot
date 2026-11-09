@@ -132,6 +132,20 @@ fun PatchPager(
         }
         PatchPipeline.selectInput(uri, queryDisplayName(context, uri))
     }
+    // P2 双镜像：init_boot.img（可选；ramdisk 的权威落点）
+    val initBootPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+        if (uri == null) {
+            AppLog.warn("PatchUI", "用户取消了 init_boot 文件选择")
+            return@rememberLauncherForActivityResult
+        }
+        runCatching {
+            context.contentResolver.takePersistableUriPermission(
+                uri,
+                android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
+            )
+        }
+        PatchPipeline.selectInitBootInput(uri, queryDisplayName(context, uri))
+    }
 
     ConfirmDialog(
         show = showResetConfirm,
@@ -178,8 +192,16 @@ fun PatchPager(
                         SelectImageCard(
                             state = state,
                             onPick = { picker.launch(arrayOf("*/*")) },
+                            onPickInitBoot = { initBootPicker.launch(arrayOf("*/*")) },
                             onReset = { showResetConfirm = true },
                         )
+                        if (state.sourceUri != null && state.initBootSourceUri == null) {
+                            WarningCard(
+                                message = "未选择 init_boot.img：将无法注入开机自启" +
+                                    "（本机 ramdisk 可能位于 init_boot，例如魅族 21）",
+                                level = WarningLevel.Notice,
+                            )
+                        }
                         ModeCard(state = state)
                         ProgressCard(state = state, onStart = { PatchPipeline.start(context) })
                         if (state.hasError) {
@@ -218,13 +240,32 @@ fun PatchPager(
 // ---------------------------------------------------------------- 选择镜像
 
 @Composable
-private fun SelectImageCard(state: PatchUiState, onPick: () -> Unit, onReset: () -> Unit) {
+private fun SelectImageCard(
+    state: PatchUiState,
+    onPick: () -> Unit,
+    onPickInitBoot: () -> Unit,
+    onReset: () -> Unit,
+) {
     Card(modifier = Modifier.fillMaxWidth()) {
         BasicComponent(
             title = "选择 boot.img",
             summary = state.sourceName
                 ?: "必须是本机 boot.img（Android boot image）；kernel 本体/压缩包会被拒绝",
             onClick = onPick,
+            startAction = {
+                Icon(
+                    imageVector = MiuixIcons.Folder,
+                    contentDescription = null,
+                    tint = colorScheme.onSurface,
+                    modifier = Modifier.padding(end = 12.dp),
+                )
+            },
+        )
+        BasicComponent(
+            title = "选择 init_boot.img（可选，强烈建议）",
+            summary = state.initBootSourceName
+                ?: "ramdisk 在 init_boot 的机型（如魅族 21）必须选它，否则开机自启无法注入",
+            onClick = onPickInitBoot,
             startAction = {
                 Icon(
                     imageVector = MiuixIcons.Folder,
@@ -482,6 +523,12 @@ private fun SuccessCard(
                     valueColor = colorScheme.onSurfaceVariantSummary,
                 )
             }
+            state.initBootOutputPath?.let { initPath ->
+                Spacer(Modifier.height(6.dp))
+                KeyValueRow("init_boot 产物", initPath, monospace = true)
+                KeyValueRow("init_boot 大小", Capabilities.formatBytes(state.initBootBytes), monospace = true)
+                KeyValueRow("init_boot sha256", state.initBootOutputSha256 ?: "—", monospace = true)
+            }
             state.reportPath?.let { KeyValueRow("引擎报告", it, monospace = true) }
             state.backupSha1?.let { KeyValueRow("原镜像备份", "sha1=$it", monospace = true) }
 
@@ -501,7 +548,11 @@ private fun SuccessCard(
 
             if (state.mode == PatchMode.EXPORT_AND_GUIDE) {
                 Spacer(Modifier.height(8.dp))
-                FlashGuide(state.outputPath!!, onCopyCommand)
+                FlashGuide(
+                    bootPath = state.outputPath!!,
+                    initBootPath = state.initBootOutputPath,
+                    onCopyCommand = onCopyCommand,
+                )
             }
             Spacer(Modifier.height(8.dp))
             TwoLevelStatus()
@@ -514,14 +565,18 @@ private fun SuccessCard(
  * AVB 结论（NEW-DOC-04 §4.4）：三家实现都不碰 AVB 密码学，只刷 boot、不碰 vbmeta。
  */
 @Composable
-private fun FlashGuide(artifactPath: String, onCopy: (String) -> Unit) {
-    val fileName = artifactPath.substringAfterLast('/')
-    val commands = listOf(
-        "进入 bootloader" to "adb reboot bootloader",
-        "查看当前槽位（A/B 机型）" to "fastboot getvar current-slot",
-        "刷入 boot（双槽都刷）" to "fastboot flash --slot=all boot $fileName",
-        "重启" to "fastboot reboot",
-    )
+private fun FlashGuide(bootPath: String, initBootPath: String?, onCopy: (String) -> Unit) {
+    val bootName = bootPath.substringAfterLast('/')
+    val initBootName = initBootPath?.substringAfterLast('/')
+    val commands = buildList {
+        add("进入 bootloader" to "adb reboot bootloader")
+        add("查看当前槽位（A/B 机型）" to "fastboot getvar current-slot")
+        add("① 刷入 boot（双槽都刷）" to "fastboot flash --slot=all boot $bootName")
+        if (initBootName != null) {
+            add("② 刷入 init_boot（双槽都刷；自启 rc 在这里）" to "fastboot flash --slot=all init_boot $initBootName")
+        }
+        add("重启" to "fastboot reboot")
+    }
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.defaultColors(
@@ -531,7 +586,11 @@ private fun FlashGuide(artifactPath: String, onCopy: (String) -> Unit) {
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Text(
-                text = "刷入指引（只刷 boot 分区，不碰 vbmeta）",
+                text = if (initBootPath != null) {
+                    "刷入指引（boot + init_boot 两个产物都要刷，按①→②顺序；不碰 vbmeta）"
+                } else {
+                    "刷入指引（只刷 boot 分区，不碰 vbmeta）"
+                },
                 fontSize = 15.sp,
                 fontWeight = FontWeight.Medium,
                 color = colorScheme.onSurface,

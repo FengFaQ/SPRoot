@@ -187,6 +187,59 @@ object RcInject {
         return Result(ok, target, if (ok) "injected" else "verify_failed", alreadyImported, templateSource)
     }
 
+    data class VerifyResult(val ok: Boolean, val detail: String)
+
+    /**
+     * 回读校验（P2 双镜像的 T-12 等价断言）：把**最终产物镜像**重新 unpack，
+     * 确认 ramdisk 里真的有 `init.sproot.rc`，且 `init.rc` 里确实有 import 行。
+     *
+     * 为什么必须回读最终镜像：注入是在 unpack 出来的 ramdisk.cpio 上做的，
+     * 若 repack 静默用了原始 ramdisk（与 kernel repack 同类的坑），
+     * 注入就丢失了，而 UI 还显示"已注入自启"——这正是要杜绝的"看起来成功实则无效"。
+     */
+    fun verifyProduct(context: Context, image: File, workDir: File): VerifyResult {
+        val dir = File(workDir, "verify_rc").apply { mkdirs() }
+        image.copyTo(File(dir, image.name), overwrite = true)
+        val unpack = MagiskBoot.exec(context, listOf("unpack", image.name), dir, 180_000) { line ->
+            AppLog.debug("cpio", line)
+        }
+        if (unpack.timedOut || unpack.exitCode != 0) {
+            return VerifyResult(false, "产物 unpack 失败（magiskboot exit=${unpack.exitCode}）")
+        }
+        val ramdisk = File(dir, "ramdisk.cpio")
+        if (!ramdisk.isFile || ramdisk.length() == 0L) {
+            return VerifyResult(false, "产物里没有 ramdisk.cpio（rc 注入无从生效）")
+        }
+        val exists = MagiskBoot.exec(
+            context,
+            listOf("cpio", ramdisk.name, "exists $RCFILE"),
+            dir,
+            timeoutMs = 60_000,
+        ) { AppLog.debug("cpio", it) }
+        if (exists.exitCode != 0) {
+            return VerifyResult(false, "产物 ramdisk 里不存在 $RCFILE（注入未进最终镜像）")
+        }
+        val extract = MagiskBoot.exec(
+            context,
+            listOf("cpio", ramdisk.name, "extract init.rc init.rc.verify"),
+            dir,
+            timeoutMs = 60_000,
+        ) { AppLog.debug("cpio", it) }
+        if (extract.exitCode != 0) {
+            return VerifyResult(false, "无法从产物 ramdisk 取出 init.rc（exit=${extract.exitCode}）")
+        }
+        val initRc = File(dir, "init.rc.verify")
+        if (!initRc.isFile) {
+            return VerifyResult(false, "产物 ramdisk 的 init.rc 未落地到校验目录")
+        }
+        val hasImport = initRc.readText().lineSequence().any { it.trim() == IMPORT_LINE }
+        return if (hasImport) {
+            VerifyResult(true, "$RCFILE 与 "$IMPORT_LINE" 均在最终产物 ramdisk 中")
+        } else {
+            VerifyResult(false, "产物 init.rc 缺少 "$IMPORT_LINE"（import 未生效）")
+        }
+    }
+
     /** 回滚：用 ramdisk.cpio.orig 覆盖 ramdisk.cpio（AVB-2 等长冲突时使用） */
     fun rollback(workDir: File, ramdisk: File): Boolean {
         val backup = File(workDir, "ramdisk.cpio.orig")

@@ -30,6 +30,14 @@ object InstallState {
         ERROR("错误", "上次修补失败，详情见修补页（错误常驻可复读）"),
     }
 
+    /** 单个产物（P2 双镜像：boot 与 init_boot 各一条） */
+    data class Artifact(
+        val label: String,
+        val displayPath: String,
+        val sha256: String,
+        val bytes: Long,
+    )
+
     data class Snapshot(
         val status: Status = Status.UNPATCHED,
         val artifactDisplayPath: String? = null,
@@ -38,6 +46,8 @@ object InstallState {
         val kernelEqualLength: Boolean? = null,
         val updatedAt: Long = 0L,
         val note: String? = null,
+        /** 本次修补的全部产物（boot / init_boot）；旧数据为空表示只有 artifactDisplayPath 一个 */
+        val artifacts: List<Artifact> = emptyList(),
     ) {
         val updatedAtText: String
             get() = if (updatedAt <= 0L) "—" else
@@ -62,6 +72,18 @@ object InstallState {
             },
             updatedAt = prefs.getLong("updated_at", 0L),
             note = prefs.getString("note", null),
+            artifacts = prefs.getString("artifacts", null)?.lineSequence()
+                ?.mapNotNull { line ->
+                    val p = line.split('\t')
+                    if (p.size >= 4) {
+                        Artifact(
+                            label = p[0],
+                            displayPath = p[1],
+                            sha256 = p[2],
+                            bytes = p[3].toLongOrNull() ?: 0L,
+                        )
+                    } else null
+                }?.toList().orEmpty(),
         )
     }
 
@@ -74,6 +96,10 @@ object InstallState {
             .putString("kernel_equal_length", snapshot.kernelEqualLength?.toString())
             .putLong("updated_at", snapshot.updatedAt)
             .putString("note", snapshot.note)
+            .putString(
+                "artifacts",
+                snapshot.artifacts.joinToString("\n") { "${it.label}\t${it.displayPath}\t${it.sha256}\t${it.bytes}" },
+            )
             .apply()
         AppLog.info(TAG, "状态 → ${snapshot.status.label}（${snapshot.note ?: "无备注"}）")
     }
@@ -93,6 +119,7 @@ object InstallState {
         artifactBytes: Long,
         kernelEqualLength: Boolean,
         audit: String? = null,
+        artifacts: List<Artifact> = emptyList(),
     ) {
         val note = buildString {
             append("导出成功，等待刷入")
@@ -108,6 +135,7 @@ object InstallState {
                 kernelEqualLength = kernelEqualLength,
                 updatedAt = System.currentTimeMillis(),
                 note = note,
+                artifacts = artifacts,
             ),
         )
     }
