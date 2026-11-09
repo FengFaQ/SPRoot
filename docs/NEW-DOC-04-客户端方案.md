@@ -479,3 +479,35 @@ CI 行为（硬失败）：
 ---
 
 *文档完 · 客户端 · 2026-11-08*
+
+---
+
+## 10. 客户端推前自检（quality/static，CI 门禁）
+
+背景：2026-11-09 P2 双镜像开发期间连续两次"CI 才暴露的低级编译错误"
+（字符串模板嵌套双引号；组件漏 import / 具名参数改名漏同步），每轮浪费 4–5 分钟 CI 周期。
+事后沉淀为 3 个零依赖脚本，已进 **`quality/static/`** 并由 **`.github/workflows/ci-static.yml`**
+作为门禁执行——**任何人改 `app/` 都会被拦住**，不再依赖「记得跑」。
+
+| 脚本 | 查什么 | 真实事故形态 |
+|---|---|---|
+| `check_kt_syntax.py` | 普通字符串/字符字面量/三引号是否闭合；`()[]{}` 是否配对；块注释闭合；**字符串闭合后紧邻 `$` 或 ASCII 标识符**（= 内层双引号未转义） | `VerifyResult(true, "$RCFILE 与 "$IMPORT_LINE" 均…")` —— 词法上被切成 3 段，编译器才报 `Expecting ')'` |
+| `check_kt_signatures.py` | 扫描仓库内 `fun Name(...)` 形参名，比对所有 `Name(x = ...)` 调用点的具名参数 | `FlashGuide` 形参改名 `onCopy`，调用点仍写 `onCopyCommand =` → `No parameter with name` |
+| `check_kt_imports.py` | 大写类型/Composable 定义所在包 vs 使用点是否 import（跳过注释/同包/全限定名） | `ui/pages/PatchPage.kt` 用 `WarningCard`（定义在 `ui.components`）漏 import → `Unresolved reference` |
+
+用法（本地，与 CI 完全相同）：
+
+```bash
+python3 quality/static/check_kt_syntax.py
+python3 quality/static/check_kt_signatures.py
+python3 quality/static/check_kt_imports.py
+# 均可加 --root <dir> 指向别处（便于用负样本自测）
+```
+
+边界（**不替代编译器**）：只做词法/签名/import 级启发式，查不出类型错误、未解析符号
+（除跨包漏 import）、泛型推导等；真正编译仍以 GitHub Actions 为唯一来源。
+新增断言必须先用负样本证明它会 FAIL（本仓库既有纪律）。
+
+---
+
+*文档完（v0.2 增补 §9.0 / §10 与 P2 双镜像、UI 重做、47 字符密钥口径）*
