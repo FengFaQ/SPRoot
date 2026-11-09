@@ -54,6 +54,8 @@ import com.sproot.manager.ui.components.ConfirmDialog
 import com.sproot.manager.ui.components.LogPanel
 import com.sproot.manager.ui.components.copyToClipboard
 import com.sproot.manager.ui.components.maskSecret
+import com.sproot.manager.ui.components.WarningCard
+import com.sproot.manager.ui.components.WarningLevel
 import com.sproot.manager.ui.components.rememberBlurBackdrop
 import com.sproot.manager.ui.theme.LocalEnableBlur
 import top.yukonga.miuix.kmp.basic.BasicComponent
@@ -551,7 +553,7 @@ private fun SuccessCard(
                 FlashGuide(
                     bootPath = state.outputPath!!,
                     initBootPath = state.initBootOutputPath,
-                    onCopyCommand = onCopyCommand,
+                    onCopy = onCopyCommand,
                 )
             }
             Spacer(Modifier.height(8.dp))
