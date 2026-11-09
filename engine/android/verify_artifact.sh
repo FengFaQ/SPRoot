@@ -190,7 +190,13 @@ fi
 # 修复语义：①只有默认 workdir（out_path + ".work"）才回收；
 #           ②--out 落在 workdir 之内时，无论如何都不删除。
 # 此处为静态防回退断言；行为级用例见 Tier B（需真样本）与质测真机回归。
-A9_SRC="$ROOT/src/skroot_patch_main.cpp"
+# 注意：$ROOT 是构建产物目录（engine/android/build/arm64），源码在 engine/src。
+# 之前误写 "$ROOT/src/..." 导致 CI 假失败（grep 找不到文件 → 三条断言全红）。
+A9_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/skroot_patch_main.cpp"
+if [ ! -f "$A9_SRC" ]; then
+  echo "FATAL: 找不到引擎源码 $A9_SRC（A9 断言无法执行，说明脚本路径推导有误）"
+  exit 1
+fi
 if grep -q "workdir preserved (owned by caller)" "$A9_SRC" 2>/dev/null; then
   pass "A9a workdir 所有权保护存在"
 else
