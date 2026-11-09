@@ -15,7 +15,7 @@
 | 项 | 结论 |
 |---|---|
 | 旧病根 | 唯一产物 `engine/src/skroot-patch` 是**宿主 x86-64 glibc 动态 ELF**（`e_machine=0x3E`、带 `PT_INTERP=/lib64/ld-linux-x86-64.so.2`），并且从未进 APK。详见 NEW-DOC-03。 |
-| 本方案 | `engine/android/build_arm64.sh` 用 **NDK r27c clang 18.0.3** 交叉编译同一份 C++ 源码（含新增内置 bootimg 处理），产出 **AArch64** 两种形态：①静态可执行 `skroot-patch`（2,920,512 B，工具/排障用，**不进 APK**）②**JNI 共享库 `libskrootpatch.so`**（2,987,088 B，`System.loadLibrary("skrootpatch")`，进 `jniLibs`）。两者均通过 ELF/契约断言。 |
+| 本方案 | `engine/android/build_arm64.sh` 用 **NDK r27c clang 18.0.3** 交叉编译同一份 C++ 源码（含新增内置 bootimg 处理），产出 **AArch64** 两种形态：①静态可执行 `skroot-patch`（**2,950,880 B**，工具/排障用，**不进 APK**）②**JNI 共享库 `libskrootpatch.so`**（**3,018,552 B**，`System.loadLibrary("skrootpatch")`，进 `jniLibs`）。两者均通过 ELF/契约断言。 |
 | 关键坑（已实测） | NDK 静态可执行文件必须用 **`ANDROID_API>=29`** 编译，否则 `PT_TLS p_align=8`，bionic 启动即 abort；API≥29 才输出 `p_align=0x40`。 |
 | 无真机验证 | `verify_artifact.sh`：Tier A（ELF/契约，qemu-user 可跑，**ALL PASS**）+ Tier B（真内核字节级断言）。**已用魅族 21 官方 boot.img 全链实测**：抽 kernel sha256 与 qa ground truth 一致、补丁 rc=0、等长、可确定性复现、重打包等长。 |
 | **`--workdir` 所有权契约（2026-11-09 真机事故后）** | **显式传入 `--workdir` ⇒ 目录及内容生命周期归调用方，引擎不得删除其中任何内容；只有默认 workdir（`<out>.work`）由引擎成功收尾时回收**（§8.1）。行为证据：A9d `--self-test-workdir` 13 例矩阵（CI 必跑）+ Tier B B9 事故现场回归 / B10 默认回收正控。 |
@@ -23,7 +23,7 @@
 | 推荐集成 | **主形态 JNI（`libskrootpatch.so` + `System.loadLibrary("skrootpatch")`）**，次形态静态 exec（`skroot-patch` 从 `nativeLibraryDir` 真实路径 exec，**禁止** symlink 到 `filesDir`；该可执行件默认不进 APK）。 |
 | 实测编译耗时 | 全量 100+ TU，12 核并行 **18 秒**（`make objs`，见 §3.4）。 |
 | 打包工具 | **magiskboot v31.1 ARM64**（SKRoot 官方路径；988,984 B，静态 AArch64，sha256 `97e9ec75…bb54`），CI 内固定版本+哈希校验并随 artifact 分发；自研 bootimg 保留为交叉校验/回退（§7）。**禁止 AIK**。 |
-| CI 证据 | ✅ **run 42486757913**（engine-arm64, v2, aee97046）**success**，artifact `skroot-engine-arm64`（1,846,449 B）；ELF/契约 6 项断言全绿（§5.2）。 |
+| CI 证据 | ✅ **最新 run 42635720094**（engine-arm64, v2, 907f5ad）**success**，artifact `skroot-engine-arm64`（2,421,354 B）：`libskrootpatch.so` sha256 `62955d8f…82fd1` / 3,018,552 B，`skroot-patch` sha256 `29908b1c…a8052` / 2,950,880 B；Tier A 全绿含 **A6g/A6h/A9d/A10**（workdir 所有权 + 密钥 ABI 行为断言，CI 必跑）。历史 run 42486757913 / 42487185268 见 §5.2。 |
 | AVB/刷入 | 主路径 = **只刷 boot**（`--slot=all`），**禁止**动 vbmeta / `--disable-verification`；产物须严格等于分区大小且逐字节保留内嵌 vbmeta+footer（§7.4） |
 
 ---
@@ -138,18 +138,18 @@ llvm-strip --strip-all <build>/jni/libskrootpatch.so
 
 | 产物 | 路径 | 大小 | sha256（前 32 位） | 类型 |
 |---|---|---|---|---|
-| 静态可执行（工具/排障，**不进 APK**） | `engine/dist/skroot-patch-arm64`（源码产物 `build/arm64/exec/skroot-patch`） | **2,920,512 B** | `ae967d2788c47d9e833daa6d7799328a` | `ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped` |
-| **JNI 共享库（APK 内 `libskrootpatch.so`）** | `engine/dist/libskrootpatch-arm64-jni.so`（源码产物 `build/arm64/jni/libskrootpatch.so`） | **2,987,088 B** | `9788ab74b69161e7f1237daa58154d35` | `ELF 64-bit LSB shared object, ARM aarch64, dynamically linked`，`SONAME=libskrootpatch.so`，NEEDED 仅 `libm.so/libdl.so/libc.so`，导出 `Java_me_sproot_patch_NativeEngine_patch/engineVersion` |
+| 静态可执行（工具/排障，**不进 APK**） | `engine/dist/skroot-patch-arm64`（源码产物 `build/arm64/exec/skroot-patch`） | **2,950,880 B** | `29908b1c5aeef254…` | `ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped` |
+| **JNI 共享库（APK 内 `libskrootpatch.so`）** | `engine/dist/libskrootpatch-arm64-jni.so`（源码产物 `build/arm64/jni/libskrootpatch.so`） | **3,018,552 B** | `62955d8fedab5c24…` | `ELF 64-bit LSB shared object, ARM aarch64, dynamically linked`，`SONAME=libskrootpatch.so`，NEEDED 仅 `libm.so/libdl.so/libc.so`，导出 `Java_me_sproot_patch_NativeEngine_patch/engineVersion` |
 
 > **命名约定（与 app-client 对齐，重要）**：APK `jniLibs/arm64-v8a/libskrootpatch.so` 必须是**JNI 共享库**（ET_DYN，`System.loadLibrary("skrootpatch")`）；独立可执行文件改名 `skroot-patch`（裸名），**绝不放进 jniLibs**，避免"名字像库实为 ET_EXEC、loadLibrary 必崩"的混淆。
 
 > 注：以上为**本地参考构建**（同一脚本、同一 NDK）。按人类规则「禁止本地编译产物作为交付」，正式交付物只取 CI artifacts（§5）。含 bootimg 功能后体积较首版 +15.5 KB。
 
-完整摘要见 `engine/dist/SHA256SUMS`：
+完整摘要（**以 CI artifact 为准**，run 42635720094 / 907f5ad；本地参考构建与 CI 逐字节一致）：
 
 ```
-ae967d2788c47d9e833daa6d7799328ab4443fa4f9303cdd7a80608ca8f37738  skroot-patch-arm64
-9788ab74b69161e7f1237daa58154d3532aa96eab719a3a85f086a156bdcaaf9  libskrootpatch-arm64-jni.so
+29908b1c5aeef2544da15296fdd72a6e9e2cf8d3b524eb278717e9beff0a8052  skroot-patch            (2,950,880 B)
+62955d8fedab5c24ae87b9472c6c5506aab55efe7d57964b03da4c54a1382fd1  libskrootpatch.so       (3,018,552 B)
 ```
 
 ELF 证据链（`readelf`）：
@@ -284,7 +284,7 @@ tasks.named("preBuild") { dependsOn(copyEngine, assertEngine) }
 | **正式绿 run（含 magiskboot）** | ✅ **run 42487185268**（engine-arm64, v2, 5749ef48）**success**：11/11 步骤全绿，artifacts **2 个** → `skroot-engine-arm64`（2,337,542 B，含两形态 + SHA256SUMS + magiskboot）与 `magiskboot-arm64`（491,115 B，含 `magiskboot` + `magiskboot-meta.txt`）。链接：https://github.com/FengFaQ/SPRoot/actions/runs/42487185268 |
 | 历史绿 run（无 magiskboot） | run 42486757913（aee97046）success，1 artifact（1,846,449 B） |
 | **2026-11-09 追加：workdir 所有权 + 密钥 ABI 加固后的本地全量验证** | ✅ **Tier A + Tier B 均 ALL PASS**（真内核 `samples/meizu21` 抽出的 33,892,864 B Image，qemu 两次真修补）：A9d 13 例矩阵、A10 17 例 keyabi、B7（`new_bytes` 96 hex + `key_spec` 六字段）、B9 事故现场（`--out` 在显式 `--workdir` 内：rc=0 且产物/报告/目录全在）、B9d（stdout 末行 = `ROOT_KEY=`）、B10（默认 `<out>.work` 已回收）。**负样本全部打红**：workdir 回退「无条件删」→5 例 FAIL、回退 8a196f0 原版→2 例 FAIL；key 写 49 字节→3 例 FAIL、写 48 可见字符无 NUL→3 例 FAIL、`key_spec` 字段改错→2 例 FAIL |
-| **本次 CI run（2026-11-09 加固后）** | ⏳ 推送后填写：run_id / 结论 / `exec` 与 `libskrootpatch.so` 的 sha256+size |
+| **本次 CI run（2026-11-09 加固后）** | ✅ **run 42635720094**（engine-arm64, v2, 907f5ad）**success**，15/15 步骤绿（trigger 步骤 skipped）。artifacts：`skroot-engine-arm64`（2,421,354 B）、`magiskboot-arm64`（491,115 B）。**`libskrootpatch.so`：sha256 `62955d8fedab5c24ae87b9472c6c5506aab55efe7d57964b03da4c54a1382fd1`，size 3,018,552 B**；`skroot-patch`（exec）：sha256 `29908b1c5aeef2544da15296fdd72a6e9e2cf8d3b524eb278717e9beff0a8052`，size 2,950,880 B。CI 日志实测：A6g/A6h、A9a~A9f、A9d-3 用例、A10 17 例、A10s、A10r 全 PASS，`RESULT: ALL PASS`。链接：https://github.com/FengFaQ/SPRoot/actions/runs/42635720094 |
 
 ---
 
@@ -635,9 +635,9 @@ magiskboot 来自 Magisk（**GPL-3.0**），我们以**独立可执行程序**�
 
 | 组合 | 增量 | 评价 |
 |---|---|---|
-| 仅 JNI 形态 | **2.82 MB** | 推荐（单产物、单调用路径） |
-| 仅 exec 形态 | 2.76 MB | 需 legacy packaging + 路径规范 |
-| 两形态都带 | 5.58 MB | 仅调试期（排障时 exec 形态可直接抓 stderr） |
+| 仅 JNI 形态 | **2.88 MB**（3,018,552 B） | 推荐（单产物、单调用路径） |
+| 仅 exec 形态 | 2.81 MB（2,950,880 B） | 需 legacy packaging + 路径规范 |
+| 两形态都带 | 5.69 MB | 仅调试期（排障时 exec 形态可直接抓 stderr） |
 
 优化空间（未实施，列入 §10-R3）：裁掉 asmjit x86 后端（~200 KB）、`-ffunction-sections -Wl,--gc-sections`、`-flto`（预估可降到 ~2.0–2.3 MB）；`capstone` 仅 A64 已裁，`cJSON` 不可省（report）。
 
