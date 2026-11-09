@@ -130,8 +130,6 @@ dependencies {
     implementation(libs.androidx.compose.foundation)
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.activity.compose)
-    // KSU miuix 版底栏/首页使用 Material Icons（Icons.Rounded.Cottage 等）
-    implementation(libs.androidx.compose.material.icons.extended)
 
     // miuix 五模块（照抄 KernelSU 的 miuix 实现所需的最小集）
     //  ui        —— 基础组件（Scaffold/TopAppBar/Card/NavigationBar/NavigationRail…）

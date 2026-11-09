@@ -1,11 +1,6 @@
 package com.sproot.manager.ui.components
 
 import androidx.compose.foundation.pager.PagerState
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Cottage
-import androidx.compose.material.icons.rounded.Extension
-import androidx.compose.material.icons.rounded.Handyman
-import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -30,6 +25,11 @@ import top.yukonga.miuix.kmp.basic.NavigationRailItem
 import top.yukonga.miuix.kmp.basic.NavigationRailValue
 import top.yukonga.miuix.kmp.basic.rememberNavigationRailState
 import top.yukonga.miuix.kmp.blur.LayerBackdrop
+import top.yukonga.miuix.kmp.icon.MiuixIcons
+import top.yukonga.miuix.kmp.icon.extended.Home
+import top.yukonga.miuix.kmp.icon.extended.Layers
+import top.yukonga.miuix.kmp.icon.extended.Settings
+import top.yukonga.miuix.kmp.icon.extended.Update
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.utils.springAnimateToPage
 
@@ -97,10 +97,10 @@ fun rememberMainPagerState(
 
 /** 底部导航目的地（页面映射：Home→主页 / Install+Flash→修补 / Module→模块 / Settings→设置）。 */
 enum class BottomBarDestination(val label: String, val icon: ImageVector) {
-    Home("主页", Icons.Rounded.Cottage),
-    Patch("修补", Icons.Rounded.Handyman),
-    Module("模块", Icons.Rounded.Extension),
-    Setting("设置", Icons.Rounded.Settings),
+    Home("主页", MiuixIcons.Home),
+    Patch("修补", MiuixIcons.Update),
+    Module("模块", MiuixIcons.Layers),
+    Setting("设置", MiuixIcons.Settings),
 }
 
 /** 照抄 KernelSU `BottomBarMiuix`（去掉浮动底栏/角标等 KSU 专有能力）。 */

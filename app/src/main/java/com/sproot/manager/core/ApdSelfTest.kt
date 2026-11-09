@@ -7,8 +7,10 @@ import android.content.Context
  *
  * 语义（契约 v1.1 + sys-guard 自检约定）：
  *  - `stage=undeployed` 时进程 **exit 0**（"AP 未部署" 是正常状态，不是错误）→ UI 显示"未部署"；
+ *  - **exit 125（提权被内核静默拒绝）在首启时同样是正常初始态**：说明内核尚未刷入修补镜像，
+ *    不是"自检失败"。文案必须是「尚未部署 AP 守护（需先刷入修补后的镜像）」，且不得标红；
  *  - 其它 stage（如 `deployed` / `daemon_ready` / `needs_repair`）按 stage 原样展示；
- *  - 失败（非 0 且非 undeployed）→ 显示"自检失败"并保留原始输出。
+ *  - 失败（非 0 且非上述正常初始态）→ 显示"自检失败"并保留原始输出。
  *
  * 结果写入 SharedPreferences，供主页/设置页**只读展示**（避免每次进页面都起进程）。
  */
@@ -32,15 +34,31 @@ object ApdSelfTest {
                 "daemon_ready" -> "守护已就绪"
                 "needs_repair" -> "需修复（重新部署）"
                 "no_ap_binary" -> "AP 二进制缺失"
-                "escalation_failed" -> "密钥无效或需重新修补"
+                // 首启最常见：客户端有密钥但内核未刷补丁镜像 → apd root-exec 返回 125。
+                // 这是**正常初始态**，不能写成"密钥无效/失败"。
+                "escalation_failed" -> "尚未部署 AP 守护（需先刷入修补后的镜像）"
                 "timeout" -> "自检超时"
                 "parse_failed" -> "自检输出无法解析"
                 "unknown" -> "未知状态"
                 else -> stage.ifBlank { "未知" }
             }
 
-        fun describe(): String =
-            "stage=$stage（$stageLabel），exit=$exitCode，${if (ok) "自检通过" else "自检未通过"}，$summary"
+        /** 正常初始态：AP 未部署（exit 0）或内核未刷补丁导致提权被拒（exit 125） */
+        val isNormalInitialState: Boolean
+            get() = stage == "undeployed" || stage == "escalation_failed"
+
+        fun describe(): String = buildString {
+            append("stage=").append(stage).append("（").append(stageLabel).append("），exit=")
+            append(exitCode).append("，")
+            append(
+                when {
+                    isNormalInitialState -> "正常初始态（无需处理；刷入修补镜像并部署 AP 后可用）"
+                    ok -> "自检通过"
+                    else -> "自检未通过"
+                },
+            )
+            append("，").append(summary)
+        }
     }
 
     fun load(context: Context): Result? {

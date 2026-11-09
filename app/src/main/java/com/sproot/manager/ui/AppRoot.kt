@@ -32,7 +32,7 @@ import com.sproot.manager.ui.components.NavigationRailMiuix
 import com.sproot.manager.ui.components.rememberBlurBackdrop
 import com.sproot.manager.ui.components.rememberMainPagerState
 import com.sproot.manager.ui.components.shouldShowSplitPane
-import com.sproot.manager.ui.pages.HomePage
+import com.sproot.manager.ui.pages.HomePager
 import com.sproot.manager.ui.pages.ModulesPage
 import com.sproot.manager.ui.pages.PatchPage
 import com.sproot.manager.ui.pages.SettingsPage
@@ -119,7 +119,13 @@ private fun MainScreen(
                 overscrollEffect = null,
             ) { page ->
                 when (page) {
-                    0 -> HomeTab(blurBackdrop, onGoPatch = { mainPagerState.animateToPage(1) })
+                    // 主页自带 Scaffold + 毛玻璃 TopAppBar（照抄 KSU HomeMiuix 结构），
+                    // 因此不再套 TabScaffold；其余页在后续步骤逐个改成同样结构。
+                    0 -> HomePager(
+                        bottomInnerPadding = bottomInnerPadding,
+                        isCurrentPage = page == mainPagerState.selectedPage,
+                        onGoPatch = { mainPagerState.animateToPage(1) },
+                    )
                     1 -> PatchTab(blurBackdrop)
                     2 -> ModuleTab(blurBackdrop)
                     else -> SettingsTab(
@@ -185,13 +191,6 @@ private fun TabScaffold(
             .only(WindowInsetsSides.Horizontal),
     ) { innerPadding ->
         content(innerPadding)
-    }
-}
-
-@Composable
-private fun HomeTab(backdrop: LayerBackdrop?, onGoPatch: () -> Unit) {
-    TabScaffold(title = "SPRoot", backdrop = backdrop) { inner ->
-        HomePage(modifier = Modifier.padding(inner), onGoPatch = onGoPatch)
     }
 }
 
