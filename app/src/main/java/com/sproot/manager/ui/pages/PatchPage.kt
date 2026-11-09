@@ -492,7 +492,11 @@ private fun SuccessCard(
                 color = colorScheme.onSurface,
             )
             Text(
-                text = "导出了 ≠ 刷进去了：请按下方指引手动刷入；刷入后回到本页标记状态",
+                text = if (state.initBootOutputPath != null) {
+                    "导出了 ≠ 刷进去了：boot + init_boot 两个产物都要刷（见下方指引）；刷入后回到本页标记状态"
+                } else {
+                    "导出了 ≠ 刷进去了：请按下方指引手动刷入；刷入后回到本页标记状态"
+                },
                 fontSize = 13.sp,
                 color = colorScheme.onSurfaceVariantSummary,
             )
@@ -620,9 +624,16 @@ private fun FlashGuide(bootPath: String, initBootPath: String?, onCopy: (String)
             }
             Spacer(Modifier.height(6.dp))
             Text(
-                text = "⚠️ 仅刷 boot 分区；不要刷 vbmeta、不要加 --disable-verity/--disable-verification。\n" +
-                    "若 bootloader 仍锁着，刷入后将无法开机（属预期）——请确认已解锁后再刷。\n" +
-                    "刷前记录本页 sha256；刷坏可用本页「原镜像备份」还原。",
+                text = if (initBootPath != null) {
+                    "⚠️ 只刷 boot / init_boot 两个分区（按①→②顺序，各自 --slot=all）；" +
+                        "不要刷 vbmeta、不要加 --disable-verity/--disable-verification。\n" +
+                        "若 bootloader 仍锁着，刷入后将无法开机（属预期）——请确认已解锁后再刷。\n" +
+                        "刷前记录本页两个产物的 sha256；刷坏可用本页「原镜像备份」还原。"
+                } else {
+                    "⚠️ 仅刷 boot 分区；不要刷 vbmeta、不要加 --disable-verity/--disable-verification。\n" +
+                        "若 bootloader 仍锁着，刷入后将无法开机（属预期）——请确认已解锁后再刷。\n" +
+                        "刷前记录本页 sha256；刷坏可用本页「原镜像备份」还原。"
+                },
                 fontSize = 12.sp,
                 color = colorScheme.error,
             )
