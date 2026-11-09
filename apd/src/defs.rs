@@ -76,6 +76,20 @@ pub const ALLOW_LIST_LOCK_FILE: &str = concatcp!(WORKING_DIR, "allow_list.lock")
 /// Single-instance lock for the resident daemon (`apd daemon`).
 pub const DAEMON_LOCK_FILE: &str = concatcp!(WORKING_DIR, "daemon.lock");
 
+// ---------------------------------------------------------------------------
+// Three-state authorisation store + audit log (NEW-DOC-05 §13, 2026-11-10).
+// The legacy csv above stays on disk as the one-way **migration source**; the
+// JSON document below is authoritative for every decision since the tri-state
+// upgrade (`allow | deny | ask`). One writer (flock), tmp+rename for readers.
+// ---------------------------------------------------------------------------
+pub const AUTH_LIST_FILE: &str = concatcp!(SPROOT_DIR, "auth_list.json");
+pub const AUTH_LIST_TMP_FILE: &str = concatcp!(SPROOT_DIR, "auth_list.json.tmp");
+/// Append-only JSONL audit trail for grant/deny/ask events (0600, capped).
+pub const AUTH_LOG_FILE: &str = concatcp!(SPROOT_DIR, "auth_log.jsonl");
+pub const AUTH_LOG_TMP_FILE: &str = concatcp!(SPROOT_DIR, "auth_log.jsonl.tmp");
+/// Over this size the log is rewritten down to the newest 500 events.
+pub const AUTH_LOG_MAX_BYTES: u64 = 256 * 1024;
+
 /// File holding the abstract unix socket name used by the su authorisation
 /// channel (`@sproot-<12 hex>`). World readable so the client library can find
 /// the daemon; the name itself carries no key material (contract v1.1 §0.4).

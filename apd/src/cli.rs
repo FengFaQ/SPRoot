@@ -124,9 +124,39 @@ enum Commands {
 
 #[derive(clap::Subcommand, Debug)]
 enum AuthCmd {
-    /// List the allow list as JSON
-    List,
-    /// Grant root to <uid> (optionally updating pkg/to_uid/scontext)
+    /// List the three-state authorisation table (JSON)
+    List {
+        /// Accepted for CLI uniformity; the output is always JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set the tri-state of <uid>: allow | deny | ask
+    Set {
+        #[arg(long)]
+        uid: i32,
+        #[arg(long, value_enum)]
+        state: AuthStateArg,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the authorisation audit log (newest first, sanitised)
+    Log {
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Revoke root from <uid> (equivalent to `set --state deny`, row kept)
+    Revoke {
+        /// Positional form is kept for the v1.1 CLI contract
+        uid: Option<i32>,
+        /// Preferred form used by the manager: `auth revoke --uid 10086`
+        #[arg(long = "uid", value_name = "UID")]
+        uid_flag: Option<i32>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Grant root to <uid> (legacy form; equivalent to `set --state allow`)
     Grant {
         uid: i32,
         #[arg(long, default_value = "")]
@@ -136,12 +166,28 @@ enum AuthCmd {
         #[arg(long, default_value = "")]
         scontext: String,
     },
-    /// Revoke root from <uid>
-    Revoke { uid: i32 },
     /// Mark <uid> as excluded from module effects
     Exclude { uid: i32 },
     /// Clear the module-exclusion bit of <uid>
     Unexclude { uid: i32 },
+}
+
+/// CLI spelling of [`auth_list::AuthState`] (clap value enum).
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum AuthStateArg {
+    Allow,
+    Deny,
+    Ask,
+}
+
+impl From<AuthStateArg> for auth_list::AuthState {
+    fn from(value: AuthStateArg) -> Self {
+        match value {
+            AuthStateArg::Allow => auth_list::AuthState::Allow,
+            AuthStateArg::Deny => auth_list::AuthState::Deny,
+            AuthStateArg::Ask => auth_list::AuthState::Ask,
+        }
+    }
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -589,18 +635,77 @@ fn run_auth(command: AuthCmd) -> Result<()> {
         std::process::exit(125);
     }
     match command {
-        AuthCmd::List => println!("{}", auth_list::list_json()?),
+        AuthCmd::List { .. } => println!("{}", auth_list::list_json()?),
+        AuthCmd::Set { uid, state, json } => {
+            let change = auth_list::set_state(uid, state.into())?;
+            print_change(&change, json);
+        }
+        AuthCmd::Log { json, limit } => {
+            if json {
+                println!("{}", auth_list::log_json(limit)?);
+            } else {
+                let events = auth_list::log_events(limit)?;
+                if events.is_empty() {
+                    println!("auth log: empty");
+                }
+                for event in events {
+                    println!(
+                        "{} uid={} pkg={} event={} decision={} previous={} cmd={} args={}",
+                        event.iso,
+                        event.uid,
+                        event.package.as_deref().unwrap_or("-"),
+                        event.event,
+                        event.decision.as_deref().unwrap_or("-"),
+                        event.previous.as_deref().unwrap_or("-"),
+                        event.cmd_name.as_deref().unwrap_or("-"),
+                        event.cmd_args.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+                    );
+                }
+            }
+        }
+        AuthCmd::Revoke { uid, uid_flag, json } => {
+            let Some(uid) = uid_flag.or(uid) else {
+                anyhow::bail!("auth revoke needs --uid <UID>");
+            };
+            let change = auth_list::revoke(uid)?;
+            print_change(&change, json);
+        }
         AuthCmd::Grant {
             uid,
             pkg,
             to_uid,
             scontext,
-        } => auth_list::grant(uid, &pkg, to_uid, &scontext)?,
-        AuthCmd::Revoke { uid } => auth_list::revoke(uid)?,
+        } => {
+            let change = auth_list::grant(uid, &pkg, to_uid, &scontext)?;
+            print_change(&change, false);
+        }
         AuthCmd::Exclude { uid } => auth_list::set_exclude(uid, true)?,
         AuthCmd::Unexclude { uid } => auth_list::set_exclude(uid, false)?,
     }
     Ok(())
+}
+
+/// `auth set/revoke --json` payload (stable ABI for the manager UI).
+fn print_change(change: &auth_list::Change, json: bool) {
+    if json {
+        let payload = serde_json::json!({
+            "ok": true,
+            "uid": change.uid,
+            "state": change.state,
+            "previous": change.previous,
+            "package": change.package,
+            "changed": change.changed,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+    } else {
+        println!(
+            "uid {}: {} -> {} ({})",
+            change.uid,
+            change.previous,
+            change.state,
+            change.package.as_deref().unwrap_or("unknown package")
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

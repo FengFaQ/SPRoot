@@ -201,10 +201,15 @@ pub fn root_shell() -> Result<()> {
     let request_uid = std::env::var(crate::supercall::REQUEST_UID_ENV)
         .ok()
         .and_then(|v| v.parse::<i32>().ok());
-    if !crate::auth_list::authorize(request_uid) {
+    let decision = crate::auth_list::authorize(request_uid);
+    if decision != crate::auth_list::Decision::Allow {
         // Silent deny: same visible behaviour as SK's silent kernel reject —
         // exit non-zero without explaining (contract §2.3 no information leak).
-        log::warn!("[root_shell] unauthorized request (denied)");
+        // `ask_pending` is a refusal too: no interactive prompt exists yet.
+        log::warn!(
+            "[root_shell] unauthorized request (decision={})",
+            decision.as_str()
+        );
         std::process::exit(1);
     }
     if free_idx < matches.free.len() {

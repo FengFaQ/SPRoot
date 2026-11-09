@@ -66,6 +66,13 @@ pub fn run(superkey: Option<SecretKey>) -> Result<()> {
 
     info!("[daemon] starting (pid={})", std::process::id());
 
+    // (0) Persist the tri-state authorisation store / audit log and finish a
+    //     pending legacy-csv migration before any request can arrive
+    //     (NEW-DOC-05 §13: upgrade must not lose grants).
+    if let Err(e) = auth_list::prepare_storage() {
+        warn!("[daemon] auth store prepare failed: {e:#}");
+    }
+
     // (1) Stage ② — non-blocking module service scripts.
     if let Err(e) = event::on_services(superkey.as_ref().map(SecretKey::as_str)) {
         warn!("[daemon] services stage failed: {e:#}");
@@ -258,26 +265,40 @@ fn handle_client(fd: RawFd) -> Result<()> {
     let request = read_request(&mut stream)?;
     let cmd = request.trim();
     if cmd.is_empty() {
-        return respond(&mut stream, false, "", "empty request", 2);
+        return respond(&mut stream, false, "", "empty request", 2, "deny");
     }
 
-    // Authorisation point (contract v1.1 §3.2(a)): SO_PEERCRED uid, table check.
-    if !auth_list::is_authorized(uid as i32) {
-        warn!("[daemon] denied uid {uid} (not in allow_list)");
-        return respond(&mut stream, false, "", "", 1);
+    // Authorisation point (contract v1.1 §3.2(a), NEW-DOC-05 §13): SO_PEERCRED
+    // uid + the tri-state table. `ask` is explicitly refused (`ask_pending`)
+    // until the interactive prompt exists — it must never fail open.
+    let decision = auth_list::authorize(Some(uid as i32));
+    // One audit event + request_count / last_*_at update per real request.
+    auth_list::record_request(uid as i32, decision, Some(cmd));
+    match decision {
+        auth_list::Decision::Allow => {}
+        auth_list::Decision::AskPending => {
+            warn!(
+                "[daemon] denied uid {uid}: state=ask (interactive prompt not implemented yet -> ask_pending)"
+            );
+            return respond(&mut stream, false, "", "ask_pending", 1, "ask_pending");
+        }
+        auth_list::Decision::Deny => {
+            warn!("[daemon] denied uid {uid} (state=deny or table unreadable)");
+            return respond(&mut stream, false, "", "", 1, "deny");
+        }
     }
 
     let su_path = format!("{}su", defs::BINARY_DIR);
     let su = Path::new(&su_path);
     if !su.exists() {
-        return respond(&mut stream, false, "", "su not deployed", 126);
+        return respond(&mut stream, false, "", "su not deployed", 126, "allow");
     }
 
     let (stdout, stderr, code) = match run_su(su, cmd, uid) {
         Ok(tuple) => tuple,
         Err(e) => (String::new(), format!("{e:#}"), 1),
     };
-    respond(&mut stream, true, &stdout, &stderr, code)
+    respond(&mut stream, true, &stdout, &stderr, code, "allow")
 }
 
 fn read_request(stream: &mut UnixStream) -> Result<String> {
@@ -351,12 +372,16 @@ fn respond(
     stdout: &str,
     stderr: &str,
     code: i32,
+    decision: &str,
 ) -> Result<()> {
     let payload = serde_json::json!({
         "ok": ok,
         "stdout": stdout,
         "stderr": stderr,
         "exit": code,
+        // NEW-DOC-05 §13: allow | deny | ask_pending (additive field; older
+        // clients simply ignore it).
+        "decision": decision,
     });
     stream
         .write_all(format!("{payload}\n").as_bytes())

@@ -353,6 +353,8 @@ service sproot-apd /data/adb/apd --superkey-file /data/adb/sproot/key daemon
 
 ### 4.4 授权表用户态化落地
 
+> **2026-11-10 更新（三态升级，见 §13 / 勘误 E6）**：授权表决策源已改为 `/data/adb/sproot/auth_list.json`（三态 `allow|deny|ask` + 审计日志 + CLI）。本节描述的 csv 机制**已降级为一次性迁移源**；单写者/原子写/uid 保护/熔断语义逐条保留在 §13。
+
 **存储**：`/data/adb/ap/allow_list`，csv 六列 `pkg,exclude,allow,uid,to_uid,sctx`（沿用 `package.rs:13-21` 的 `PackageConfig` 布局 + 表头 `package.rs:32`）。
 
 **一致性模型**：
@@ -388,6 +390,7 @@ service sproot-apd /data/adb/apd --superkey-file /data/adb/sproot/key daemon
 | **E3** | §3.2 + 时序稿 §3.6：`SP_REQUEST_UID` 由 SK do_execve hook 在 cred 改写时注入环境变量，供 AP 还原请求方 uid | **不可实施**：hook 在 do_execve 入口、任何 exec 语义之前，无能力构造新的 envp 数组（引擎亦无相关代码）；且提权后 `getuid()==0`，原 uid 已不可恢复 | 废弃 `SP_REQUEST_UID`；第三方身份用 **socket SO_PEERCRED**；`apd.rs:196-205` 的 env 读取删除 | **契约 v1.1 删除该需求**；`apd.rs` 改造 P0 |
 | **E4** | §3.2 授权表=`allow_list` csv（含 exclude 列）+ §3.6 另有 `exclude_list`（每行 uid） | 现实现把 exclude 放在 csv 行内（`PackageConfig.exclude`），`exclude_list` 未实现；两份存储 = 双写不一致风险 | **只保留单一 `allow_list`（含 exclude 列）**，删除 `exclude_list` 独立文件口径 | 简化，需会签确认 |
 | **E5** | 时序稿 §4：rc 注入/install_su/key 文件由独立部署器 `skroot-deploy` 交付 | 新架构「手机本地修补」：管理器在修补时即可写 rc；无独立部署器进程 | 部署职责并入 **管理器（rc 注入）+ AP `deploy` 子命令（install_su/key/目录）** | 分工变更，需 lead + 内核修补确认 |
+| **E6** | §3.2/E4：授权表 = 单文件 csv `allow_list`（`pkg,exclude,allow,uid,to_uid,sctx`） | 人类要求「root 授权页面」：需每应用三态 + 授权日志 + 搜索 → csv 无法表达状态/时间戳/计数 | 决策源改为 **`/data/adb/sproot/auth_list.json`**（三态 `allow|deny|ask` + `request_count`/`last_*_at`）+ 审计日志 `auth_log.jsonl`；csv 仅一次性迁移源（`allow&&!exclude`→allow，其它→deny），升级不丢授权 | 存储格式变更（决策语义不变，仍需会签）；详见 §13 |
 
 > **未偏差项**（保持逐条一致）：密钥方案 B 无状态传参（§2.3/§4）、错误码禁令/静默拒绝（§2.1/§2.3）、日志脱敏（§2.3）、su 路径契约的 argv[0] 分发（§3.4 前半）、`kp` 别名删除（§3.4）、安全模式三路（§3.5）、busybox 首装归属（§5）。
 
@@ -709,12 +712,119 @@ apd --superkey-file /data/adb/sproot/key daemon
 
 五处静态核对**全部一致**（唯一待回执项是第 5 处引擎侧，静态读码一致）。`apd` 侧第 1~4 处由 6 条新增单测（全仓 7 条全绿）+ 1 条编译期断言锁死，且每条新增断言都用负样本证明过会 FAIL。本节与 `docs/HANDOFF-2026-11-08.md` §6.7/§6.8、`docs/NEW-DOC-01` §3.5.4 互为索引。
 
+## 13. 授权模型（三态 + 日志，2026-11-10，apd-dev 落实）
+
+> 需求来源：人类「增加 root 授权功能页面」。本节定义 **授权表 ABI / CLI 契约 / daemon 判定语义**，供 `ui-client` 直接照做前端；实现落在 `apd/src/auth_list.rs`（存储与判定）、`apd/src/cli.rs`（`auth *`）、`apd/src/daemon.rs`（socket 判定点）。
+
+### 13.1 状态机与默认值
+
+| 状态 | 含义 | 请求行为 |
+|---|---|---|
+| `allow` | 已授权 | 放行 |
+| `deny` | 已拒绝 | 拒绝（静默，只留审计） |
+| `ask` | **默认**：还没决定 / 每次询问 | **本迭代拒绝**（`ask_pending`，见 13.4），交互式弹窗是 Phase 2 |
+
+- 受保护 uid `0`（root）、`2000`（adb shell）恒为 allow，且不写表。
+- **无行 = `ask`**（绝不隐式 allow）；表不可读 = **deny**（fail closed，与旧内核拒绝的一致可见行为）。
+- 迁移：旧 `/data/adb/ap/allow_list`（csv，契约 v1.1 §3.2/E4）在升级后**首次加载时一次性导入**：`allow==1 && exclude==0` → `allow`，其它已持久化行 → `deny`（旧纯白名单语义），`exclude/to_uid/sctx` 原样保留。csv **不再写入**，仅作只读迁移源与审计留档。**升级不丢授权。**
+
+### 13.2 存储 ABI
+
+- 权威文件：`/data/adb/sproot/auth_list.json`（0600 from creation，tmp+rename 原子，`flock` 单写者）。文档结构：
+
+```json
+{
+  "version": 1,
+  "entries": [
+    {
+      "uid": 10123,
+      "package": "com.example.granted",
+      "label": null,
+      "app_icon_path": null,
+      "state": "allow",
+      "last_grant_at": 1762670000,
+      "last_deny_at": null,
+      "request_count": 3,
+      "to_uid": 0,
+      "sctx": "",
+      "exclude": false
+    }
+  ]
+}
+```
+
+- `label` / `app_icon_path` 恒为 `null`：`PackageManager` 只在 App 侧可用，UI 用 `package`（或直接按 uid）自行解析；字段保留保证 schema 稳定。
+- 审计日志：`/data/adb/sproot/auth_log.jsonl`（0600，JSONL 追加；超过 256 KiB 自动重写为最新 500 条）。**每行不含完整命令与任何密钥**，只有脱敏摘要：`cmd_name`（可执行名，白名单字符，≤48）/ `cmd_args`（参数个数）/ `cmd_sha256`（SHA-256 前 16 hex，纯 Rust 实现，零新增依赖）。
+
+### 13.3 CLI 契约（全部 JSON，root-only；`apd` 已部署在 `/data/adb/apd`）
+
+| 命令 | 输出 |
+|---|---|
+| `apd auth list --json` | 裸数组：`AuthEntry[]`（见 13.2，`label/app_icon_path` 为 `null`） |
+| `apd auth set --uid <n> --state allow\|deny\|ask --json` | `{"ok":true,"uid":10123,"state":"allow","previous":"ask","package":"com.example","changed":true}` |
+| `apd auth revoke --uid <n> --json`（位置参数 `<n>` 兼容 v1.1 契约） | 同 `set --state deny` 的对象；行保留（`previous`/`state` 均可能为 `deny`） |
+| `apd auth log --json --limit N`（默认 100） | 裸数组，**最新在前**：`AuthEvent[]` |
+| `apd auth grant <uid> [--pkg --to-uid --scontext]` / `exclude` / `unexclude` | 旧 CLI 兼容：`grant` ≡ `set --state allow` 并写回映射字段，静默文本输出 |
+
+`AuthEvent` 样例（daemon 放行一次 `id` 请求；时间戳为 UTC ISO-8601）：
+
+```json
+{
+  "ts": 1762670000,
+  "iso": "2025-11-09T06:33:20Z",
+  "uid": 10123,
+  "package": "com.example.granted",
+  "event": "request",
+  "state": null,
+  "decision": "allow",
+  "previous": null,
+  "cmd_name": "id",
+  "cmd_args": 0,
+  "cmd_sha256": "a56145270ce6b3be",
+  "detail": null
+}
+```
+
+`event` 取值：`request`（每次 root 请求，`decision` ∈ `allow|deny|ask_pending`）、`set_state`、`revoke`、`grant`、`migrate`（一次性迁移摘要）。`state`/`previous` 为 `allow|deny|ask`。
+
+### 13.4 daemon / socket 判定语义
+
+1. socket 收请求 → `SO_PEERCRED` 取 uid（不可伪造）→ 三态判定；
+2. `allow` → fork 会话执行；
+3. `deny` → 拒绝（exit 1，静默）；
+4. **`ask` → 显式 `ask_pending` 拒绝**（本迭代未实现交互式弹窗；**绝不 fail-open**），并写审计 `decision="ask_pending"`；请求计数/`last_deny_at` 一并更新，UI 可据 `request_count` 提示用户；
+5. 每个真实请求**只记一条** `request` 事件（`apd.rs` 的 root-context 回退路径不重复计数）；
+6. socket 响应新增**加法字段** `"decision": "allow"|"deny"|"ask_pending"`（老客户端忽略之）；
+7. 判定点仍只有一处：`auth_list::authorize()`（`apd.rs` 的 `su` 入口同源）。
+
+### 13.5 断言与负样本（`cargo test`，全仓 15 条）
+
+| 测试 | 钉住 |
+|---|---|
+`auth_list::tests::migration_keeps_grants_and_denials` | 迁移不丢授权：`allow&&!exclude`→allow；其它已存行→deny；`exclude/to_uid/sctx` 保留；不凭空造 allow/ask
+`auth_list::tests::decide_is_three_state_and_never_implicit_allow` | 无行→`AskPending`（负样本：改成 allow 即 FAIL）；表不可读→deny；受保护 uid→allow
+`auth_list::tests::auth_state_parse_rejects_unknown` | 非法 state 拒绝（大写/`grant`/空/数字），不静默默认
+`auth_list::tests::command_digest_is_redacted` | 日志脱敏：只留 `cmd_name`+参数数+16 hex 摘要，命令与 `key` 字样不出现
+`auth_list::tests::entry_serialisation_roundtrip` | `state` 为小写字符串、可空字段显式 `null`、round-trip
+`auth_list::tests::iso8601_matches_known_epochs` | UTC ISO-8601 无日期依赖
+`utils::tests::sha256_matches_known_vectors` | 纯 Rust SHA-256 对照 FIPS 向量
+
+### 13.6 与契约 v1.1 的偏差（新勘误 E6，待会签）
+
+契约 v1.1 §3.2/E4 规定授权表为单文件 csv（`allow_list`）。三态升级后**决策源改为 JSON**（csv 仅迁移源）。影响：`package.rs` 的 csv 读写/同步路径标记为 legacy（保留不调用）；`selftest` 的 `allow_list` 检查名不变，detail 改为 JSON 计数（`allow=/deny=/ask=` + `legacy_migrated`）。其余安全语义（单写者、原子写、uid 保护、torn-read 熔断）逐条保留。
+
+### 13.7 待办
+
+1. **交互式 `ask` 弹窗（Phase 2）**：需要 App 常驻监听 + daemon↔App 双向事件（daemon 现只有请求侧 socket）。本轮明确以 `ask_pending` 拒绝收尾，已记入本节而非静默放行。
+2. `ui-client`：按 13.3 渲染三态列表/日志/搜索；`label`/`app_icon_path` 由 UI 用 `PackageManager` 解析（本侧恒 `null`）。
+
 ## 附录 A · 证据索引（本文所有结论的源码/文档出处）
 
 | 结论 | 出处 |
 |---|---|
 | 提权=execve(47 字符)，成功看 getuid()==0 | `engine/src/patch_do_execve.cpp:76-98,113-135`；`engine/src/skroot_patch_main.cpp:312-317`；`docs/SPROOT-DOC-A1` §4.1/§4.3 |
 | **密钥 ABI 全链（AP 文件 47 / 内核 47+NUL / 引擎 48→47+NUL / execve 必须 47）** | **§12**；`apd/src/deploy.rs::{abi_key,key_material}`；`apd/src/secret.rs::read_key_file`；`apd/src/supercall.rs::escalation_token`；`engine/src/skroot_patch_main.cpp:61-64,105-107,434-447,618-623` |
+| **授权三态 + 日志（ABI/CLI/判定）** | **§13**；`apd/src/auth_list.rs`（`authorize/decide/set_state/log_events/migrate_legacy`）；`apd/src/cli.rs::AuthCmd`；`apd/src/daemon.rs::handle_client`；`apd/src/defs.rs::{AUTH_LIST_FILE,AUTH_LOG_FILE}` |
 | 隐藏目录名=key[0:16]、filldir 双路隐藏 | `engine/src/patch_filldir64.cpp:52-62`；A1 §4.2/§4.4 |
 | AP 侧提权实现已就位 | `app/apd/src/supercall.rs:42-83` |
 | 授权表用户态化（flock/单写者/tmp+rename/保护 uid） | `app/apd/src/auth_list.rs:27-149`；`app/apd/src/package.rs:13-21,127-185,241-330` |
@@ -751,3 +861,4 @@ apd --superkey-file /data/adb/sproot/key daemon
 
 *版本：v1.2（2026-11-08 夜间自主令，sys-guard）。v1.1 → v1.2：① `module list --json` / `selftest --json` schema 定稿（与 app-client 对齐）；② 新增 §11 发布门禁（release.yml）；③ P2 收尾记录（AGPL/许可清单/实测体积）。历史：v1.1（2026-11-08，sys-guard）。v1.0 草案 → v1.1：① 契约 v1.1 已三方会签并**冻结（2026-11-08 21:23 +08，TBD-10 关闭）**；② 补入 §2.2「修补链 ≠ 特权链」边界铁律；③ §7 backlog P0 进入实施（交叉编译链依赖 CI）。下一交付：P0 代码落地 + host `cargo check` 通过记录。*
 *版本补充：v1.3（2026-11-09，apd-dev）：新增 §12「密钥 ABI 全链一致性」（五处口径静态核对 + 6 条新断言，逐条以负样本证伪）；`supercall::escalation_token()` 改为返回 `Result`（<47 / >48 / 非 ASCII 硬报错，不再静默透传；48 归一到 47 并告警）。*
+*版本补充：v1.4（2026-11-10，apd-dev）：新增 §13「授权模型（三态 + 日志）」——`auth_list.json` 三态存储（`allow|deny|ask`，默认 ask）+ 一次性 csv 迁移（升级不丢授权）+ `auth list/set/log/revoke --json` CLI ABI + daemon `ask_pending` 显式拒绝 + 脱敏审计日志；勘误 **E6**（决策源 csv → JSON，待会签）；§4.4 标注 csv 已降级为迁移源。*

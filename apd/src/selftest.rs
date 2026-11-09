@@ -29,7 +29,7 @@ use anyhow::Result;
 use log::warn;
 use serde::Serialize;
 
-use crate::{daemon, defs, deploy, package, secret, selinux};
+use crate::{auth_list, daemon, defs, deploy, secret, selinux};
 
 #[derive(Serialize)]
 struct Check {
@@ -340,18 +340,24 @@ pub fn run(json: bool) -> Result<()> {
     };
     checks.push(rc_started_check);
 
-    // ---- allow list ------------------------------------------------------
+    // ---- authorisation table (tri-state JSON, NEW-DOC-05 §13) -------------
+    // The check name stays `allow_list` for schema stability (QA/UI already map
+    // it); the detail now reports the authoritative JSON store and its states.
     let acl_check = if deployed {
-        let read = package::read_ap_package_config_validated();
+        let stats = auth_list::stats();
         Check::new(
             "allow_list",
-            Path::new(defs::ALLOW_LIST_FILE).exists() && read.valid,
+            stats.valid,
             true,
             format!(
-                "{} mode={:?} entries={}",
+                "{} entries={} allow={} deny={} ask={} legacy_migrated={} (legacy csv {} kept as read-only migration source)",
+                defs::AUTH_LIST_FILE,
+                stats.entries,
+                stats.allow,
+                stats.deny,
+                stats.ask,
+                stats.migrated_legacy,
                 defs::ALLOW_LIST_FILE,
-                mode_of(Path::new(defs::ALLOW_LIST_FILE)),
-                read.configs.len()
             ),
         )
     } else {

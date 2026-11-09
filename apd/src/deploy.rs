@@ -451,6 +451,14 @@ fn install_su(key: &str, apd_src: &Path) -> Result<String> {
     Ok(name)
 }
 
+/// Initialise the authorisation storage.
+///
+/// * the **legacy csv** (`defs::ALLOW_LIST_FILE`) is created header-only when
+///   missing: it is no longer the decision source (NEW-DOC-05 §13), but
+///   `deploy`'s smoke check and old tooling still expect the file, and it is
+///   the one-way migration source for devices upgrading from the whitelist;
+/// * the **tri-state JSON store** + audit log are created by
+///   [`crate::auth_list::prepare_storage`] (0600, atomic, flock protected).
 fn init_allow_list() -> Result<()> {
     let path = Path::new(defs::ALLOW_LIST_FILE);
     if !path.exists() {
@@ -499,6 +507,9 @@ fn smoke_check() -> Result<()> {
         PathBuf::from(defs::SPROOT_KEY_FILE),
         PathBuf::from(defs::SPROOT_RC_FILE),
         PathBuf::from(defs::ALLOW_LIST_FILE),
+        // Tri-state authorisation store + audit log (NEW-DOC-05 §13).
+        PathBuf::from(defs::AUTH_LIST_FILE),
+        PathBuf::from(defs::AUTH_LOG_FILE),
         concat_path(defs::BINARY_DIR, "su"),
     ];
     for path in &paths {
@@ -510,6 +521,10 @@ fn smoke_check() -> Result<()> {
     }
     let mode = fs::metadata(defs::SPROOT_KEY_FILE)?.permissions().mode() & 0o777;
     ensure!(mode == 0o600, "key file mode {mode:o} != 600");
+    for path in [defs::AUTH_LIST_FILE, defs::AUTH_LOG_FILE] {
+        let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+        ensure!(mode == 0o600, "{path} mode {mode:o} != 600");
+    }
 
     // Start-chain contract (NEW-DOC-05 §3.1.3): exact ABI + fixed path.
     let mut key_bytes = fs::read(defs::SPROOT_KEY_FILE)?;

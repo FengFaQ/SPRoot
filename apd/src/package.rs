@@ -139,6 +139,10 @@ pub fn read_ap_package_config() -> Vec<PackageConfig> {
 
 /// Commit a table generation: tmp file in the same directory, fsync, rename.
 /// The caller must already hold the write lock (see [`ConfigLock`]).
+///
+/// Legacy csv path: unused since the tri-state JSON store became authoritative
+/// (NEW-DOC-05 §13); kept for the one-way migration record.
+#[allow(dead_code)]
 pub fn write_ap_package_config(package_configs: &[PackageConfig]) -> io::Result<()> {
     let max_retry = 5;
     for _ in 0..max_retry {
@@ -252,6 +256,34 @@ impl Drop for ConfigLock {
     }
 }
 
+/// Parse `/data/system/packages.list` into `(package, uid)` pairs.
+///
+/// Returns `None` when the file is missing, unreadable or has no parsable
+/// entry: an empty list is almost certainly a torn read (PackageManager
+/// rewrites it via tmp+rename), so callers must **not** prune grants against
+/// `None` (same fuse as the historical csv sync).
+pub fn read_system_packages() -> Option<Vec<(String, i32)>> {
+    let lines = read_lines("/data/system/packages.list").ok()?;
+    let mut packages = Vec::new();
+    for line in lines.flatten() {
+        let mut fields = line.split_whitespace();
+        let (Some(pkg), Some(uid)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let Ok(uid) = uid.parse::<i32>() else {
+            continue;
+        };
+        if uid >= 0 {
+            packages.push((pkg.to_string(), uid));
+        }
+    }
+    if packages.is_empty() {
+        None
+    } else {
+        Some(packages)
+    }
+}
+
 fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
 where
     P: AsRef<Path>,
@@ -262,6 +294,12 @@ where
 /// Prune rows of uninstalled packages and refresh uids from the system package
 /// list. **Caller must hold a [`ConfigLock`]** (this variant neither locks nor
 /// logs beyond warnings).
+///
+/// Legacy csv path: since the tri-state upgrade (NEW-DOC-05 §13) the
+/// authoritative table is the JSON store and the csv is only a one-way
+/// migration source, so nothing calls this anymore. Kept for audit and for
+/// tools that still read the old format.
+#[allow(dead_code)]
 pub fn synchronize_package_uid_locked() -> io::Result<()> {
     info!("[synchronize_package_uid] Start synchronizing allow list with system packages...");
 
@@ -355,9 +393,9 @@ pub fn synchronize_package_uid_locked() -> io::Result<()> {
 
 /// Public wrapper: takes the write lock, then prunes/updates the table.
 ///
-/// Kept for call sites that do not already own the lock (`auth` subcommands,
-/// manual refresh). The daemon's refresh path uses
-/// [`synchronize_package_uid_locked`] to avoid a re-entrant flock.
+/// Legacy csv path (see [`synchronize_package_uid_locked`]); unused since the
+/// tri-state JSON store became authoritative.
+#[allow(dead_code)]
 pub fn synchronize_package_uid() -> io::Result<()> {
     let _lock = ConfigLock::acquire();
     synchronize_package_uid_locked()
