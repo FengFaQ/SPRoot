@@ -549,9 +549,33 @@ python3 quality/static/check_kt_imports.py
 # 均可加 --root <dir> 指向别处（便于用负样本自测）
 ```
 
-边界（**不替代编译器**）：只做词法/签名/import 级启发式，查不出类型错误、未解析符号
-（除跨包漏 import）、泛型推导等；真正编译仍以 GitHub Actions 为唯一来源。
-新增断言必须先用负样本证明它会 FAIL（本仓库既有纪律）。
+规则（v0.5 扩充后，每条都有负样本验证会 FAIL）：
+
+| 检查器 | 规则 | 覆盖的真实事故 |
+|---|---|---|
+| `check_kt_syntax.py` | 字符串/三引号/字符字面量闭合、`()[]{}` 配对、块注释闭合；**字符串闭合后紧邻 `$`/ASCII 标识符**（嵌套双引号）；支持 `${...}` 模板嵌套（不误报） | `RcInject` 嵌套双引号（run 42636829029） |
+| `check_kt_signatures.py` | 具名参数必须在定义中；**唯一签名时校验必填参数是否缺失**（支持尾随 lambda）；忽略字符串/注释里的伪调用 | `FlashGuide` 参数改名未同步 + 漏传 `onCopy`（run 42637756697） |
+| `check_kt_imports.py` | ① 跨包缺 import；② **已知库扩展函数缺 import**（drawIntoCanvas/nativeCanvas/graphicsLayer/clip/nestedScroll/scrollEndHaptic/layerBackdrop… 白名单可逐轮扩充）；③ **禁用 `Icons.Rounded|Filled|Outlined|Default|AutoMirrored` 与 `androidx.compose.material.icons.*`**（图标统一 miuix-icons / 自绘 ImageVector） | `WarningCard` 漏 import（run 42637756697）；`drawIntoCanvas` 漏 import（run 42722204812）；material-icons 体积/不存在图标问题 |
+
+### 10.1 已知踩坑表（红一次 → 工具强一次）
+
+| # | 事故（run） | 错误形态 | 现状 |
+|---|---|---|---|
+| 1 | 42636829029 | Kotlin 字符串模板裸写内层双引号 → 词法上切成 3 段 | ✅ `check_kt_syntax` 规则 4 覆盖 |
+| 2 | 42637756697 | 跨包用 Composable 漏 import；函数形参改名后调用点未同步 + 漏必填参数 | ✅ `check_kt_imports` A / `check_kt_signatures` 覆盖 |
+| 3 | 42722204812 | Compose 扩展函数 `drawIntoCanvas` 漏 import（扩展函数写在别的包） | ✅ `check_kt_imports` B 覆盖（扩展名白名单） |
+| 4 | 42721703071 | `Icons.Rounded.*` / miuix 图标名不存在或依赖已移除 | ✅ `check_kt_imports` C 全面禁用 material `Icons.*`；miuix 图标名仍需编译校验（白名单暂不含图标名） |
+
+### 10.2 推送流程约定（硬规则）
+
+1. **推送前**：跑三个检查器（脚本在 `quality/static/`，同 CI 一致），全绿再推；
+2. **推送后**：**立刻盯 CI 结果**（PAT 查 run）；**上一轮未出结果前不推下一批功能改动**——
+   红链会掩盖真正的错误，也会拉长"人类拿不到可用 APK"的时间；
+3. **每次红了**：把错误形态补进 §10.1，并评估是否能变成检查器规则（能就补 + 负样本验证）；
+4. 新增断言的纪律不变：**先用负样本证明它会 FAIL**。
+
+边界（**不替代编译器**）：只做词法/签名/import 级启发式；查不出类型错误、未解析符号（除上述白名单）、
+泛型推导、库函数形参名变更等；真正编译仍以 GitHub Actions 为唯一来源。
 
 ---
 

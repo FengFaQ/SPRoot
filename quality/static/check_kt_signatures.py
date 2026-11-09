@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
-"""Kotlin 具名参数自检（推前自检 #2）—— 调用点的具名参数必须存在于被调函数的定义里。
+"""Kotlin 具名参数 / 必填参数自检（推前自检 #2）。
 
-背景：真实事故（P2 双镜像提交）`FlashGuide` 形参已改名为 onCopy，调用点仍写
-`onCopyCommand = ...` → CI 才报 `No parameter with name 'onCopyCommand' found`。
-本脚本在本地即可发现「改名后漏改调用点」这类错误。
+背景（真实事故，2026-11-09）：
+  - `FlashGuide` 形参改名 `onCopy`，调用点仍写 `onCopyCommand = ...`
+    → CI 才报 `No parameter with name 'onCopyCommand' found`；
+  - 同一次还在同一调用点漏了必填参数 → `No value passed for parameter 'onCopy'`。
+本脚本在本地即可发现这两类（依据仓库内函数定义，不替代编译器）。
 
-做法（零依赖、纯源码）：
-  1. 扫描仓库内所有 `fun Name(...)` 定义，收集每个函数的形参名（含默认值/注解/vararg）；
-  2. 扫描所有 `Name(...)` 调用点，若某个位置参数是 `x = ...` 形式且 `x` 不在形参名集合中，
-     报 file:line；
-  3. 同名函数多处定义时取并集（本项目没有重载冲突的公开 API）。
+规则：
+  1. 解析所有 `fun Name(...)` 的形参名，并区分是否带默认值（必填/可选）；
+  2. 对 `Name(...)` 调用点：
+     - 具名参数 `x = ...` 必须存在于某个同名定义；不存在则报错；
+     - 该名字只有**唯一签名**时，按「位置参数填前 N 个形参 + 具名参数」计算，
+       若仍缺必填形参 → 报错（可捕捉 `No value passed for parameter`）；
+  3. 只是启发式（不处理重载解析/扩展接收者/类型推断），真正的编译仍以 GitHub Actions 为准。
 
-用法：
-    python3 quality/static/check_kt_signatures.py [--root app/src/main/java]
-退出码：0 = 通过；1 = 发现问题。
+用法：python3 quality/static/check_kt_signatures.py [--root app/src/main/java]
+退出码：0 通过；1 发现问题。
 """
 import argparse
 import os
@@ -115,26 +118,199 @@ def split_top(s):
     return [p.strip() for p in parts if p.strip()]
 
 
+def param_has_default(param):
+    """形参文本里是否含顶层 `=`（默认值）；`->`/`==` 不算。"""
+    depth = 0
+    i = 0
+    while i < len(param):
+        c = param[i]
+        if c in "([{<":
+            depth += 1
+        elif c in ")]}>":
+            # 泛型 `>` 与箭头 `->` 里的 `>` 不是闭合括号：`->` 不计深度
+            prev_ch = param[i - 1] if i > 0 else ""
+            if not (c == ">" and prev_ch == "-"):
+                depth = max(0, depth - 1)
+        elif c == "=" and depth == 0:
+            prev = param[i - 1] if i > 0 else ""
+            nxt = param[i + 1] if i + 1 < len(param) else ""
+            if prev not in "=!<>" and nxt != "=":
+                return True
+        i += 1
+    return False
+
+
+def mask_code(src):
+    """把字符串/字符/注释内容替换成空格（保留换行与长度），用于定位"代码里的调用点"。
+
+    否则三引号字符串里的字样会被误当成调用（真实误报：
+    AppLog 的 session 头模板里含 write( 文本）。
+    """
+    out = list(src)
+    n = len(src)
+    i = 0
+    in_triple = in_str = in_char = in_line = in_block = False
+    while i < n:
+        c = src[i]
+        nxt = src[i + 1] if i + 1 < n else ""
+        if c == "\n":
+            in_line = False
+            i += 1
+            continue
+        if in_line:
+            out[i] = " "
+            i += 1
+            continue
+        if in_block:
+            out[i] = " "
+            if c == "*" and nxt == "/":
+                out[i + 1] = " "
+                i += 2
+                in_block = False
+                continue
+            i += 1
+            continue
+        if in_triple:
+            out[i] = " "
+            if src.startswith('"""', i):
+                out[i + 1] = out[i + 2] = " "
+                i += 3
+                in_triple = False
+                continue
+            i += 1
+            continue
+        if in_str:
+            out[i] = " "
+            if c == "\\":
+                if i + 1 < n:
+                    out[i + 1] = " "
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+            i += 1
+            continue
+        if in_char:
+            out[i] = " "
+            if c == "\\":
+                if i + 1 < n:
+                    out[i + 1] = " "
+                i += 2
+                continue
+            if c == "'":
+                in_char = False
+            i += 1
+            continue
+        if c == "/" and nxt == "/":
+            in_line = True
+            out[i] = out[i + 1] = " "
+            i += 2
+            continue
+        if c == "/" and nxt == "*":
+            in_block = True
+            out[i] = out[i + 1] = " "
+            i += 2
+            continue
+        if src.startswith('"""', i):
+            in_triple = True
+            out[i] = out[i + 1] = out[i + 2] = " "
+            i += 3
+            continue
+        if c == '"':
+            in_str = True
+            out[i] = " "
+            i += 1
+            continue
+        if c == "'":
+            # 字符字面量（'x'）；Kotlin 标签不以 ' 结尾于 2 字符内
+            j = i + 1
+            closed = False
+            steps = 0
+            while j < n and steps < 3:
+                if src[j] == "\\":
+                    j += 2
+                    continue
+                if src[j] == "'":
+                    closed = True
+                    break
+                if src[j] == "\n":
+                    break
+                j += 1
+                steps += 1
+            if closed:
+                for k in range(i, j + 1):
+                    out[k] = " "
+                i = j + 1
+                continue
+            i += 1
+            continue
+        i += 1
+    return "".join(out)
+
+
 def collect_defs(sources):
+    """name -> list of ordered param names（去重相同签名）。"""
     defs = {}
     for path, s in sources.items():
-        for m in re.finditer(r"\bfun\s+(?:<[^>]+>\s+)?(\w+)\s*\(", s):
+        masked = mask_code(s)
+        for m in re.finditer(r"\bfun\s+(?:<[^>]+>\s+)?(\w+)\s*\(", masked):
             name = m.group(1)
             op = m.end() - 1
             cp = match_paren(s, op)
             if cp < 0:
                 continue
-            names = set()
+            ordered = []
             for prm in split_top(s[op + 1:cp]):
                 mm = re.match(r"(?:@\w+(?:\([^)]*\))?\s+)*(?:vararg\s+)?(\w+)\s*:", prm)
                 if mm:
-                    names.add(mm.group(1))
-            defs.setdefault(name, set()).update(names)
+                    ordered.append((mm.group(1), not param_has_default(prm)))
+            if not ordered:
+                continue
+            signatures = defs.setdefault(name, [])
+            key = tuple(n for n, _ in ordered)
+            if all(tuple(n for n, _ in sig) != key for sig in signatures):
+                signatures.append(ordered)
     return defs
 
 
+def check_call(name, args, signatures, has_trailing_lambda=False):
+    """返回问题列表；signatures 是同名函数形参列表（可能多份=重载）。"""
+    problems = []
+    named = []
+    positional = 0
+    seen_named = False
+    for a in args:
+        am = re.match(r"^(\w+)\s*=(?!=)", a)
+        if am:
+            seen_named = True
+            named.append(am.group(1))
+        elif not seen_named:
+            positional += 1
+        # 位置参数出现在具名参数之后 = 语法错误，交给编译器
+    all_param_names = set()
+    for sig in signatures:
+        all_param_names |= {n for n, _ in sig}
+    for n in named:
+        if n not in all_param_names:
+            problems.append(
+                "named arg '%s' not in defined params %s" % (n, sorted(all_param_names))
+            )
+    if len(signatures) == 1:
+        sig = signatures[0]
+        provided = set(named)
+        for idx, (pname, _required) in enumerate(sig):
+            if idx < positional:
+                provided.add(pname)
+        if has_trailing_lambda and sig:
+            provided.add(sig[-1][0])
+        missing = [n for n, required in sig if required and n not in provided]
+        if missing:
+            problems.append("missing required param(s): %s" % missing)
+    return problems
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Kotlin 具名参数 vs 函数定义自检")
+    ap = argparse.ArgumentParser(description="Kotlin 具名参数/必填参数自检")
     ap.add_argument("--root", default=DEFAULT_ROOT)
     args = ap.parse_args()
     if not os.path.isdir(args.root):
@@ -150,21 +326,25 @@ def main():
     defs = collect_defs(sources)
     bad = 0
     for path, s in sources.items():
-        for name, params in defs.items():
-            for m in re.finditer(r"(?<!fun )\b" + re.escape(name) + r"\s*\(", s):
+        masked = mask_code(s)
+        for name, signatures in defs.items():
+            for m in re.finditer(r"(?<![.\w])" + re.escape(name) + r"\s*\(", masked):
+                if s[max(0, m.start() - 4):m.start()] == "fun ":
+                    continue
                 op = m.end() - 1
                 cp = match_paren(s, op)
                 if cp < 0:
                     continue
-                for a in split_top(s[op + 1:cp]):
-                    am = re.match(r"^(\w+)\s*=(?!=)", a)
-                    if am and am.group(1) not in params:
-                        line = s[:m.start()].count("\n") + 1
-                        bad += 1
-                        print(
-                            "%s:%d: call %s(...) uses named arg '%s' "
-                            "(defined params: %s)" % (path, line, name, am.group(1), sorted(params))
-                        )
+                call_args = split_top(s[op + 1:cp])
+                if not call_args:
+                    continue
+                tail = s[cp + 1:].lstrip()
+                has_trailing_lambda = tail.startswith("{")
+                problems = check_call(name, call_args, signatures, has_trailing_lambda)
+                if problems:
+                    line = s[:m.start()].count("\n") + 1
+                    bad += 1
+                    print("%s:%d: call %s(...): %s" % (path, line, name, "; ".join(problems)))
     print("check_kt_signatures: %d function(s), %d problem(s)" % (len(defs), bad))
     return 0 if bad == 0 else 1
 
