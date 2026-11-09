@@ -4,29 +4,29 @@
   "engine": {
     "description": "SKRoot 修补引擎 JNI 共享库（aarch64 ET_DYN，Android 侧 System.loadLibrary(\"skrootpatch\")）",
     "artifact": "skroot-engine-arm64",
-    "run_id": 42630740020,
+    "run_id": 42635720094,
     "file": "libskrootpatch.so",
     "target": "libskrootpatch.so",
-    "sha256": "e5a04855efe9a19c8fe8b0c70a85cb9d1ff39fb976233a4395d9e3290292a0db",
-    "size": 3005944,
+    "sha256": "62955d8fedab5c24ae87b9472c6c5506aab55efe7d57964b03da4c54a1382fd1",
+    "size": 3018552,
     "extra_assets": {
-      "ENGINE-META.txt": "21fd95de702ae18e9c221340b268a073ba1ffc6d826926d3641eaca8762ec0eb",
-      "SYMBOLS-libskrootpatch.txt": "b676d3711c22efd1bf8af7bb9ac4d7d2be0214802ea082e093786b0acf005114",
-      "SHA256SUMS": "7b2b39f443171c05a59ff051fd397e26364f1bb5e223caf47125c57d228c7cf3"
+      "ENGINE-META.txt": "ad89061d9fb034636d0a4fc39922a6164add45a8fa5679d0d09f1aad6cb25e5e",
+      "SYMBOLS-libskrootpatch.txt": "fb44c76336100c54826e38780a10ff944ce99e2c892f998ef23c05e95f1cd5b4",
+      "SHA256SUMS": "40893e9cdbf9b65d398671a7863d7b59c8bc5c481374b1571c34df1b3efb0d36"
     }
   },
   "apd": {
     "description": "SPRoot AP 守护（aarch64 PIE 可执行 ELF；部署时复制为 /data/adb/apd）",
     "artifact": "apd-aarch64-latest",
-    "run_id": 42633734739,
+    "run_id": 42634727477,
     "file": "libapd-arm64.so",
     "target": "libapd.so",
-    "sha256": "f78c2d966d93c1a8da468456086622d0fdcc51aa22cdad402dc36cc1b1e8fc2f",
-    "size": 2084456,
-    "commit": "28e6aacc98484f0db8a4ef6c1a30537dee6d5fb9",
-    "version": "28e6aac",
+    "sha256": "3e70561cd889a03b96bb20cbf04f4a4dd6bf5cc1a0b480a3e6d0198841c351f4",
+    "size": 2085344,
+    "commit": "7ea007223a96e851a38edb1b2ea0387ff998de14",
+    "version": "7ea0072",
     "extra_assets": {
-      "apd-version.txt": "ec58296189aec92cea31a1d674240a1ff6bec5b4b586aa256a385f0e1ab55162",
+      "apd-version.txt": "1131cb66781e0a02e20d87e7b11c928cda6105ff5871dbd7f05a900fc69206e9",
       "apd-capabilities.txt": "2abb17a825e71c0cc22d6eb91b9a66eee7b008347f0f49d91b6f2412e37cc269"
     }
   },
