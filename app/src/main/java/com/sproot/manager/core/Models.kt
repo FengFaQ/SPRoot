@@ -59,6 +59,10 @@ data class PatchUiState(
     val stage: PatchStage = PatchStage.IDLE,
     val progress: Float = 0f,
     val phase: String = "",
+    /** 引擎 NDJSON 自报的原始 phase（read_input…write_output）；空=还没收到事件 */
+    val enginePhase: String = "",
+    /** 引擎自报 pct（0..100）；-1=还没收到事件 */
+    val enginePct: Int = -1,
     val running: Boolean = false,
     val mode: PatchMode = PatchMode.EXPORT_AND_GUIDE,
     val sourceUri: String? = null,
@@ -100,6 +104,30 @@ data class CapabilityItem(
     val detail: String,
     val blocking: Boolean = true,
 )
+
+/**
+ * 引擎 NDJSON 进度事件里的 `phase` → 中文（UI 直接展示，避免用户看到 read_input）。
+ *
+ * 引擎契约（engine/src/skroot_patch_main.cpp emit_progress）：
+ * ```
+ * read_input 0→5 → parse_kallsyms 5→15 → derive_offsets 20→30 → locate_init_cred 35
+ * → patch_cfi_huawei 40 → patch_hooks 50 → embed_key 80 → write_output 95 → done 100
+ * ```
+ */
+object EnginePhase {
+    fun label(phase: String): String = when (phase) {
+        "read_input" -> "读取内核"
+        "parse_kallsyms" -> "解析 kallsyms 符号表"
+        "derive_offsets" -> "推导 cred/uid/seccomp 偏移"
+        "locate_init_cred" -> "定位 init_cred"
+        "patch_cfi_huawei" -> "修补 CFI / 华为分支"
+        "patch_hooks" -> "写入 hook 跳板"
+        "embed_key" -> "内嵌 Root 密钥（47 字符 + NUL）"
+        "write_output" -> "写出修补后内核"
+        "done" -> "完成"
+        else -> phase
+    }
+}
 
 /** 修补引擎 JNI 返回码（与 SPROOT-DOC-C1 §3 退出码枚举一致） */
 object EngineExitCode {

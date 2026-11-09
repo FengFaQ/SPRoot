@@ -80,6 +80,8 @@ object PatchPipeline {
             stage = PatchStage.IDLE,
             progress = 0f,
             phase = "",
+            enginePhase = "",
+            enginePct = -1,
         )
         AppLog.info(TAG, "已选择镜像：${displayName ?: "<未命名>"} uri=$uri")
     }
@@ -123,6 +125,8 @@ object PatchPipeline {
             stage = PatchStage.PREFLIGHT,
             progress = 0f,
             phase = "准备中",
+            enginePhase = "",
+            enginePct = -1,
             startedAt = System.currentTimeMillis(),
             finishedAt = 0L,
             outputPath = null,
@@ -336,12 +340,12 @@ object PatchPipeline {
                 return
             }
             state.value = state.value.copy(kernelEqualLength = true)
-            stage(PatchStage.PATCH_KERNEL, 72f, "修补完成：等长 $rawSize 字节，sha256 已变化")
+            stage(PatchStage.PATCH_KERNEL, 80f, "修补完成：等长 $rawSize 字节，sha256 已变化")
             AppLog.info(TAG, "修补后内核 sha256=$patchedSha（等长校验通过）")
 
             // ---------- ⑥ 覆盖 kernel（关键：repack 只认 kernel） ----------
             if (compression != null) {
-                stage(PatchStage.RECOMPRESS, 76f, "回压内核（$compression）并覆盖 kernel")
+                stage(PatchStage.RECOMPRESS, 84f, "回压内核（$compression）并覆盖 kernel")
                 val recompress = MagiskBoot.exec(
                     context,
                     listOf("compress=$compression", "kernel.patched", "kernel"),
@@ -356,7 +360,7 @@ object PatchPipeline {
                     return
                 }
             } else {
-                stage(PatchStage.RECOMPRESS, 76f, "覆盖 kernel ← kernel.patched")
+                stage(PatchStage.RECOMPRESS, 84f, "覆盖 kernel ← kernel.patched")
                 patched.copyTo(kernel, overwrite = true)
             }
             val overwrittenSha = sha256(kernel)
@@ -383,7 +387,7 @@ object PatchPipeline {
             } else {
                 "boot"
             }
-            stage(PatchStage.REPACK, 80f, "尝试注入开机自启 rc（target=$rcTarget）")
+            stage(PatchStage.REPACK, 88f, "尝试注入开机自启 rc（target=$rcTarget）")
             rcResult = RcInject.inject(context, workDir, ramdisk.takeIf { it.isFile }, rcTarget)
             state.value = state.value.copy(
                 rcInjected = rcResult!!.injected,
@@ -635,21 +639,29 @@ object PatchPipeline {
 
     // ------------------------------------------------------------ 引擎进度事件
     private fun onEngineEvent(evt: String) {
-        val event = MiniJson.string(evt, "event") ?: return
-        when (event) {
-            "progress" -> {
-                val phase = MiniJson.string(evt, "phase") ?: ""
-                val pct = MiniJson.int(evt, "pct") ?: 0
-                val detail = MiniJson.string(evt, "detail") ?: ""
-                // 引擎 0..100 映射到流水线 35..72 区间
-                val mapped = 35f + (pct.coerceIn(0, 100) / 100f) * 37f
-                state.value = state.value.copy(
-                    stage = PatchStage.PATCH_KERNEL,
-                    progress = mapped / 100f,
-                    phase = "引擎：$phase（$pct%）${if (detail.isNotBlank()) " · $detail" else ""}",
-                )
-                AppLog.debug("Engine", "progress phase=$phase pct=$pct detail=$detail")
-            }
+        val event = MiniJson.string(evt, "event")
+        // 容错：个别引擎实现可能只写 pct/phase 而不带 event 字段；两种都按进度处理
+        if (event == null || event == "progress") {
+            val phase = MiniJson.string(evt, "phase") ?: return
+            val pct = (MiniJson.int(evt, "pct") ?: MiniJson.int(evt, "percent"))?.coerceIn(0, 100) ?: 0
+            val detail = MiniJson.string(evt, "detail") ?: ""
+            // 引擎 0..100 映射到流水线 35..80（修补是主耗时段；80→100 留给回压/重打包/校验/导出）
+            val mapped = (35f + pct * 0.45f).coerceIn(35f, 80f)
+            val prev = state.value
+            val next = mapped / 100f
+            state.value = prev.copy(
+                stage = PatchStage.PATCH_KERNEL,
+                // 单调递增：引擎事件与 stage() 可能交错写，进度绝不回退（真机反馈"卡 35%"的修复点之一）
+                progress = maxOf(prev.progress, next),
+                phase = buildString {
+                    append("引擎：").append(EnginePhase.label(phase)).append("（").append(pct).append("%）")
+                    if (detail.isNotBlank()) append(" · ").append(detail.take(120))
+                },
+                enginePhase = phase,
+                enginePct = pct,
+            )
+            AppLog.debug("Engine", "progress phase=$phase pct=$pct detail=$detail → 总进度 ${(maxOf(prev.progress, next) * 100).toInt()}%")
+        } else when (event) {
             "result" -> {
                 val code = MiniJson.int(evt, "code") ?: -1
                 val error = MiniJson.string(evt, "error")

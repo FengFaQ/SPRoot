@@ -34,7 +34,7 @@ import com.sproot.manager.ui.components.rememberMainPagerState
 import com.sproot.manager.ui.components.shouldShowSplitPane
 import com.sproot.manager.ui.pages.HomePager
 import com.sproot.manager.ui.pages.ModulesPage
-import com.sproot.manager.ui.pages.PatchPage
+import com.sproot.manager.ui.pages.PatchPager
 import com.sproot.manager.ui.pages.SettingsPage
 import com.sproot.manager.ui.theme.AppSettings
 import com.sproot.manager.ui.theme.LocalEnableBlur
@@ -126,7 +126,10 @@ private fun MainScreen(
                         isCurrentPage = page == mainPagerState.selectedPage,
                         onGoPatch = { mainPagerState.animateToPage(1) },
                     )
-                    1 -> PatchTab(blurBackdrop)
+                    1 -> PatchPager(
+                        bottomInnerPadding = bottomInnerPadding,
+                        isCurrentPage = page == mainPagerState.selectedPage,
+                    )
                     2 -> ModuleTab(blurBackdrop)
                     else -> SettingsTab(
                         backdrop = blurBackdrop,
@@ -191,13 +194,6 @@ private fun TabScaffold(
             .only(WindowInsetsSides.Horizontal),
     ) { innerPadding ->
         content(innerPadding)
-    }
-}
-
-@Composable
-private fun PatchTab(backdrop: LayerBackdrop?) {
-    TabScaffold(title = "修补", backdrop = backdrop) { inner ->
-        PatchPage(modifier = Modifier.padding(inner))
     }
 }
 
