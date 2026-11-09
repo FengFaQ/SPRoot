@@ -26,6 +26,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use log::warn;
 use serde::Serialize;
 
 use crate::{daemon, defs, deploy, package, secret, selinux};
@@ -56,6 +57,22 @@ impl Check {
 
 fn mode_of(path: &Path) -> Option<u32> {
     fs::metadata(path).ok().map(|m| m.permissions().mode() & 0o777)
+}
+
+/// Verdict for the raw bytes behind `--superkey-file` (NEW-DOC-05 §12).
+///
+/// * `len == 47 && nul_free` — canonical AP-side ABI → pass, no warning;
+/// * `len == 48 && nul_free` — **legacy** manager/APK format. The runtime uses
+///   the first 47 bytes (`supercall::escalation_token`, logged), so an upgraded
+///   install must **pass with a `legacy48` annotation**, not be reported as
+///   `needs_repair` (Lead 2026-11-09). A re-deploy rewrites the file to 47;
+/// * anything else (wrong length, embedded NUL, mode ≠ 0600) — fail; those are
+///   either a manual edit or a truncated write, not a legacy format.
+///
+/// Returns `(ok, legacy48)` so the caller can emit the warning + detail.
+fn superkey_abi_verdict(mode: u32, len: usize, nul_free: bool) -> (bool, bool) {
+    let legacy48 = len == 48 && nul_free;
+    (mode == 0o600 && nul_free && (len == 47 || legacy48), legacy48)
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -187,8 +204,13 @@ pub fn run(json: bool) -> Result<()> {
                     let alnum = key.as_str().chars().all(|c| c.is_ascii_alphanumeric());
                     ok = mode == 0o600 && (len == 47 || len == 48) && alnum && key.is_locked();
                     detail = format!(
-                        "mode={mode:o} len={len} alnum={alnum} mlocked={}",
-                        key.is_locked()
+                        "mode={mode:o} len={len} alnum={alnum} mlocked={}{}",
+                        key.is_locked(),
+                        if len == 48 {
+                            " legacy48=true (历史 48 位文件，运行时按前 47 使用)"
+                        } else {
+                            ""
+                        }
                     );
                 }
                 None => detail = format!("mode={mode:o} unreadable/empty"),
@@ -219,15 +241,29 @@ pub fn run(json: bool) -> Result<()> {
             // The raw copy is key material: wipe it as soon as it is measured.
             // SAFETY: `bytes` is a live, uniquely-owned buffer we no longer use.
             unsafe { secret::wipe_bytes(bytes.as_mut_ptr(), bytes.len()) };
-            Check::new(
-                "superkey_file",
-                mode == 0o600 && len == 47 && nul_free,
-                deployed,
+            let (ok, legacy48) = superkey_abi_verdict(mode, len, nul_free);
+            if legacy48 {
+                // Old manager / old APK wrote 48 bytes. It still escalates
+                // (first 47 used, logged by `escalation_token`), so this is a
+                // warning, not a broken deployment: never fail an upgraded
+                // install (Lead 2026-11-09). Re-deploy rewrites it to 47.
+                warn!(
+                    "[selftest] {} 是历史 48 字节文件：AP 侧 ABI 为 47 字节，运行时按前 47 使用；建议重部署或重新生成密钥",
+                    defs::SPROOT_KEY_FILE
+                );
+            }
+            let detail = if legacy48 {
+                format!(
+                    "{} mode={mode:o} len=48 nul_free=true legacy48=true (检测到 48 位历史文件，已按前 47 位使用；建议重部署/重新生成密钥)",
+                    defs::SPROOT_KEY_FILE
+                )
+            } else {
                 format!(
                     "{} mode={mode:o} len={len} nul_free={nul_free} (AP-side ABI: 47 plain bytes)",
                     defs::SPROOT_KEY_FILE
-                ),
-            )
+                )
+            };
+            Check::new("superkey_file", ok, deployed, detail)
         }
         Err(_) if deployed => Check::new(
             "superkey_file",
@@ -496,4 +532,28 @@ pub fn run(json: bool) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `superkey_file` verdict must not fail an upgraded install: a legacy
+    /// 48-byte file passes with the `legacy48` flag (warn + detail), while a
+    /// truly broken file (length/mode/NUL) still fails.
+    #[test]
+    fn superkey_verdict_accepts_47_and_legacy_48() {
+        // canonical 47 plain bytes
+        assert_eq!(superkey_abi_verdict(0o600, 47, true), (true, false));
+        // legacy 48: pass (so summary stays daemon_ready/deployed), flagged
+        assert_eq!(superkey_abi_verdict(0o600, 48, true), (true, true));
+        // wrong mode / short / long / NUL-tainted → fail, not "legacy"
+        assert_eq!(superkey_abi_verdict(0o644, 47, true), (false, false));
+        assert_eq!(superkey_abi_verdict(0o600, 46, true), (false, false));
+        assert_eq!(superkey_abi_verdict(0o600, 49, true), (false, false));
+        assert_eq!(superkey_abi_verdict(0o600, 47, false), (false, false));
+        assert_eq!(superkey_abi_verdict(0o600, 48, false), (false, false));
+        // 48 with a NUL is the kernel format copied in by hand, not legacy 48
+        assert_eq!(superkey_abi_verdict(0o600, 48, false), (false, false));
+    }
 }

@@ -683,6 +683,8 @@ apd --superkey-file /data/adb/sproot/key daemon
 
 **客户端侧口径（`5ed19c6`，2026-11-09）**：`SecretStore.KEY_LENGTH = 47`，生成/存储/`ApdClient` 传输一律 47 并严格校验；唯一例外是调引擎时用 `engineKeyOf()` 把 47 补位到 48（第 48 位被引擎 `erase` 丢弃，见 F3）。因此上表第 1 行的「48 兼容」分支现仅服务**历史 48 字符旧密钥文件/旧 APK**，正常路径不再触发。
 
+**`selftest --json` 的可诊断面（部署后 `superkey_file` 是 critical 项）**：47 字节纯文本 → 通过；**历史 48 字节文件 → 通过 + `legacy48=true` detail + `warn!`**（不判失败，避免老用户升级即 `needs_repair`/exit 1；运行时按前 47 使用，`deploy` 会把它改写成 47）；其它长度 / 内嵌 NUL / 权限非 0600 → 失败。判定抽成纯函数 `selftest::superkey_abi_verdict()` 并由单测钉死。
+
 ### 12.3 断言（随 CI 编译的单元测试）
 
 | 断言 / 测试 | 钉住的点 | 负样本（先证伪再交付） |
@@ -693,6 +695,7 @@ apd --superkey-file /data/adb/sproot/key daemon
 | `deploy::tests::rc_template_matches_defs_and_writer_path` | 起链 rc / defs / 写入路径三方 | 把 rc 参数序改成 `daemon --superkey-file …` → **FAIL**（实测） |
 | `supercall::tests::escalation_token_is_exactly_47_or_an_error` | 4 | 把短密钥改回「原样透传」→ **FAIL**（实测） |
 | `supercall::tests::key_file_to_escalation_token_stays_47` | 2+3+4（47 字节文件 → SecretKey 47 → token 47；47+NUL 兼容；48 文件 → token 47） | 链上任一处口径不一致即 FAIL |
+| `selftest::tests::superkey_verdict_accepts_47_and_legacy_48` | 2/3 的**可诊断面**：47 通过；历史 48 **通过 + `legacy48` 标注**（非失败）；长度/权限/NUL 异常仍失败 | 把历史 48 判失败 → 该测试 FAIL（老用户升级即 `needs_repair`） |
 | 编译期 `const _: () = assert!(KERNEL_KEY_LEN == 47);` | 4（ABI 常量） | 改常量而不重打内核 → **编译失败**，强制走全链评审 |
 
 ### 12.4 剩余待办 / 风险
