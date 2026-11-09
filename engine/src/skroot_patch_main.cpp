@@ -665,7 +665,28 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
         J extra;
         extra.set("root_key", root_key).set("report_ref", opt.report_path).set("hook_count", static_cast<int>(vec_patch.size()));
         emit_result(OK, std::move(extra));
-        std::error_code ec; fs::remove_all(opt.workdir, ec);     // 成功清理 workdir
+
+        // 成功清理 workdir —— **只有引擎自建的默认 workdir 才回收**。
+        //
+        // 契约（C1 §3）：调用方显式传 --workdir 时，该目录及其内容的所有权归调用方，
+        // 引擎不得删除。历史事故（真机首跑实测）：客户端把 --out=kernel.patched 放在
+        // 显式传入的 --workdir 内，引擎写完产物后 remove_all(workdir) 把产物一起删掉，
+        // 随后返回 rc=0 —— 客户端看到"成功但无产物"，修补在最后一步失败。
+        //
+        // 双重保险：
+        //   ① opt.workdir == out_path + ".work"  ⇒ 是引擎自己造的默认目录，可回收；
+        //   ② 若 --out 落在 workdir 之内           ⇒ 无论如何都不删（防未来又有调用方这么传）。
+        const std::string default_workdir = opt.out_path + ".work";
+        const bool out_inside_workdir =
+            !opt.workdir.empty() &&
+            opt.out_path.size() > opt.workdir.size() &&
+            opt.out_path.compare(0, opt.workdir.size(), opt.workdir) == 0;
+        if (opt.workdir == default_workdir && !out_inside_workdir) {
+            std::error_code ec; fs::remove_all(opt.workdir, ec);
+        } else {
+            std::cout << "[engine] workdir preserved (owned by caller): "
+                      << opt.workdir << std::endl;
+        }
     }
 
     if (g_ndjson.is_open()) g_ndjson.close();

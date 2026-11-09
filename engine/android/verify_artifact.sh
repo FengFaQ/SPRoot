@@ -183,6 +183,31 @@ else
   echo "SKIP  A8 期望组数分支自检（需 qemu）"
 fi
 
+# ---------------- A9：workdir 所有权契约（防真机事故回退）----------------
+# 真机事故（2026-11-09，魅族21 首跑）：客户端把 --out=kernel.patched 放在显式传入的
+# --workdir 内；引擎写完产物后无条件 remove_all(workdir)，连产物一起删掉，却仍返回
+# rc=0 → 客户端报"引擎返回成功但没有产物"，修补在最后一步失败。
+# 修复语义：①只有默认 workdir（out_path + ".work"）才回收；
+#           ②--out 落在 workdir 之内时，无论如何都不删除。
+# 此处为静态防回退断言；行为级用例见 Tier B（需真样本）与质测真机回归。
+A9_SRC="$ROOT/src/skroot_patch_main.cpp"
+if grep -q "workdir preserved (owned by caller)" "$A9_SRC" 2>/dev/null; then
+  pass "A9a workdir 所有权保护存在"
+else
+  fail "A9a 缺少 workdir 所有权保护（真机事故会复发：产物被引擎删除）"
+fi
+if grep -q "default_workdir" "$A9_SRC" 2>/dev/null && grep -q "out_inside_workdir" "$A9_SRC" 2>/dev/null; then
+  pass "A9b 默认 workdir 判定 + out-in-workdir 双重保险均在"
+else
+  fail "A9b 缺少 default_workdir / out_inside_workdir 判定"
+fi
+if grep -A2 "if (opt.workdir == default_workdir" "$A9_SRC" 2>/dev/null | grep -q "remove_all"; then
+  pass "A9c remove_all(workdir) 已受条件保护（不再无条件删除）"
+else
+  fail "A9c remove_all(workdir) 未受条件保护（无条件删除仍存在）"
+fi
+
+
 # ---------------- Tier B：真修补产物字节级断言（需一份真 arm64 内核 Image）-----
 if [[ -n "${KERNEL_IMAGE:-}" ]]; then
   echo "=== Tier B: 真修补产物断言 (KERNEL_IMAGE=$KERNEL_IMAGE) ==="
