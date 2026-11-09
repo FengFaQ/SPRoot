@@ -18,15 +18,15 @@
   "apd": {
     "description": "SPRoot AP 守护（aarch64 PIE 可执行 ELF；部署时复制为 /data/adb/apd）",
     "artifact": "apd-aarch64-latest",
-    "run_id": 42631634991,
+    "run_id": 42633734739,
     "file": "libapd-arm64.so",
     "target": "libapd.so",
-    "sha256": "355071f3b736037b6b457a1e6545736e0ca7495b5c62a38da5a45b0bc684b6d7",
-    "size": 2083936,
-    "commit": "d239e4e956380294c120d06eb341daf1600dd5bd",
-    "version": "d239e4e",
+    "sha256": "f78c2d966d93c1a8da468456086622d0fdcc51aa22cdad402dc36cc1b1e8fc2f",
+    "size": 2084456,
+    "commit": "28e6aacc98484f0db8a4ef6c1a30537dee6d5fb9",
+    "version": "28e6aac",
     "extra_assets": {
-      "apd-version.txt": "9ac19238def94772072599932d6e374cb80dc761dfa5517277336eae9ff0cc03",
+      "apd-version.txt": "ec58296189aec92cea31a1d674240a1ff6bec5b4b586aa256a385f0e1ab55162",
       "apd-capabilities.txt": "2abb17a825e71c0cc22d6eb91b9a66eee7b008347f0f49d91b6f2412e37cc269"
     }
   },
