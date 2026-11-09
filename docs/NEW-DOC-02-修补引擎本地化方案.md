@@ -18,6 +18,8 @@
 | 本方案 | `engine/android/build_arm64.sh` 用 **NDK r27c clang 18.0.3** 交叉编译同一份 C++ 源码（含新增内置 bootimg 处理），产出 **AArch64** 两种形态：①静态可执行 `skroot-patch`（2,920,512 B，工具/排障用，**不进 APK**）②**JNI 共享库 `libskrootpatch.so`**（2,987,088 B，`System.loadLibrary("skrootpatch")`，进 `jniLibs`）。两者均通过 ELF/契约断言。 |
 | 关键坑（已实测） | NDK 静态可执行文件必须用 **`ANDROID_API>=29`** 编译，否则 `PT_TLS p_align=8`，bionic 启动即 abort；API≥29 才输出 `p_align=0x40`。 |
 | 无真机验证 | `verify_artifact.sh`：Tier A（ELF/契约，qemu-user 可跑，**ALL PASS**）+ Tier B（真内核字节级断言）。**已用魅族 21 官方 boot.img 全链实测**：抽 kernel sha256 与 qa ground truth 一致、补丁 rc=0、等长、可确定性复现、重打包等长。 |
+| **`--workdir` 所有权契约（2026-11-09 真机事故后）** | **显式传入 `--workdir` ⇒ 目录及内容生命周期归调用方，引擎不得删除其中任何内容；只有默认 workdir（`<out>.work`）由引擎成功收尾时回收**（§8.1）。行为证据：A9d `--self-test-workdir` 13 例矩阵（CI 必跑）+ Tier B B9 事故现场回归 / B10 默认回收正控。 |
+| **密钥 ABI 契约（P0，提权链）** | CLI `--key` **严格 48 字符**（47/49/非 alnum → E101）；内核只写 **`key[0:47]` + NUL = 48 字节**（`embed_key_bytes()`，内联断言）；`report.key_spec` 输出 `abi="47+nul"/bytes=48/last_byte_is_nul=true/input_len=48`（§7.5）。行为证据：A10 `--self-test-keyabi` 17 例（CI 必跑）+ Tier B B7。**用户态提权串必须 47 字符**。 |
 | 推荐集成 | **主形态 JNI（`libskrootpatch.so` + `System.loadLibrary("skrootpatch")`）**，次形态静态 exec（`skroot-patch` 从 `nativeLibraryDir` 真实路径 exec，**禁止** symlink 到 `filesDir`；该可执行件默认不进 APK）。 |
 | 实测编译耗时 | 全量 100+ TU，12 核并行 **18 秒**（`make objs`，见 §3.4）。 |
 | 打包工具 | **magiskboot v31.1 ARM64**（SKRoot 官方路径；988,984 B，静态 AArch64，sha256 `97e9ec75…bb54`），CI 内固定版本+哈希校验并随 artifact 分发；自研 bootimg 保留为交叉校验/回退（§7）。**禁止 AIK**。 |
@@ -277,10 +279,12 @@ tasks.named("preBuild") { dependsOn(copyEngine, assertEngine) }
 | 证据 | 状态 |
 |---|---|
 | 本地等价 CI 构建（同脚本/同 NDK/同断言） | ✅ 通过（§6.1 ALL PASS） |
-| 本地 qemu 跑**真实内核**（arm64 产物） | ✅ 通过：33,892,864 B 真内核 `rc=0`，耗时 226 s，产物 sha256 与宿主构建**完全一致**（跨架构确定性，§6.2 B9） |
+| 本地 qemu 跑**真实内核**（arm64 产物） | ✅ 通过：33,892,864 B 真内核 `rc=0`，耗时 226 s，产物 sha256 与宿主构建**完全一致**（跨架构确定性，§6.2 B9b） |
 | GitHub Actions 运行 | 🔴 **第 1 次 run 失败**（[run 42486267958](https://github.com/FengFaQ/SPRoot/actions/runs/42486267958)，commit b53c58e）：**失败点为 `Install qemu-user-static` 步骤**（ubuntu-latest 的 `apt-get update` 因第三方源 403 失败），构建/断言步骤全部 skipped。已修复：`update` 容错 + apt 安装失败回落下载静态 `qemu-aarch64-static`（multiarch release），并重推 v2 触发新 run |
 | **正式绿 run（含 magiskboot）** | ✅ **run 42487185268**（engine-arm64, v2, 5749ef48）**success**：11/11 步骤全绿，artifacts **2 个** → `skroot-engine-arm64`（2,337,542 B，含两形态 + SHA256SUMS + magiskboot）与 `magiskboot-arm64`（491,115 B，含 `magiskboot` + `magiskboot-meta.txt`）。链接：https://github.com/FengFaQ/SPRoot/actions/runs/42487185268 |
 | 历史绿 run（无 magiskboot） | run 42486757913（aee97046）success，1 artifact（1,846,449 B） |
+| **2026-11-09 追加：workdir 所有权 + 密钥 ABI 加固后的本地全量验证** | ✅ **Tier A + Tier B 均 ALL PASS**（真内核 `samples/meizu21` 抽出的 33,892,864 B Image，qemu 两次真修补）：A9d 13 例矩阵、A10 17 例 keyabi、B7（`new_bytes` 96 hex + `key_spec` 六字段）、B9 事故现场（`--out` 在显式 `--workdir` 内：rc=0 且产物/报告/目录全在）、B9d（stdout 末行 = `ROOT_KEY=`）、B10（默认 `<out>.work` 已回收）。**负样本全部打红**：workdir 回退「无条件删」→5 例 FAIL、回退 8a196f0 原版→2 例 FAIL；key 写 49 字节→3 例 FAIL、写 48 可见字符无 NUL→3 例 FAIL、`key_spec` 字段改错→2 例 FAIL |
+| **本次 CI run（2026-11-09 加固后）** | ⏳ 推送后填写：run_id / 结论 / `exec` 与 `libskrootpatch.so` 的 sha256+size |
 
 ---
 
@@ -301,6 +305,11 @@ tasks.named("preBuild") { dependsOn(copyEngine, assertEngine) }
 | A6d 铁律 | rc≠0 时 `--out` **不存在** | C1 §3 行为铁律 |
 | **A7 T-12 强断言** | 合成 boot.img：extract→mutate→repack→**回读 kernel 段 sha256 == patch 输出 sha256**（不是只比长度）+ 产物等长 + `AVBf` footer 逐字节保留 | 防「repack 静默用原始 kernel」；**CI 每次必跑**（不依赖真机样本） |
 | A7b 反例保护 | 若回读 sha256 ≠ patch 输出 → 直接 FAIL | 阻断级测试项 T-12 |
+| **A9 workdir 所有权（静态）** | A9a 保留提示存在；A9b 判定收在纯函数 `should_reclaim_workdir()` + `workdir_from_user` 显式标记；A9c `remove_all` 受 `reclaim_workdir` 保护 | 防真机事故（产物被引擎自删）回退；见 §8.1 |
+| **A9d workdir 所有权（行为，CI 必跑）** | `--self-test-workdir`：**13 例判定矩阵**（7 例 `should_reclaim_workdir` + 6 例 `path_within_dir` 边界），逐例 `expect=reclaim\|keep` vs `got`；rc=0 且 `WDRESULT PASS` 才算过；并单独校验 3 个关键用例（事故现场 / 显式传默认值 / NDJSON 在默认 workdir 内）在场且 PASS，防「删用例 → 空断言」 | **静态 grep 证明不了行为**，A9d 是这条契约的 CI 门槛 |
+| A9e 矩阵规模 | `WDCASE/WDDIR` 行数 ≥12（防用例被删空） | T-12 铁律（负样本可打红） |
+| **A6g/A6h 密钥长度严格 48** | 47 字符（不足）→ rc=101；49 字符（超长）→ rc=101 | 防"静默截断/放行"导致 ABI 漂移 |
+| **A10 密钥 ABI 47+NUL（行为，CI 必跑）** | `--self-test-keyabi`：**17 例**（内嵌 48 字节 / 末字节 NUL / 前 47 字符逐字节相同 / 提权串 47 字符 / 47·49·非 alnum·空 全拒 / `key_spec` 六字段自证）；`KEYRESULT PASS` + `KEYSPEC abi=47+nul bytes=48 last_byte_is_nul=true input_len=48 embed_hex_len=96 embed_hex_tail=00` 才算过；另用随机密钥（`--gen-key` 路径）复跑一次 | 提权链成败所系（错 ABI = 静默 exit 125）；见 §7.5 |
 
 实测日志摘录（qemu-user，2026-11-08）：
 
@@ -332,9 +341,13 @@ usage: skroot-patch --in <kernel_image> --out <patched_kernel> (--gen-key|--key 
 E=engine/src/skroot-patch     # arm64 形态：qemu-aarch64-static engine/android/build/arm64/exec/libskrootpatch.so
 $E --bootimg info           --in samples/meizu21/boot.img
 $E --bootimg extract-kernel --in samples/meizu21/boot.img --out kernel.raw
-$E --in kernel.raw --out kernel.patched --key <48字符> --json ev.ndjson --workdir w
-$E --bootimg repack         --in samples/meizu21/boot.img --kernel kernel.patched --out new-boot.img
+# ★ 事故现场形态（2026-11-09 真机）：--out 位于**显式传入**的 --workdir 内
+mkdir -p w && $E --in kernel.raw --out w/kernel.patched --key <48字符> --json ev.ndjson --workdir w
+$E --bootimg repack         --in samples/meizu21/boot.img --kernel w/kernel.patched --out new-boot.img
 ```
+
+> **Tier B 主用例自 2026-11-09 起改为「事故现场形态」**（`--out` 在显式 `--workdir` 内），
+> 因为事故正是发生在这一形态下；此前"产物在 workdir 外面"的理想形态刚好躲过了 bug。
 
 | 断言 | 实测结果 |
 |---|---|
@@ -344,12 +357,15 @@ $E --bootimg repack         --in samples/meizu21/boot.img --kernel kernel.patche
 | B2 | 等长：`33,892,864 B` |
 | B3 | 输出 sha256 = `399ac4797e6ab2ae5700cc21350676daf7b89fe397e473ef24ae32cb9cce3f2f` ≠ 输入 |
 | B4 | 产物含 `key[0:47]+NUL` 窗口（47 字符提权串，CALL v1.1 **E1**） |
+| **B7 密钥自证（P0，脚本 Tier B B7）** | `hooks[embed_key].new_bytes` **长度恰为 96 hex（48 字节、偶数）**、以 `key[0:47]` hex **开头**、以 `00` **结尾**；且 `report.key_spec` 自证 `abi=47+nul / bytes=48 / last_byte_is_nul=true / input_len=48 / stored_len=47 / length=48`（客户端与质测可直接断言） |
 | B5 | `report.json`：`input/output.sha256+size` 齐全且等长、`hidden_dir_prefix==key[0:16]`、`hook_table` 为数组（含 `blob_count/root_key_region`）、`kernel_version=6.1.25`、`errors=[]` |
 | B6 | NDJSON 终态 `result` 唯一且为最后一行 |
-| B7 重打包（magiskboot 主路径） | `magiskboot unpack` → patch → **`cp kernel.patched kernel`** → `magiskboot repack boot.img` → `new-boot.img` **等长 100,663,296 B**；回读 kernel 段 == `kernel.patched`；内嵌 vbmeta 2,496 B 与 `AVBf` footer **逐字节保留**。⚠️ 实测坑：不覆盖 `kernel` 时 repack 会静默用原始 kernel（补丁丢失） |
+| B7 重打包（magiskboot 主路径，手动链） | `magiskboot unpack` → patch → **`cp kernel.patched kernel`** → `magiskboot repack boot.img` → `new-boot.img` **等长 100,663,296 B**；回读 kernel 段 == `kernel.patched`；内嵌 vbmeta 2,496 B 与 `AVBf` footer **逐字节保留**。⚠️ 实测坑：不覆盖 `kernel` 时 repack 会静默用原始 kernel（补丁丢失） |
 | B7b 双路交叉校验 | `magiskboot unpack` 的 `kernel` 与自研 `--bootimg extract-kernel` 的 sha256 均为 `4d445384…4841`（独立实现互证） |
 | B8 确定性 | 同输入同密钥两次运行产物 sha256 相同 |
-| B9 跨架构 | arm64 产物（qemu）与宿主 x86-64 产物输出**同一 sha256** |
+| **B9 事故现场回归（核心）** | 在 `--out` 位于显式 `--workdir` 内的形态下：**B9a** workdir 目录仍存在（未被整体删除）；**B9b** `--out` 存在且非空；**B9c** `--out.report.json` 存在（workdir 内产物未被连带清理）；**B9d** stdout 末行仍为 `ROOT_KEY=`（C1 §2.2 会签口径）；**B9e** stderr 有 `workdir preserved (owned by caller)` 诊断 | 真机事故的真实复现条件；旧代码此处 rc=0 但 B9b 必红 |
+| **B10 正控：默认 workdir 回收** | 不传 `--workdir`（默认 `<out>.work` 由测试预建并放 marker）→ rc=0、产物存在、**`<out>.work` 已被引擎回收** | 防「干脆永不删除」把契约另一半演没 |
+| B9b 跨架构 | arm64 产物（qemu）与宿主 x86-64 产物输出**同一 sha256**（原编号 B9，因新增 B9 事故回归而改号，§5.2 引用同步） |
 
 > 附带修复（C1 §2.3 契约偏差，qa 会判）：①`report.json` 原缺 `output.size/output.sha256`；②`hook_table` 被 `cJSON*`→`bool` 重载误选写成 `true`；③`kernel_version` 恒 `unknown`。已分别补 `engine/src/spr_sha256.h`（自实现 SHA-256，无第三方依赖）、修正 JSON 序列化、接 `KernelVersionParser`。
 
@@ -466,14 +482,50 @@ fastboot reboot
 **引擎已实现的强制自检（可测）**：
 - `--key-abi <值>`：缺省 `47nul`；**任何其它取值（如 `48nul`/`48`）→ `E101` 拒绝**，stderr 明确写出
   "SPRoot engine implements only 47+NUL … Skroot-Next uses 48-byte no-NUL ABI and is INCOMPATIBLE"。
-- `report.json → key_spec.abi = "47+NUL"`：产物自描述，qa/客户端可断言，避免与 Next 产物混淆。
+- **`--key` 长度严格 48**（`^[A-Za-z0-9]{48}$`）：47 字符/49 字符/非 alnum **一律 `E101`**，绝不静默截断或放行
+  （CI：A6g/A6h 实测 rc=101）。这防的是"App 用 47、引擎收 48、内核存 47"之间任一环被静默改写。
+- **内核内嵌字节的唯一来源**：`engine/src/skroot_patch_main.cpp` 的 `embed_key_bytes()`
+  —— `out = cli_key[0:47] + '\0'`，**恰好 48 字节，第 48 字节恒为 0**（第 48 个可见字符不写入内核）。
+  函数内联断言 `size()==48 && out[47]==0`；`embed_key` 阶段若派生失败直接 `E250` 失败（不写产物）。
+- **`report.json → key_spec`：机器可断言的四字段**（客户端/质测直接读，不必猜）：
+
+  ```json
+  "key_spec": {"charset":"A-Za-z0-9","length":48,"stored_len":47,
+               "bytes":48,"last_byte_is_nul":true,"input_len":48,
+               "abi":"47+nul","source":"user|gen"}
+  ```
+
+  | 字段 | 语义 |
+  |---|---|
+  | `abi` | `"47+nul"`（**规范小写**；非 Next 的 48-no-NUL） |
+  | `bytes` | 内核内嵌总字节数 = **48**（47 字符 + NUL） |
+  | `last_byte_is_nul` | **true**（第 48 字节恒为 0） |
+  | `input_len` | CLI 输入长度 = **48**（48 字符只取前 47 落盘） |
+  | `stored_len` / `length` / `charset` | 47 / 48 / `A-Za-z0-9`（旧字段保留，向后兼容） |
+
 - 文档写死：**禁止**用 Skroot-Next 打过的内核再用本引擎/密钥提权；反之亦然。
+
+**全链一致性（CALL v1.1 E1，缺一环即静默失配）**：
+
+```
+App 持有 48 字符密钥
+  → 引擎 embed_key_bytes(): 写 key[0:47] + NUL（48 字节）     ← A10 / Tier B B7 断言
+  → 内核跳板存 47 字符 + NUL（逐字节 ldrb/cmp/cbnz，遇 NUL 终止）
+  → daemon 读 /data/adb/sproot/key（47 字符纯文本、无 NUL）
+  → escalation_token() 47 字符 → execve 47 字符 → 内核 strcmp 命中
+```
+⚠️ 客户端/daemon 侧**必须用 47 字符**（`ROOT_KEY[:47]` / 文件内容 47 字符）；若 App 拿 48 字符去提权，
+内核第 48 字节是 NUL 而比较串第 48 字节是可见字符 → **静默失败（普通 ENOENT，无日志）**。
 
 **验证命令**（CI 已覆盖）：
 ```bash
 skroot-patch --in kernel --out out --key <48字符> --key-abi 48nul   # → rc=101 且无 out 文件
-skroot-patch --in kernel --out out --key <48字符>                   # → rc=0，report.key_spec.abi=="47+NUL"
+skroot-patch --in kernel --out out --key <48字符>                   # → rc=0，report.key_spec.abi=="47+nul"
+skroot-patch --self-test-keyabi --key <48字符>                      # → KEYRESULT PASS 17/17，KEYSPEC abi=47+nul …
+skroot-patch --self-test-keyabi                                     # 随机密钥（--gen-key 路径）同样 17/17
 ```
+**负样本已验**（T-12 铁律）：写「48 可见字符 + NUL」(49 B) → 3 例 FAIL；写「48 可见字符无 NUL」→ 3 例 FAIL；
+把 `abi` 改回 `"47+NUL"` 或 `last_byte_is_nul` 改 false → 2 例 FAIL。
 
 ### 7.6 诊断能力：`--dump-symbols` 与前置拒绝提示
 
@@ -515,12 +567,69 @@ magiskboot 来自 Magisk（**GPL-3.0**），我们以**独立可执行程序**�
 | §2.3 report schema | `build_report`（engine_version/input/output/hook_table/hidden_dir_prefix…） | ✅（Tier B5 待样本验证） |
 | §3 退出码 11 枚举 | `ExitCode` enum；A6b/A6c/A6e 实测 101/102 | ✅ |
 | §3 失败不落盘铁律 | `fail()` 内 `fs::remove(opt.out_path)`；A6d 实测 | ✅ |
-| §4-2 密钥内嵌（47+NUL） | `main.cpp` 写入 `key[0..46] + NUL`；跳板逐字节 cmp（`patch_do_execve.cpp:89-102`）；Tier B4 | ✅ 实现 / ⏳ 样本断言 |
+| **§3 `--workdir` 所有权（事故后补足契约）** | 判定收进纯函数 `should_reclaim_workdir()` + 解析期 `workdir_from_user` 标记；行为证据 A9d（13 例矩阵，CI 必跑）+ Tier B B9/B10（真内核） | ✅ 见 §8.1 |
+| §4-2 密钥内嵌（47+NUL） | `embed_key_bytes()` 取 CLI 密钥前 47 字符 + NUL（48 字节，内联断言）；跳板逐字节 cmp（`patch_do_execve.cpp:89-102`）；A10 17 例 + Tier B B7 | ✅ |
+| **§4-2 `report.key_spec` 机器可断言（P0）** | `abi="47+nul"` / `bytes=48` / `last_byte_is_nul=true` / `input_len=48`（+ `stored_len=47`/`length=48`/`charset`）；A10s 摘要自证 + Tier B B7 断言 | ✅ 见 §7.5 |
 | **CALL v1.1 E1 提权串=47 字符** | 内核侧第 48 字节恒为 NUL → 用户态必须传 47 字符 NUL 串（48 字符必失配） | ✅ 已会签 |
 | CALL v1.1 E5 取消独立部署器 | 本方案只交付引擎两形态，**无** `skroot-deploy` | ✅ |
 | CALL v1.1 §8 root-exec 依赖 `--superkey-file` | 与引擎无关（属 apd/守护面，task-6） | n/a |
 
 ---
+
+### 8.1 CLI 契约补充：`--workdir` 所有权（真机事故后追加，2026-11-09）
+
+> **契约原文（本仓权威口径，客户端与引擎共同遵守）**
+>
+> **显式传入 `--workdir` 时，该目录及其内容的生命周期归调用方，引擎不得删除其中任何内容；只有默认 workdir（`<out>.work`）由引擎在成功收尾时回收。**
+
+**事故背景**（真机首跑，魅族 21）：客户端把 `--out=kernel.patched` 放在显式传入的 `--workdir` 内，
+引擎成功收尾时 `remove_all(workdir)` 把产物一并删掉却仍返回 `rc=0` → 客户端只看到
+「引擎返回成功但没有产物」，修补在最后一步静默失败（`kernel.patched` 不存在）。
+旧实现的问题不在"清理"本身，而在**用字符串是否等于默认值来推断目录所有权**，且 `--out` 的保护
+没有覆盖 `--json` 事件流。
+
+判定规则（实现：`engine/src/skroot_patch_main.cpp` 的 `should_reclaim_workdir()`，纯函数、可被自检直接调用）：
+
+| 场景 | 成功收尾行为 |
+|---|---|
+| 调用方**显式**传 `--workdir`（无论 `--out` 在不在其中） | **不删除**该目录及其中任何内容 |
+| 调用方显式传入的 `--workdir` 恰好等于默认值字符串（`<out>.work`） | **不删除** —— 所有权按「命令行是否出现 `--workdir`」判定，**禁止**用字符串比对推断 |
+| 未传 `--workdir`（引擎自拼 `<out>.work`） | 回收该目录 |
+| 未传 `--workdir`，但 `--out` / `<out>.report.json` / `--json` 任一落在默认 workdir 内 | **不删除**（兜底，防丢产物 / 事件流） |
+| 任意失败（rc≠0） | **不删除** workdir（保留诊断）；只删 `--out`（C1 §3 铁律） |
+
+补充约定：
+
+1. **stdout 末行必须是 `ROOT_KEY=<48字符>`**（C1 §2.2 客户端会签兜底口径）。`workdir preserved` 之类诊断一律走 **stderr**，并受 `--quiet` 抑制 —— 否则会把末行挤掉，变成"密钥读不到"的新事故。
+2. 引擎当前**不向 workdir 写任何中间产物**（尚无检查点/转储），故上述规则的实际风险面只有"成功收尾的 `remove_all`"。将来若在 workdir 内落盘任何文件，必须先更新本节与 A9d 矩阵。
+3. **证据链**：
+   - 静态 A9a~A9c（防 grep 级回退）；
+   - **行为（CI 必跑）** A9d：`--self-test-workdir` 13 例矩阵（7 例 `should_reclaim_workdir` + 6 例 `path_within_dir` 边界），逐例 `expect=reclaim|keep` vs `got`；A9e 规模下限 ≥12 防"删用例成空断言"；
+   - **行为（真内核）** Tier B B9（事故现场：rc=0 且产物/报告/目录全在、stdout 末行仍为 `ROOT_KEY=`）、B10（默认 workdir 回收正控）。
+4. **负样本（T-12 铁律：断言必须先被证明能红，2026-11-09 实测）**：
+   - 判定回退成「无条件删除」（8a196f0 之前）→ A9d **5 例 FAIL**（`WDRESULT FAIL 8/13 cases`，rc=1）；
+   - 判定回退成 8a196f0 原版（纯字符串相等、只护 `--out`）→ A9d 恰好在 `explicit_workdir_equal_default_string` 与 `default_workdir_json_sink_inside` **两例 FAIL**（`WDRESULT FAIL 11/13 cases`，rc=1）。
+   - 后者证明本轮加固的两个缺口（显式传默认值仍被删、NDJSON sink 被连带删除）是**真实存在**的行为缺口，而非防御性臆想。
+5. 与上游契约的关系：`SPROOT-DOC-C1` §3 只写了「默认 `<out>.work/`，成功后自动清理，失败时保留」，**未规定显式传入时的所有权** —— 本节即该空白的补足。建议 C1 下一版由 Lead 合并本节文字，避免两处口径漂移。
+
+### 8.2 密钥 ABI 契约（P0，提权链成败）
+
+> **契约一句话**：CLI `--key` 收 **48 字符**；引擎只把 **`key[0:47]` + NUL（48 字节）** 写进内核；
+> **用户态提权串必须是这 47 个字符**（不带 NUL、不带第 48 字符）。
+
+细节、全链图与负样本见 **§7.5**。机器可断言面（客户端/质测不必猜）：
+
+| 断言对象 | 期望值 |
+|---|---|
+| `report.key_spec.abi` | `"47+nul"` |
+| `report.key_spec.bytes` | `48` |
+| `report.key_spec.last_byte_is_nul` | `true` |
+| `report.key_spec.input_len` | `48` |
+| `report.key_spec.stored_len` / `length` | `47` / `48` |
+| `hooks[] group=embed_key` 的 `new_bytes` | 96 个 hex 字符（48 字节、偶数），`startswith(key[:47].hex())`、`endswith("00")` |
+| 失败语义 | `--key` 47 字符 / 49 字符 / 非 alnum → `rc=101`（E101），**绝不静默截断或放行** |
+
+证据：A6g/A6h（长度守卫）、A10（`--self-test-keyabi` 17 例，CI 必跑）、Tier B B4/B7（真内核产物字节）。
 
 ## 9. 包体与体积
 
@@ -570,9 +679,9 @@ magiskboot 来自 Magisk（**GPL-3.0**），我们以**独立可执行程序**�
 | 文件 | 说明 |
 |---|---|
 | `engine/src/Makefile` | `?=` 化 + `OBJDIR` 树外目标文件 + `objs` 目标（宿主构建行为不变） |
-| `engine/src/skroot_patch_main.cpp` | 入口改 `extern "C" spr_engine_run()`，`main()` 转发（`SPROOT_NO_CLI_MAIN` 可裁） |
+| `engine/src/skroot_patch_main.cpp` | 入口改 `extern "C" spr_engine_run()`，`main()` 转发（`SPROOT_NO_CLI_MAIN` 可裁）；**workdir 所有权判定收进纯函数 `should_reclaim_workdir()` + `path_within_dir()`，新增隐藏自检 `--self-test-workdir`（§8.1）**；**密钥内嵌统一走 `embed_key_bytes()`（47+NUL/48 字节，内联断言）+ `--self-test-keyabi`（§7.5）** |
 | `engine/android/build_arm64.sh` | arm64 交叉编译（exec / jni / both） |
-| `engine/android/verify_artifact.sh` | Tier A/B 静态验证（qemu 契约自检） |
+| `engine/android/verify_artifact.sh` | Tier A/B 验证（qemu 契约自检）；**A9d `--self-test-workdir` 13 例行为矩阵（CI 必跑）**、**Tier B B9 事故现场回归 / B10 默认 workdir 回收正控**；**A6g/A6h 密钥长度严格 48 + A10 `--self-test-keyabi` 17 例（CI 必跑）+ Tier B B7 强化（new_bytes=96 hex + key_spec 六字段）** |
 | `engine/android/jni/skroot_patch_jni.cpp` | JNI 入口 `NativeEngine.patch/engineVersion` |
 | `engine/android/tools/asmjit_probe.cpp` | asmjit 指令字节生成器（oracle 的 A 侧） |
 | `engine/android/tools/asm_oracle.sh` | asm oracle：asmjit vs NDK LLVM 汇编器逐字节比对（10/10 PASS，已进 CI） |
@@ -665,7 +774,7 @@ adb shell 'cd /data/local/tmp/patch && ./skroot-patch --in kernel --out kernel.p
     `read_input → parse_kallsyms → derive_offsets → locate_init_cred → patch_cfi_huawei → patch_hooks → embed_key → write_output` 与唯一 `result` 终态
   - `size(kernel.patched) == size(kernel)`（等长，C1 §2.1）
   - `kernel.patched.report.json`：`hook_groups_count >= 13`、`hook_groups_resolved >= 10`、
-    `hooks[group=embed_key].new_bytes` = 密钥 hex + `00`、`key_spec.abi == "47+NUL"`
+    `hooks[group=embed_key].new_bytes` = `key[0:47]` hex + `00`（**96 hex = 48 字节**）、`key_spec.abi == "47+nul"`（另见 `bytes=48 / last_byte_is_nul=true / input_len=48`）
 - **耗时预期**：宿主机 33.9 MB 内核 **6.4 s**；qemu 模拟 **226 s**；真机（8 核 A 系）预计 **3–10 s**。
   若 >60 s 仍未结束：检查是否 `--workdir` 落在 sdcard（FUSE 慢），应放 `/data/local/tmp`
 
