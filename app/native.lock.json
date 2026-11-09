@@ -1,6 +1,6 @@
 {
   "_comment": "SPRoot Manager 原生二进制锁定表（可复现构建）。CI 只按本文件精确下载并校验 sha256，不在 latest artifact 上浮动。任何升级须显式修改本文件并单独 commit。",
-  "_updated": "2026-11-09",
+  "_updated": "2026-11-10",
   "engine": {
     "description": "SKRoot 修补引擎 JNI 共享库（aarch64 ET_DYN，Android 侧 System.loadLibrary(\"skrootpatch\")）",
     "artifact": "skroot-engine-arm64",
@@ -18,15 +18,15 @@
   "apd": {
     "description": "SPRoot AP 守护（aarch64 PIE 可执行 ELF；部署时复制为 /data/adb/apd）",
     "artifact": "apd-aarch64-latest",
-    "run_id": 42634727477,
+    "run_id": 42721006924,
     "file": "libapd-arm64.so",
     "target": "libapd.so",
-    "sha256": "3e70561cd889a03b96bb20cbf04f4a4dd6bf5cc1a0b480a3e6d0198841c351f4",
-    "size": 2085344,
-    "commit": "7ea007223a96e851a38edb1b2ea0387ff998de14",
-    "version": "7ea0072",
+    "sha256": "ba4ac09628b014d52f2d485dea0a2304841198e673bcefcb7f98a37bb0f0609d",
+    "size": 2146272,
+    "commit": "d6c9ecb69095ba8afd9690c476b4d0c1cf045fd3",
+    "version": "d6c9ecb",
     "extra_assets": {
-      "apd-version.txt": "1131cb66781e0a02e20d87e7b11c928cda6105ff5871dbd7f05a900fc69206e9",
+      "apd-version.txt": "3b024b1838fcd7f49c8d9d0ec1ec5f02585a11ed4f0508ac07d59c94b43e2790",
       "apd-capabilities.txt": "2abb17a825e71c0cc22d6eb91b9a66eee7b008347f0f49d91b6f2412e37cc269"
     }
   },
