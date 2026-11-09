@@ -28,6 +28,7 @@ import top.yukonga.miuix.kmp.blur.LayerBackdrop
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Home
 import top.yukonga.miuix.kmp.icon.extended.Layers
+import top.yukonga.miuix.kmp.icon.extended.Lock
 import top.yukonga.miuix.kmp.icon.extended.Settings
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.utils.springAnimateToPage
@@ -102,6 +103,7 @@ fun rememberMainPagerState(
  */
 enum class BottomBarDestination(val label: String, val icon: ImageVector) {
     Home("主页", MiuixIcons.Home),
+    Auth("授权", MiuixIcons.Lock),
 
     Module("模块", MiuixIcons.Layers),
     Setting("设置", MiuixIcons.Settings),

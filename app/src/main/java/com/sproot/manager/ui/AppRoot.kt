@@ -25,6 +25,7 @@ import com.sproot.manager.ui.components.rememberBlurBackdrop
 import com.sproot.manager.ui.components.rememberMainPagerState
 import com.sproot.manager.ui.components.shouldShowSplitPane
 import com.sproot.manager.ui.pages.AboutPager
+import com.sproot.manager.ui.pages.AuthPager
 import com.sproot.manager.ui.pages.HomePager
 import com.sproot.manager.ui.pages.ModulePager
 import com.sproot.manager.ui.pages.PatchPager
@@ -36,9 +37,9 @@ import com.sproot.manager.ui.theme.ThemePrefs
 import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.blur.layerBackdrop
 
-/** 主分页数量（主页 / 模块 / 设置）。修补/刷入是主页触发的二级页，不是 Tab。 */
+/** 主分页数量（主页 / 授权 / 模块 / 设置）。修补/刷入是主页触发的二级页，不是 Tab。 */
 private object MainPagerConfig {
-    const val PAGE_COUNT = 3
+    const val PAGE_COUNT = 4
 }
 
 /**
@@ -49,7 +50,7 @@ private object MainPagerConfig {
  *  ├─ 关于页（二级页面：BackHandler + 全屏 AboutPager）   ← KSU Route.About
  *  ├─ 修补/刷入页（二级页面：主页触发）                   ← KSU Home→Install/Flash 模型
  *  └─ Scaffold(bottomBar = BlurredBar(NavigationBar))   （或分屏 SideRail）
- *      └─ HorizontalPager(3 页：主页/模块/设置)          ← 手势横滑 + 底栏联动
+ *      └─ HorizontalPager(4 页：主页/授权/模块/设置)      ← 手势横滑 + 底栏联动
  *          └─ 每页自带 Scaffold + BlurredBar(TopAppBar)  ← 与 KSU 页面结构一致
  * ```
  *
@@ -140,7 +141,12 @@ private fun MainScreen(
                         onGoPatch = onOpenPatch,
                     )
 
-                    1 -> ModulePager(
+                    1 -> AuthPager(
+                        bottomInnerPadding = bottomInnerPadding,
+                        isCurrentPage = isCurrentPage,
+                    )
+
+                    2 -> ModulePager(
                         bottomInnerPadding = bottomInnerPadding,
                         isCurrentPage = isCurrentPage,
                     )

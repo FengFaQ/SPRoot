@@ -93,7 +93,8 @@ android.newDsl=false
 - 主题：`ui/theme/{Theme,MiuixTheme,Colors,ThemePrefs}.kt`，照抄 KSU `ui/theme/MiuixTheme.kt` 的 miuix 分支（`ThemeController` + `TonalSpot` + `Spec2025` + 15 色强调色）；Monet/materialkolor 未引入（KSU 的 Monet 依赖 material3）；
 - 组件：`ui/components/{BlurExt,BottomBar,StatusTag,WarningCard,ConfirmDialog}.kt` 逐行照抄 KSU 对应 miuix 文件；
 - 页面映射：Home→主页状态卡、Install+Flash→修补页、Module→模块页、Settings→设置页、About→关于页（二级页）；
-- 底部导航四页 + 关于页；设置页设置项**全部替换为 SPRoot 自己的**（主题 / Root 密钥 / 日志 / 原镜像备份 / AP 部署 / 引擎自检 / 工作目录清理 / 关于许可）。
+- 底部导航四页（主页 / 授权 / 模块 / 设置，KSU 顺序）+ 关于页与修补页两个二级页；
+  设置页设置项**全部替换为 SPRoot 自己的**（主题 / Root 密钥 / 日志 / 原镜像备份 / AP 部署 / 引擎自检 / 工作目录清理 / 关于许可）。
 
 ### 3.1 主页（Home）
 1. **安装状态卡**（来自 `InstallState`）：`未修补 / 修补中 / 已修补·待刷入 / 已刷入·待重启 / 已激活 / 错误` + 产物路径 + sha256 + 最近更新时间 + 备注。
@@ -134,6 +135,18 @@ android.newDsl=false
 - **空态**：大图标 + 文案（区分「尚未安装」与「搜索无匹配」）；AP 未就绪时顶部 Notice 提示并禁用操作。
 - **卸载**：二次确认对话框（说明「AP 模块变更通常在下次重启后生效」）。
 - 业务数据仍只经 `ModuleRepository`（`apd module ...` root-exec），客户逻辑未改。
+
+### 3.3A 授权管理页（SuperUser，v0.3 骨架）
+
+照 KSU `SuperUserMiuix.kt` 的版式搭骨架：TopAppBar「授权」+ 右上角筛选（全部/已授权/已拒绝/每次询问）
++ 刷新；列表首项搜索栏（名称/包名/uid）；列表项 = 圆底首字母图标 + 名称 + 包名 + uid/统计 + 右侧三态标签；
+点卡片进详情（应用信息 + 三态单选：允许/拒绝/每次询问 + 撤销授权 + 统计）。
+
+**数据诚实原则**：AP 侧 `apd auth list/set/log/revoke --json` 契约由 apd-dev 落地中，
+`core/AuthRepository.kt` 目前 `API_READY=false`，返回**明确标注的占位假数据**：
+页面顶部常驻 Notice「授权 API 尚未接入…当前列表为占位假数据，变更仅本地预览」；
+`ask`（每次询问）依赖 daemon 挂起请求并回传弹窗，本轮未实现 → **显示但禁用并标注"待实现"**。
+契约落地后只需替换 `AuthRepository` 实现（UI 不用改）。
 
 ### 3.4 设置页（Settings）
 外观（主题）、Root 密钥（显示/复制/重新生成 + 旧内核失效警告）、日志（路径/复制/清空）、**原镜像备份**（sha1 列表 / 还原到 Downloads / 删除）、AP 部署（`apd deploy --source <nativeLibDir>`，显示 exit code 与完整输出）、关于（版本/工具链/契约版本）。
