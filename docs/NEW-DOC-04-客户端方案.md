@@ -29,8 +29,10 @@
 | Gradle | 9.7.1（wrapper 已提交） | miuix 0.9.4 的 wrapper 版本 |
 | JDK | 21（CI `setup-java`） | miuix `jvmToolchain(21)`；AGP 9 要求 |
 | material3 冲突处理 | `exclude(group="org.jetbrains.compose.material3", module="material3-window-size-class")` | miuix runtime 变体把 material3 约束抬到 1.5.0-alpha22，会造成编译期 1.4.0 / 运行期 alpha 不一致；miuix 源码对 `WindowSizeClass` 零引用（见 `docs/research/miuix-integration.md` §1.3/E8） |
-| 未使用 | miuix-preference / blur / glass / glass-icons / squircle | blur 需 minSdk 33；glass 系列 0.9.4 未发布；preference 当前手写卡片足够 |
-| 导航 | 不用 navigation-compose | 仅 4 个平级页，状态驱动即可，少一个依赖 = CI 少一类失败面 |
+| miuix 模块 | **ui + icons + nav + preference + blur**（照抄 KSU miuix 版所需最小集） | KSU 的 `manager/gradle/libs.versions.toml` 五模块；本项目 UI 重做后已全部使用（preference 用于设置页，blur 用于顶栏/底栏毛玻璃，nav 依赖备用） |
+| miuix-blur 与 minSdk | 项目 minSdk 保持 **26**；manifest 加 `tools:overrideLibrary="top.yukonga.miuix.kmp.blur"`（该库声明 minSdk 33） | 与 KSU 同样处理；代码侧统一 `isRenderEffectSupported()`（SDK_INT>=31）守卫，API<31 自动退化为不透明色 |
+| 图标 | **miuix-icons**（`MiuixIcons.Home/Update/Layers/Settings/Refresh/Ok/Report/Phone/Info/Tasks/Store/Lock/Tune`、`MiuixIcons.Basic.Check/Close`） | 曾引入 material-icons-extended 导致 APK 15.4MB；改 miuix-icons 后回落到 11.2MB（两库风格也更一致） |
+| 导航 | 不用 navigation-compose；关于页用状态驱动 + BackHandler | 只有 4 个平级页 + 1 个二级页（关于），状态驱动可避免引入 kotlinx-serialization 编译器插件（CI 风险更低）；KSU 的 NavDisplay 未照搬 |
 
 ### 1.1 AGP 9 的两个必填开关（CI 实证踩坑）
 
@@ -85,7 +87,13 @@ android.newDsl=false
 
 ## 3. 页面骨架与交互
 
-底部导航四页（Miuix `NavigationBar`），顶栏 `SmallTopAppBar`；主题 `MiuixTheme(ThemeController)`，设置页可切「跟随系统/浅色/深色」。
+**UI 已按人类指令完全照抄 KernelSU 的 miuix 实现**（固定 miuix，无 Material/Miuix 双模式；KSU 来源声明见根 `NOTICE` §6.1）：
+
+- 骨架：`ui/AppRoot.kt` = MiuixTheme + `HorizontalPager`(4 页) + 毛玻璃 `BottomBarMiuix`（宽屏切 `NavigationRailMiuix`），每页自带 `Scaffold` + `BlurredBar(TopAppBar)`（KSU 页面结构）；
+- 主题：`ui/theme/{Theme,MiuixTheme,Colors,ThemePrefs}.kt`，照抄 KSU `ui/theme/MiuixTheme.kt` 的 miuix 分支（`ThemeController` + `TonalSpot` + `Spec2025` + 15 色强调色）；Monet/materialkolor 未引入（KSU 的 Monet 依赖 material3）；
+- 组件：`ui/components/{BlurExt,BottomBar,StatusTag,WarningCard,ConfirmDialog}.kt` 逐行照抄 KSU 对应 miuix 文件；
+- 页面映射：Home→主页状态卡、Install+Flash→修补页、Module→模块页、Settings→设置页、About→关于页（二级页）；
+- 底部导航四页 + 关于页；设置页设置项**全部替换为 SPRoot 自己的**（主题 / Root 密钥 / 日志 / 原镜像备份 / AP 部署 / 引擎自检 / 工作目录清理 / 关于许可）。
 
 ### 3.1 主页（Home）
 1. **安装状态卡**（来自 `InstallState`）：`未修补 / 修补中 / 已修补·待刷入 / 已刷入·待重启 / 已激活 / 错误` + 产物路径 + sha256 + 最近更新时间 + 备注。
@@ -97,6 +105,8 @@ android.newDsl=false
 ### 3.2 修补页（Patch）——本项目的核心
 自上而下：
 1. **选择镜像**：SAF `OpenDocument("*/*")` + `takePersistableUriPermission`；展示文件名/URI。
+   **P2 双镜像**：`boot.img` 必选 + `init_boot.img` 可选（强烈建议）；未选 init_boot 时页面明确提示
+   「将无法注入开机自启（本机 ramdisk 可能位于 init_boot）」，不静默跳过。
 2. **修补模式**（PatchMode）：`仅导出` / `导出并给出刷入指引`；`从备份还原`、`卸载还原` 以 `enabled=false` 占位（避免"点了必然失败"）。
 3. **进度**：`阶段标题 + 阶段说明 + 百分比 + LinearProgressIndicator`；引擎进度来自 NDJSON，占 35%→72% 区间。
 4. **错误区（常驻）**：`errorTitle/errorDetail` 一经写入不自动消失，仅"重置"清除；提供「展开/收起详情」「复制全部（含日志）」「日志文件路径」。
@@ -129,11 +139,15 @@ android.newDsl=false
 5 修补        NativeEngine.patch(kernel.raw → kernel.patched, key48, json=progress.ndjson)
 6 覆盖内核    **必须**把修补结果写回 `kernel`（压缩则 compress=<fmt> kernel.patched kernel，否则直接复制）
               记录 kernel/kernel.orig/kernel.patched 三者 sha256；若 kernel == kernel.orig → T-12 中止
+6.4 init_boot（P2）  P2 双镜像：copy → 备份 → magiskboot unpack → 在 init_boot ramdisk 注入 rc
+                   （D-12：init_boot 优先、boot 回退）→ repack → **ramdisk 级回读**（rc 真在最终镜像）
+                   → AVB-1/2/3 → 产物 init_boot_patched.img
 7 重打包      magiskboot repack boot.img → new-boot.img
 7.5 回读断言 把 new-boot.img 复制到 verify/ 再 unpack（必要时再 decompress）：
               回读 kernel sha256 **必须等于** kernel.patched 且 **不等于** kernel.orig/raw，否则 T-12 中止
               同时检查 AVB footer 存在性是否保持、记录产物/输入总长差异
 8 校验导出    产物存在/非空 → 修补内核与输入内核**长度相等** → sha256 变化 → 导出 Downloads/SPRoot/
+              双镜像时 boot + init_boot 两个产物**全部通过校验后**才导出；任一失败即中止、一个都不导出
 9 状态        失败 → InstallState.ERROR；成功 → PATCHED_PENDING_FLASH
 ```
 
@@ -251,7 +265,7 @@ UI 铁律：**原始码与可读文案同时展示**（错误区"错误码"字�
 | AP root-exec | 1 | AP 业务失败（展示 stderr 摘要） |
 | AP root-exec | 2 | AP 用法错误——视为 bug，展示原始 argv |
 | AP root-exec | 124 | 超时（提示用户，保留日志） |
-| AP root-exec | 125 | 密钥无效或需重新修补（提权被内核静默拒绝；**不自动重试**） |
+| AP root-exec | 125 | **尚未部署 AP 守护（需先刷入修补后的镜像）**——首启正常初始态；UI 用 Notice 展示，**不标红、不显示"失败/未通过"**、不自动重试 |
 | AP root-exec | 126 | 目标命令不可执行（126），需重新部署 AP |
 | AP root-exec | 127 | 目标命令不存在（127），需重新部署 AP |
 | AP root-exec | 其他 | 未知退出码（<code>），原样展示 |
@@ -350,6 +364,8 @@ UI 铁律：**原始码与可读文案同时展示**（错误区"错误码"字�
 
 - 启动时 `SPRootApp` 后台执行一次；有密钥走 `root-exec`，无密钥回退直接 exec（只读探测）。
 - `stage=undeployed` **exit 0 = 正常状态**（AP 未部署），UI 显示「AP 未部署」，不报错。
+- **exit 125 同属正常初始态**（有密钥但内核未刷补丁镜像 → 提权被静默拒绝）：
+  `ApdSelfTest` 新增 `isNormalInitialState`，UI 文案「尚未部署 AP 守护（需先刷入修补后的镜像）」。
 - 其它 stage 原样展示（`deployed`/`daemon_ready`/`needs_repair`…）；结果缓存 SharedPreferences，主页/模块页/设置页只读展示，并提供「重跑 AP 自检」。
 
 ### 7A.3 B-14 引擎自检入口（qa JNI 验证）
@@ -430,6 +446,18 @@ CI 行为（硬失败）：
 ---
 
 ## 9. 待办与开放项
+
+### 9.0 UI 重做与 P2 双镜像（已完成，2026-11-09）
+
+- **UI 完全照抄 KSU miuix 版**：四页骨架 + 关于页；设置项全部替换为 SPRoot 自己的 8 项；
+  业务逻辑类（PatchPipeline/ApdClient/InstallState/PatchEngine/Capabilities/SecretStore/BackupStore、
+  Elf/MiniJson/ModuleExitCode 等）**未改动逻辑**（P2 与 47 密钥口径属功能修复，另行记录）。
+- **P2 双镜像**：`boot.img` + `init_boot.img` → 两个产物；init_boot ramdisk 优先注入 rc；
+  两个产物分别做 ramdisk 级回读（T-12 等价）与 AVB-1/2/3；全通过才导出；
+  `InstallState.artifacts` 持久化 `products[]`。
+- **密钥口径**：本地/AP/内核 47 字符（内核 ABI 47+NUL）；引擎 `--key` 入参 48（引擎内部 erase 末位），
+  由 `SecretStore.engineKeyOf()` 补位，见 §9.1。
+- **APK 体积**：15.4MB → 11.2MB（移除 material-icons-extended，改 miuix-icons）。
 
 1. **native 资产落地**：
    - `libapd.so` ← CI 固定 artifact **`apd-aarch64-latest`**（含 `libapd-arm64.so` + `apd-version.txt`，约 1.35 MB）；工作流已按此名拉取并重命名为 `libapd.so`，同时把 `apd-version.txt` 打到 `app/src/main/assets/`；
