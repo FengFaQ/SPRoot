@@ -1,120 +1,263 @@
 package com.sproot.manager.core
 
 import android.content.Context
+import android.content.pm.PackageManager
+import android.graphics.drawable.Drawable
 
 /**
  * Root 授权数据层 —— D（授权管理页）的唯一数据入口。
  *
- * ## 为什么要先说"未接入"
- * 权威接口是 apd-dev 正在实现的 `apd auth list/set/log/revoke --json`。在它落地前，
- * 本类返回**明确标记 fake = true 的占位数据**，UI 会展示提示条；
- * 任何"看起来能改、实际不生效"的实现都是禁止的（本项目最忌讳"看起来成功实则无效"）。
+ * 契约来源：apd commit d6c9ecb（apd-dev，`apd auth list/set/revoke/log --json`）。
+ * 全部命令 **root-only**，统一经 [ApdClient.rootExec]（契约 v1.1 §8 唯一特权入口）；
+ * App 不直接读 /data/adb、不 execve 提权。
  *
- * ## 接入方式（apd-dev 契约到位后只改本文件）
- * - `list`：`ApdClient.rootExec(key, listOf(apd, "auth", "list", "--json"))`，
- *   用 `MiniJson`/`Modules.kt` 同款扁平解析拿到 `{uid,package,state,last_grant_at,deny_count,request_count}`；
- * - `set`：`auth set <uid> <allow|deny|ask> --json`；`ask` 需 daemon 弹窗能力，未就绪则 `supported=false`；
- * - `revoke`：`auth revoke <uid> --json`；
- * - `log`：`auth log --json`（详情页"最近记录"用，本轮不做）。
- *
- * 业务严格只走 `ApdClient`（root-exec），App 不直接读 /data/adb。
+ * ## 字段解析要点
+ * - `label` / `app_icon_path` 恒为 `null`（apd 侧无 PackageManager）→ 本类用 App 的
+ *   PackageManager 按 `package` 解析应用名与图标；包不存在（uid 无对应包）时
+ *   label = `uid=xxxxx` + 通用图标（icon=null），**不崩、不显示空白**；
+ * - `last_grant_at` / `last_deny_at` / `ts` 为 **unix 秒** → 统一换算成毫秒；
+ * - `ask` 在 Phase 1 不可交互（当前等同拒绝），[setState] 拒绝把状态设成 ask 并给出说明；
+ * - 日志只有脱敏信息（无完整命令/无密钥），本类不补全、不猜测。
  */
 object AuthRepository {
 
     private const val TAG = "Auth"
 
-    /** 契约标志：true = 仍为占位假数据；apd-dev 契约落地后置 false 并替换实现。 */
-    const val API_READY = false
-
-    const val FAKE_NOTICE =
-        "授权 API 尚未接入（等待 apd auth list/set/log/revoke --json 契约）：" +
-            "当前列表为占位假数据，状态变更只在本地预览、不会写入 daemon"
+    /** 默认授权态说明（页面顶部展示；避免用户困惑"为什么新 App 申请不到 root"）。 */
+    const val DEFAULT_STATE_NOTICE =
+        "默认授权态是「待询问」(ask)：新安装应用第一次请求 root 会被拒绝（decision=ask_pending），" +
+            "请在此把它改为「允许」"
 
     data class ListResult(
         val ok: Boolean,
-        val fake: Boolean,
         val message: String,
         val apps: List<AuthApp>,
         val raw: String = "",
     )
 
-    private fun fakeApps(): List<AuthApp> = listOf(
-        AuthApp(
-            uid = 2000,
-            packageName = "com.termux",
-            label = "Termux",
-            state = AuthState.ALLOW,
-            lastGrantAt = System.currentTimeMillis() - 86_400_000L,
-            requestCount = 12,
-        ),
-        AuthApp(
-            uid = 2001,
-            packageName = "bin.mt.plus",
-            label = "MT 管理器",
-            state = AuthState.DENY,
-            denyCount = 3,
-            requestCount = 3,
-        ),
-        AuthApp(
-            uid = 2002,
-            packageName = "com.topjohnwu.magisk",
-            label = "Magisk",
-            state = AuthState.ASK,
-            requestCount = 1,
-        ),
-        AuthApp(
-            uid = 2003,
-            packageName = "com.android.shell",
-            label = "Shell",
-            state = AuthState.ALLOW,
-            lastGrantAt = System.currentTimeMillis() - 3_600_000L,
-            requestCount = 8,
-        ),
+    data class LogResult(
+        val ok: Boolean,
+        val message: String,
+        val entries: List<AuthLogEntry>,
+        val raw: String = "",
     )
 
-    /** 列表（当前=假数据）。调用方放后台线程。 */
+    // ------------------------------------------------------------------ 列表
+
+    /** 列表（阻塞，调用方放后台线程）。 */
     fun list(context: Context, superKey: String?): ListResult {
-        if (API_READY) {
-            // 契约落地后在此替换为 apd auth list --json（保留 fake=false 契约）
-            error("AuthRepository.API_READY=true 但 apd 契约实现尚未接入")
+        if (superKey.isNullOrBlank()) {
+            return ListResult(false, "Root 密钥不可用：请到「设置 → Root 密钥」重新生成后重试", emptyList())
         }
-        AppLog.info(TAG, "授权列表：契约未接入，返回占位假数据（${fakeApps().size} 条）")
-        return ListResult(
-            ok = true,
-            fake = true,
-            message = FAKE_NOTICE,
-            apps = fakeApps(),
+        val result = exec(context, superKey, listOf("auth", "list", "--json"), 60)
+        if (!result.ok) {
+            return ListResult(false, explain(result), emptyList(), rawOf(result))
+        }
+        val rows = parseObjectArray(result.stdout)
+        if (rows.isEmpty() && result.stdout.trim().let { it.isNotEmpty() && it != "[]" }) {
+            return ListResult(
+                false,
+                "apd auth list 输出无法解析（契约不一致，请上报）：\n${result.stdout.take(800)}",
+                emptyList(),
+                result.stdout,
+            )
+        }
+        val apps = rows.mapNotNull { parseApp(context, it) }
+        AppLog.info(TAG, "授权列表：${apps.size} 条（apd auth list --json）")
+        return ListResult(true, "共 ${apps.size} 条（apd auth list --json）", apps, result.stdout)
+    }
+
+    private fun parseApp(context: Context, row: Map<String, String>): AuthApp? {
+        val uid = row["uid"]?.toIntOrNull() ?: return null
+        val pkg = row["package"].orNullValue()
+        val state = AuthState.fromWire(row["state"])
+        val (label, icon) = resolveAppInfo(context, pkg, uid)
+        return AuthApp(
+            uid = uid,
+            packageName = pkg ?: "",
+            label = label,
+            state = state,
+            lastGrantAt = (row["last_grant_at"]?.toLongOrNull() ?: 0L) * 1000L,
+            lastDenyAt = (row["last_deny_at"]?.toLongOrNull() ?: 0L) * 1000L,
+            requestCount = row["request_count"]?.toIntOrNull() ?: 0,
+            icon = icon,
+            toUid = row["to_uid"]?.toIntOrNull() ?: 0,
+            sctx = row["sctx"].orNullValue() ?: "",
+            exclude = row["exclude"] == "true",
         )
     }
 
-    /** 设置授权态。契约未接入时返回 supported=false（UI 只做本地预览并明确提示）。 */
+    /** 用 PackageManager 解析应用名/图标；uid 无对应包时回落 `uid=xxxxx`（不崩、不空白）。 */
+    private fun resolveAppInfo(
+        context: Context,
+        pkg: String?,
+        uid: Int,
+    ): Pair<String, Drawable?> {
+        if (pkg.isNullOrBlank()) return "uid=$uid" to null
+        val pm = context.packageManager
+        return runCatching {
+            val info = pm.getApplicationInfo(pkg, 0)
+            val label = pm.getApplicationLabel(info).toString().ifBlank { pkg }
+            label to runCatching { pm.getApplicationIcon(info) }.getOrNull()
+        }.getOrElse { error ->
+            AppLog.warn(TAG, "解析应用信息失败（package=$pkg）：${error.javaClass.simpleName}: ${error.message}")
+            pkg to null
+        }
+    }
+
+    // ------------------------------------------------------------------ 写操作
+
+    /** 设置授权态。`ask` 在 Phase 1 不可交互 → 返回 supported=false 并说明原因。 */
     fun setState(context: Context, superKey: String?, uid: Int, state: AuthState): AuthOpResult {
         if (state == AuthState.ASK) {
             return AuthOpResult(
                 ok = false,
                 supported = false,
-                message = "「每次询问」需要 daemon 挂起请求并回传弹窗，AP 侧尚未实现（待 apd-dev），当前不可用",
+                message = "「待询问」Phase 1 不可交互（daemon 挂起请求/弹窗回传未实现，当前等同拒绝）；" +
+                    "请改为「允许」或「拒绝」",
             )
         }
-        if (!API_READY) {
-            return AuthOpResult(
-                ok = false,
-                supported = false,
-                message = "授权 API 尚未接入（apd auth set --json 待 apd-dev）：仅本地预览，未写入 daemon",
-            )
+        if (superKey.isNullOrBlank()) {
+            return AuthOpResult(false, false, "Root 密钥不可用：请到设置页重新生成")
         }
-        error("AuthRepository.API_READY=true 但 apd 契约实现尚未接入")
+        val result = exec(
+            context,
+            superKey,
+            listOf("auth", "set", "--uid", uid.toString(), "--state", state.wire, "--json"),
+            60,
+        )
+        return opResult(result, state)
     }
 
-    /** 撤销授权（等价 set deny + 清统计）。 */
+    /** 撤销授权（等价置为拒绝）。 */
     fun revoke(context: Context, superKey: String?, uid: Int): AuthOpResult {
-        if (!API_READY) {
-            return AuthOpResult(
-                ok = false,
-                supported = false,
-                message = "授权 API 尚未接入（apd auth revoke --json 待 apd-dev）：仅本地预览",
+        if (superKey.isNullOrBlank()) {
+            return AuthOpResult(false, false, "Root 密钥不可用：请到设置页重新生成")
+        }
+        val result = exec(context, superKey, listOf("auth", "revoke", "--uid", uid.toString(), "--json"), 60)
+        return opResult(result, AuthState.DENY)
+    }
+
+    private fun opResult(result: ApdClient.Result, target: AuthState): AuthOpResult {
+        if (!result.ok) {
+            return AuthOpResult(false, result.exitCode != 2, explain(result), rawOf(result))
+        }
+        val fields = MiniJson.objectOf(result.stdout)
+        val jsonOk = fields["ok"]?.equals("true", ignoreCase = true) == true
+        val previous = fields["previous"].orNullValue()
+        val changed = fields["changed"]?.equals("true", ignoreCase = true) == true
+        val message = buildString {
+            append(if (jsonOk) "已设为「${target.label}」" else "apd 返回 ok=false")
+            if (!previous.isNullOrBlank()) append("（原状态：$previous）")
+            if (!jsonOk) append("：").append(result.stdout.take(400))
+            if (!changed) append(" · 状态未变化")
+        }
+        AppLog.info(TAG, "auth set/revoke → uid=${fields["uid"] ?: "?"} state=$target ok=$jsonOk changed=$changed")
+        return AuthOpResult(jsonOk, true, message, rawOf(result))
+    }
+
+    // ------------------------------------------------------------------ 日志
+
+    /** 审计日志（最新在前；apd 只给脱敏信息）。 */
+    fun log(context: Context, superKey: String?, limit: Int = 100): LogResult {
+        if (superKey.isNullOrBlank()) {
+            return LogResult(false, "Root 密钥不可用：请到设置页重新生成", emptyList())
+        }
+        val result = exec(context, superKey, listOf("auth", "log", "--json", "--limit", limit.toString()), 60)
+        if (!result.ok) {
+            return LogResult(false, explain(result), emptyList(), rawOf(result))
+        }
+        val rows = parseObjectArray(result.stdout)
+        val entries = rows.mapNotNull { row ->
+            val uid = row["uid"]?.toIntOrNull() ?: return@mapNotNull null
+            AuthLogEntry(
+                ts = (row["ts"]?.toLongOrNull() ?: 0L) * 1000L,
+                iso = row["iso"].orNullValue() ?: "",
+                uid = uid,
+                packageName = row["package"].orNullValue(),
+                event = row["event"].orNullValue() ?: "unknown",
+                state = row["state"].orNullValue(),
+                decision = row["decision"].orNullValue(),
+                cmdName = row["cmd_name"].orNullValue(),
+                detail = row["detail"].orNullValue(),
             )
         }
-        error("AuthRepository.API_READY=true 但 apd 契约实现尚未接入")
+        AppLog.info(TAG, "授权日志：${entries.size} 条（apd auth log --json）")
+        return LogResult(true, "共 ${entries.size} 条（最新在前）", entries, result.stdout)
+    }
+
+    // ------------------------------------------------------------------ 工具
+
+    private fun exec(
+        context: Context,
+        superKey: String,
+        args: List<String>,
+        timeoutSec: Int,
+    ): ApdClient.Result = ApdClient.rootExec(
+        context = context,
+        superKey = superKey,
+        command = listOf(ApdClient.apdBinary(context).absolutePath) + args,
+        timeoutSec = timeoutSec,
+    )
+
+    private fun rawOf(result: ApdClient.Result): String =
+        (result.stdout + if (result.stderr.isNotBlank()) "\n[stderr]\n" + result.stderr else "").trim()
+
+    /** 退出码 → 人话（125 = 内核未刷补丁镜像的"正常初始态"，不标红为失败契约错误）。 */
+    private fun explain(result: ApdClient.Result): String = when {
+        result.timedOut -> "apd auth 调用超时（124），请重试"
+        result.exitCode == ApdClient.EXIT_ESCALATION ->
+            "尚未部署 AP 守护（125，需先刷入修补后的镜像并部署 AP）"
+        result.exitCode == ApdClient.EXIT_USAGE ->
+            "apd auth 参数与客户端不一致（2，契约不匹配，请上报 apd-dev）：${result.stderr.take(300)}"
+        result.exitCode == ApdClient.EXIT_NOT_EXECUTABLE || result.exitCode == ApdClient.EXIT_NOT_FOUND ->
+            "AP 调不起来（${result.exitCode}）：请到「设置 → AP 部署」重新部署"
+        else -> result.describe() + if (result.stderr.isNotBlank()) "：${result.stderr.take(300)}" else ""
+    }
+
+    /** `"null"` / 空白 → null。 */
+    private fun String?.orNullValue(): String? =
+        this?.trim()?.takeIf { it.isNotEmpty() && !it.equals("null", ignoreCase = true) }
+
+    /**
+     * 解析 JSON **裸数组 of objects**（apd auth list/log 的返回形态）。
+     * 复用 [MiniJson.objectOf] 解析每个扁平对象；嵌套对象/数组字段按契约不存在。
+     */
+    private fun parseObjectArray(json: String?): List<Map<String, String>> {
+        if (json.isNullOrBlank()) return emptyList()
+        val text = json.trim()
+        val start = text.indexOf('[')
+        if (start < 0) return emptyList()
+        val objects = mutableListOf<Map<String, String>>()
+        var depth = 0
+        var inString = false
+        var escaped = false
+        var objectStart = -1
+        var i = start
+        while (i < text.length) {
+            val c = text[i]
+            when {
+                escaped -> escaped = false
+                inString && c == '\\' -> escaped = true
+                c == '"' -> inString = !inString
+                inString -> Unit
+                c == '{' -> {
+                    if (depth == 0) objectStart = i
+                    depth++
+                }
+
+                c == '}' -> {
+                    depth--
+                    if (depth == 0 && objectStart >= 0) {
+                        objects += MiniJson.objectOf(text.substring(objectStart, i + 1))
+                        objectStart = -1
+                    }
+                }
+
+                c == ']' && depth == 0 -> return objects
+            }
+            i++
+        }
+        return objects
     }
 }

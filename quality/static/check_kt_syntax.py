@@ -62,6 +62,35 @@ def check_file(path):
             if c == "\\":
                 i += 2
                 continue
+            if c == "$" and nxt == "{":
+                # Kotlin 字符串模板 `${ ... }` 内部允许嵌套字符串/花括号（合法语法），
+                # 必须整体跳过，否则会被误判成"字符串提前闭合"（AuthRepository 的
+                # `${fields["uid"] ?: "?"}` 就是这种合法形态）。
+                depth = 1
+                i += 2
+                while i < n and depth > 0:
+                    ch = src[i]
+                    ch_next = src[i + 1] if i + 1 < n else ""
+                    if ch == "\\":
+                        i += 2
+                        continue
+                    if ch == '"':
+                        i += 1
+                        while i < n:
+                            if src[i] == "\\":
+                                i += 2
+                                continue
+                            if src[i] == '"':
+                                i += 1
+                                break
+                            i += 1
+                        continue
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                    i += 1
+                continue
             if c == '"':
                 in_str = False
                 # 真实事故形态：字符串闭合后**紧邻** `$` 或标识符（无运算符），

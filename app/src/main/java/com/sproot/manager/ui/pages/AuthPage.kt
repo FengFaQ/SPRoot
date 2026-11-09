@@ -1,6 +1,8 @@
 package com.sproot.manager.ui.pages
 
+import android.graphics.drawable.Drawable
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -13,7 +15,6 @@ import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.add
 import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxHeight
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.only
@@ -32,8 +33,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
@@ -46,6 +52,7 @@ import androidx.compose.ui.unit.sp
 import com.sproot.manager.core.ApdClient
 import com.sproot.manager.core.AppLog
 import com.sproot.manager.core.AuthApp
+import com.sproot.manager.core.AuthLogEntry
 import com.sproot.manager.core.AuthRepository
 import com.sproot.manager.core.AuthState
 import com.sproot.manager.core.SecretStore
@@ -57,7 +64,6 @@ import com.sproot.manager.ui.components.WarningLevel
 import com.sproot.manager.ui.components.rememberBlurBackdrop
 import com.sproot.manager.ui.theme.LocalEnableBlur
 import top.yukonga.miuix.kmp.basic.Card
-import top.yukonga.miuix.kmp.basic.CardDefaults
 import top.yukonga.miuix.kmp.basic.DropdownImpl
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
@@ -74,39 +80,41 @@ import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.basic.Search
 import top.yukonga.miuix.kmp.icon.extended.Back
 import top.yukonga.miuix.kmp.icon.extended.Filter
+import top.yukonga.miuix.kmp.icon.extended.Lock
+import top.yukonga.miuix.kmp.icon.extended.Notes
 import top.yukonga.miuix.kmp.icon.extended.Refresh
 import top.yukonga.miuix.kmp.overlay.OverlayListPopup
 import top.yukonga.miuix.kmp.preference.ArrowPreference
-import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.MiuixTheme.colorScheme
 import top.yukonga.miuix.kmp.utils.overScrollVertical
 import top.yukonga.miuix.kmp.utils.scrollEndHaptic
 
-/** 筛选：对应 KSU SuperUser 页右上角的「全部 / 已授权 / 已拒绝」菜单（另加"每次询问"）。 */
+/** 筛选：对应 KSU SuperUser 页右上角菜单（全部 / 已允许 / 已拒绝 / 待询问）。 */
 private enum class AuthFilter(val label: String) {
     ALL("全部应用"),
-    ALLOWED("已授权"),
+    ALLOWED("已允许"),
     DENIED("已拒绝"),
-    ASKED("每次询问"),
+    ASKED("待询问"),
 }
 
 /**
- * Root 授权管理页（D）—— 按 KernelSU `ui/screen/superuser/SuperUserMiuix.kt` 的版式搭骨架：
+ * Root 授权管理页（D）—— 照 KernelSU `ui/screen/superuser/SuperUserMiuix.kt` 版式：
  *
  * ```
- * Scaffold(BlurredBar(TopAppBar("授权" + 筛选菜单 + 刷新)))
+ * Scaffold(BlurredBar(TopAppBar("授权" + 筛选 + 刷新 + 审计日志)))
  *  └─ LazyColumn(12dp 横距)
- *      ├─ Notice：授权 API 未接入（占位假数据）/ AP 未部署
- *      ├─ 搜索栏（名称 / 包名 / uid）
- *      ├─ AuthApp 卡（图标 + 名称 + 包名 + 右侧状态标签，点卡片进详情）
- *      ├─ 空态（大图标 + 文案）
- *      └─ 详情页（二级页）：应用信息 + 三态单选（允许/拒绝/每次询问·待实现）+ 撤销授权 + 统计
+ *      ├─ Notice：默认授权态是「待询问」(ask) → 新 App 首次请求会被拒
+ *      ├─ Notice：AP 未部署（125）时优雅降级
+ *      ├─ 搜索栏（应用名 / 包名 / uid）
+ *      ├─ AuthApp 卡（应用图标 + 名称 + 包名 + 右侧状态，点卡片进详情）
+ *      ├─ 空态（大图标 + 文案 + 默认态说明）
+ *      └─ 详情页（二级页）：应用信息 + 三态单选 + 权限详情 + 撤销 + 审计日志入口
  * ```
  *
- * ## 数据状态（诚实原则）
- * 数据层 [AuthRepository] 目前 `API_READY=false`，返回**明确标注的占位假数据**；
- * 三态中的 `ask` 依赖 daemon 挂起请求并回传弹窗，本轮未实现 → **显示但禁用，标注"待实现"**，
- * 绝不假装可用。apd-dev 的 `apd auth --json` 契约落地后，只需替换 AuthRepository 实现。
+ * ## 数据契约（apd d6c9ecb）
+ * `apd auth list/set/revoke/log --json`，全部经 [ApdClient.rootExec]。
+ * `label`/`app_icon_path` 恒为 null → 本页用 PackageManager 解析名称/图标（uid 无包时显示 uid=xxxxx）。
+ * `ask` Phase 1 不可交互（当前等同拒绝）→ 详情页显示但**禁用**并标「待实现」，不假装可用。
  */
 @Composable
 fun AuthPager(
@@ -124,6 +132,7 @@ fun AuthPager(
     var filter by remember { mutableStateOf(AuthFilter.ALL) }
     var showFilterPopup by remember { mutableStateOf(false) }
     var detail by remember { mutableStateOf<AuthApp?>(null) }
+    var showLog by remember { mutableStateOf(false) }
     var actionMsg by remember { mutableStateOf<String?>(null) }
     var showRevokeConfirm by remember { mutableStateOf(false) }
 
@@ -138,14 +147,13 @@ fun AuthPager(
             val r = runCatching { AuthRepository.list(context, key) }.getOrElse {
                 AuthRepository.ListResult(
                     ok = false,
-                    fake = true,
                     message = "读取授权列表异常：${it.javaClass.simpleName}: ${it.message}",
                     apps = emptyList(),
                 )
             }
             listResult = r
             loading = false
-            AppLog.info("Auth", "授权列表：ok=${r.ok} fake=${r.fake} count=${r.apps.size}")
+            if (!r.ok) AppLog.error("Auth", "授权列表失败：${r.message}")
         }.start()
     }
 
@@ -153,46 +161,49 @@ fun AuthPager(
         if (isCurrentPage && listResult == null) load()
     }
 
-    /** 本地预览更新（契约未接入时）：只改内存列表，并在 UI 明示"仅本地预览"。 */
-    fun applyLocalPreview(uid: Int, state: AuthState) {
-        listResult = listResult?.let { snapshot ->
-            snapshot.copy(apps = snapshot.apps.map { if (it.uid == uid) it.copy(state = state) else it })
-        }
-        detail = detail?.takeIf { it.uid == uid }?.copy(state = state) ?: detail
+    // ---------------- 审计日志页（二级页） ----------------
+    if (showLog) {
+        BackHandler(enabled = true) { showLog = false }
+        AuthLogPager(superKey = key, onBack = { showLog = false })
+        return
     }
 
-    // ---------------- 详情页 ----------------
+    // ---------------- 详情页（二级页） ----------------
     val currentDetail = detail
     if (currentDetail != null) {
         BackHandler(enabled = true) { detail = null }
         AuthDetailPager(
             app = currentDetail,
-            fake = listResult?.fake != false,
             onBack = { detail = null },
             onSetState = { state ->
                 Thread {
                     val r = AuthRepository.setState(context, key, currentDetail.uid, state)
                     actionMsg = r.message
-                    if (r.supported) {
+                    if (r.ok) {
                         load()
+                        detail = currentDetail.copy(state = state)
                     } else {
-                        applyLocalPreview(currentDetail.uid, state)
+                        AppLog.warn("Auth", "设置授权失败：${r.message}")
                     }
                 }.start()
             },
             onRevoke = { showRevokeConfirm = true },
+            onOpenLog = { showLog = true },
         )
         ConfirmDialog(
             show = showRevokeConfirm,
             title = "撤销授权",
-            message = "将「${currentDetail.label}」置为拒绝（deny），之后该应用的提权请求会被直接拒绝。",
+            message = "将「${currentDetail.label}」置为「拒绝」：之后该应用的提权请求会被直接拒绝。",
             confirmText = "撤销",
             onConfirm = {
                 showRevokeConfirm = false
                 Thread {
                     val r = AuthRepository.revoke(context, key, currentDetail.uid)
                     actionMsg = r.message
-                    if (r.supported) load() else applyLocalPreview(currentDetail.uid, AuthState.DENY)
+                    if (r.ok) {
+                        load()
+                        detail = currentDetail.copy(state = AuthState.DENY)
+                    }
                 }.start()
             },
             onDismiss = { showRevokeConfirm = false },
@@ -229,6 +240,13 @@ fun AuthPager(
                     color = barColor,
                     title = "授权",
                     actions = {
+                        IconButton(onClick = { showLog = true }) {
+                            Icon(
+                                imageVector = MiuixIcons.Notes,
+                                contentDescription = "审计日志",
+                                tint = colorScheme.onSurface,
+                            )
+                        }
                         Box {
                             IconButton(onClick = { showFilterPopup = true }) {
                                 Icon(
@@ -291,19 +309,25 @@ fun AuthPager(
                 overscrollEffect = null,
             ) {
                 item {
+                    WarningCard(
+                        message = AuthRepository.DEFAULT_STATE_NOTICE,
+                        level = WarningLevel.Notice,
+                    )
+                }
+                item {
                     if (!apdReady) {
                         WarningCard(
-                            message = "尚未部署 AP 守护（需先刷入修补后的镜像）：授权链路依赖 apd，" +
-                                "部署完成后才能真正读写授权状态",
+                            message = "尚未部署 AP 守护（需先刷入修补后的镜像）：授权命令走 apd root-exec，" +
+                                "部署完成前列表与操作不可用",
                             level = WarningLevel.Notice,
                         )
                     }
                 }
-                item {
-                    if (listResult?.fake != false) {
+                listResult?.takeIf { !it.ok }?.let { failed ->
+                    item {
                         WarningCard(
-                            message = AuthRepository.FAKE_NOTICE,
-                            level = WarningLevel.Notice,
+                            message = "授权列表加载失败：${failed.message}",
+                            level = WarningLevel.Error,
                         )
                     }
                 }
@@ -322,7 +346,7 @@ fun AuthPager(
                     }
                 }
                 when {
-                    (loading || listResult == null) && apps.isEmpty() -> {
+                    loading && apps.isEmpty() -> {
                         item {
                             Box(
                                 modifier = Modifier
@@ -361,7 +385,7 @@ fun AuthPager(
 
 // ---------------------------------------------------------------- 列表项
 
-/** 列表项：图标圆底 + 名称 + 包名（+uid），右侧三态标签；点卡片进详情（KSU SuperUser 版式）。 */
+/** 列表项：应用图标 + 名称 + 包名 + 统计，右侧三态标签；点卡片进详情（KSU SuperUser 版式）。 */
 @Composable
 private fun AuthAppCard(app: AuthApp, onClick: () -> Unit) {
     Card(
@@ -372,7 +396,7 @@ private fun AuthAppCard(app: AuthApp, onClick: () -> Unit) {
         onClick = onClick,
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            AppLetterIcon(label = app.label)
+            AppIcon(app = app)
             Column(
                 modifier = Modifier
                     .weight(1f)
@@ -387,7 +411,7 @@ private fun AuthAppCard(app: AuthApp, onClick: () -> Unit) {
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    text = app.packageName,
+                    text = app.packageName.ifBlank { "（无对应包）" },
                     fontSize = 12.sp,
                     color = colorScheme.onSurfaceVariantSummary,
                     fontFamily = FontFamily.Monospace,
@@ -398,7 +422,6 @@ private fun AuthAppCard(app: AuthApp, onClick: () -> Unit) {
                     text = buildString {
                         append("uid ").append(app.uid)
                         if (app.requestCount > 0) append(" · 请求 ").append(app.requestCount).append(" 次")
-                        if (app.denyCount > 0) append(" · 拒绝 ").append(app.denyCount).append(" 次")
                     },
                     fontSize = 12.sp,
                     color = colorScheme.onSurfaceVariantSummary,
@@ -409,24 +432,51 @@ private fun AuthAppCard(app: AuthApp, onClick: () -> Unit) {
     }
 }
 
+/** 应用图标：apd 不给图标 → App 侧解析；解析不到时用首字母圆底（uid 无包也适用）。 */
 @Composable
-private fun AppLetterIcon(label: String) {
-    Box(
-        modifier = Modifier
-            .size(44.dp)
-            .background(colorScheme.secondaryContainer, CircleShape),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(
-            text = label.take(1).uppercase(),
-            fontSize = 20.sp,
-            fontWeight = FontWeight(600),
-            color = colorScheme.onSecondaryContainer,
+private fun AppIcon(app: AuthApp, size: Dp = 44.dp) {
+    val icon = app.icon
+    if (icon != null) {
+        val painter = remember(icon) { DrawablePainter(icon) }
+        Image(
+            painter = painter,
+            contentDescription = null,
+            modifier = Modifier
+                .size(size)
+                .clip(CircleShape),
         )
+    } else {
+        Box(
+            modifier = Modifier
+                .size(size)
+                .background(colorScheme.secondaryContainer, CircleShape),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = app.label.take(1).uppercase().ifBlank { "?" },
+                fontSize = 20.sp,
+                fontWeight = FontWeight(600),
+                color = colorScheme.onSecondaryContainer,
+            )
+        }
     }
 }
 
-/** 三态标签：允许=primary、拒绝=error、每次询问=tertiary（标注"待实现"）。 */
+/** android Drawable → Compose Painter（不引入 core-ktx/Coil；直接画 native canvas）。 */
+private class DrawablePainter(private val drawable: Drawable) : Painter() {
+    override val intrinsicSize: Size
+        get() = Size(
+            drawable.intrinsicWidth.coerceAtLeast(1).toFloat(),
+            drawable.intrinsicHeight.coerceAtLeast(1).toFloat(),
+        )
+
+    override fun DrawScope.onDraw() {
+        drawable.setBounds(0, 0, size.width.toInt().coerceAtLeast(1), size.height.toInt().coerceAtLeast(1))
+        drawIntoCanvas { canvas -> drawable.draw(canvas.nativeCanvas) }
+    }
+}
+
+/** 三态标签：允许=primary、拒绝=error、待询问=tertiary（Phase 1 不可交互）。 */
 @Composable
 private fun StateTag(state: AuthState) {
     val container = when (state) {
@@ -440,7 +490,7 @@ private fun StateTag(state: AuthState) {
         AuthState.ASK -> colorScheme.onTertiaryContainer
     }
     StatusTag(
-        label = if (state == AuthState.ASK) "${state.label}·待实现" else state.label,
+        label = if (state == AuthState.ASK) "${state.label}·Phase1" else state.label,
         backgroundColor = container,
         contentColor = content,
     )
@@ -451,10 +501,10 @@ private fun StateTag(state: AuthState) {
 @Composable
 private fun AuthDetailPager(
     app: AuthApp,
-    fake: Boolean,
     onBack: () -> Unit,
     onSetState: (AuthState) -> Unit,
     onRevoke: () -> Unit,
+    onOpenLog: () -> Unit,
 ) {
     val scrollBehavior = MiuixScrollBehavior()
     val backdrop = rememberBlurBackdrop(LocalEnableBlur.current)
@@ -501,7 +551,7 @@ private fun AuthDetailPager(
                     Card(modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(16.dp)) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                AppLetterIcon(label = app.label)
+                                AppIcon(app = app, size = 56.dp)
                                 Column(modifier = Modifier.padding(start = 12.dp)) {
                                     Text(
                                         text = app.label,
@@ -510,13 +560,13 @@ private fun AuthDetailPager(
                                         color = colorScheme.onSurface,
                                     )
                                     Text(
-                                        text = app.packageName,
+                                        text = app.packageName.ifBlank { "（无对应包）" },
                                         fontSize = 12.sp,
                                         fontFamily = FontFamily.Monospace,
                                         color = colorScheme.onSurfaceVariantSummary,
                                     )
                                     Text(
-                                        text = "uid ${app.uid}",
+                                        text = "uid ${app.uid} · 请求 ${app.requestCount} 次",
                                         fontSize = 12.sp,
                                         color = colorScheme.onSurfaceVariantSummary,
                                     )
@@ -550,7 +600,8 @@ private fun AuthDetailPager(
                             AuthStateRow(
                                 state = AuthState.ASK,
                                 selected = app.state == AuthState.ASK,
-                                hint = "每次提权都弹窗询问 —— 需要 daemon 挂起请求并回传弹窗，AP 侧尚未实现",
+                                hint = "Phase 1 不可交互：daemon 挂起请求/弹窗回传未实现，当前等同「拒绝」；" +
+                                    "请改为允许或拒绝",
                                 enabled = false,
                                 onClick = { onSetState(AuthState.ASK) },
                             )
@@ -560,6 +611,11 @@ private fun AuthDetailPager(
                 item { Spacer(Modifier.height(12.dp)) }
                 item {
                     Card(modifier = Modifier.fillMaxWidth()) {
+                        ArrowPreference(
+                            title = "审计日志",
+                            summary = "查看 request / set_state / revoke 等事件（apd 只提供脱敏信息）",
+                            onClick = onOpenLog,
+                        )
                         ArrowPreference(
                             title = "撤销授权",
                             summary = "等价于置为「拒绝」；不会卸载应用",
@@ -572,26 +628,26 @@ private fun AuthDetailPager(
                     Card(modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(16.dp)) {
                             Text(
-                                text = "统计",
+                                text = "权限详情",
                                 fontSize = 15.sp,
                                 fontWeight = FontWeight.Medium,
                                 color = colorScheme.onSurface,
                             )
+                            InfoLine("state", app.state.wire)
+                            InfoLine("package", app.packageName.ifBlank { "—" }, monospace = true)
+                            InfoLine("uid", app.uid.toString())
+                            InfoLine("to_uid", app.toUid.toString())
+                            InfoLine("sctx", app.sctx.ifBlank { "—" })
+                            InfoLine("exclude", app.exclude.toString())
                             InfoLine(
                                 "last_grant_at",
-                                if (app.lastGrantAt <= 0L) "—" else
-                                    java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US)
-                                        .format(java.util.Date(app.lastGrantAt)),
+                                if (app.lastGrantAt <= 0L) "—" else formatUnix(app.lastGrantAt),
                             )
-                            InfoLine("deny_count", app.denyCount.toString())
+                            InfoLine(
+                                "last_deny_at",
+                                if (app.lastDenyAt <= 0L) "—" else formatUnix(app.lastDenyAt),
+                            )
                             InfoLine("request_count", app.requestCount.toString())
-                            if (fake) {
-                                Text(
-                                    text = "当前为占位假数据；变更仅本地预览，不会写入 daemon。",
-                                    fontSize = 12.sp,
-                                    color = colorScheme.error,
-                                )
-                            }
                         }
                     }
                 }
@@ -628,7 +684,7 @@ private fun AuthStateRow(
                 if (!enabled) {
                     Spacer(Modifier.size(6.dp))
                     StatusTag(
-                        label = "待实现",
+                        label = "Phase 1 不可交互",
                         backgroundColor = colorScheme.tertiaryContainer,
                         contentColor = colorScheme.onTertiaryContainer,
                     )
@@ -641,6 +697,203 @@ private fun AuthStateRow(
             )
         }
     }
+}
+
+// ---------------------------------------------------------------- 审计日志页
+
+/** 审计日志页：event/decision/package/cmd_name/iso（apd 只给脱敏信息，UI 不补全不猜测）。 */
+@Composable
+private fun AuthLogPager(superKey: String?, onBack: () -> Unit) {
+    val context = LocalContext.current
+    var result by remember { mutableStateOf<AuthRepository.LogResult?>(null) }
+    var loading by remember { mutableStateOf(false) }
+    val scrollBehavior = MiuixScrollBehavior()
+    val backdrop = rememberBlurBackdrop(LocalEnableBlur.current)
+    val barColor = if (backdrop != null) Color.Transparent else colorScheme.surface
+
+    LaunchedEffect(Unit) {
+        if (loading || result != null) return@LaunchedEffect
+        loading = true
+        Thread {
+            result = runCatching { AuthRepository.log(context, superKey) }.getOrElse {
+                AuthRepository.LogResult(
+                    ok = false,
+                    message = "读取审计日志异常：${it.javaClass.simpleName}: ${it.message}",
+                    entries = emptyList(),
+                )
+            }
+            loading = false
+        }.start()
+    }
+
+    Scaffold(
+        topBar = {
+            BlurredBar(backdrop) {
+                TopAppBar(
+                    color = barColor,
+                    title = "审计日志",
+                    navigationIcon = {
+                        IconButton(onClick = onBack) {
+                            Icon(
+                                imageVector = MiuixIcons.Back,
+                                contentDescription = "返回",
+                                tint = colorScheme.onSurface,
+                            )
+                        }
+                    },
+                    scrollBehavior = scrollBehavior,
+                )
+            }
+        },
+        popupHost = { },
+        contentWindowInsets = WindowInsets.systemBars.add(WindowInsets.displayCutout)
+            .only(WindowInsetsSides.Horizontal),
+    ) { innerPadding ->
+        Box(modifier = if (backdrop != null) Modifier.layerBackdrop(backdrop) else Modifier) {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxHeight()
+                    .scrollEndHaptic()
+                    .overScrollVertical()
+                    .nestedScroll(scrollBehavior.nestedScrollConnection)
+                    .padding(horizontal = 12.dp),
+                contentPadding = PaddingValues(
+                    top = innerPadding.calculateTopPadding() + 12.dp,
+                    bottom = 24.dp,
+                ),
+                overscrollEffect = null,
+            ) {
+                item {
+                    WarningCard(
+                        message = "日志只含 apd 提供的脱敏信息（无完整命令、无密钥）；" +
+                            "cmd_name 是命令名，cmd_args 是参数个数，不展示完整参数",
+                        level = WarningLevel.Notice,
+                    )
+                }
+                result?.takeIf { !it.ok }?.let { failed ->
+                    item {
+                        WarningCard(
+                            message = "审计日志读取失败：${failed.message}",
+                            level = WarningLevel.Error,
+                        )
+                    }
+                }
+                result?.entries?.let { entries ->
+                    if (entries.isEmpty() && !loading) {
+                        item {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 48.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Text(
+                                    text = "暂无审计记录",
+                                    fontSize = 14.sp,
+                                    color = colorScheme.onSurfaceVariantSummary,
+                                )
+                            }
+                        }
+                    }
+                    items(entries) { entry ->
+                        AuthLogCard(entry = entry)
+                    }
+                }
+                if (loading) {
+                    item {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 40.dp),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text(
+                                text = "正在读取审计日志…",
+                                fontSize = 14.sp,
+                                color = colorScheme.onSurfaceVariantSummary,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AuthLogCard(entry: AuthLogEntry) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 12.dp),
+        insideMargin = PaddingValues(16.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            StatusTag(
+                label = eventLabel(entry.event),
+                backgroundColor = colorScheme.secondaryContainer,
+                contentColor = colorScheme.onSecondaryContainer,
+            )
+            entry.decision?.let { decision ->
+                Spacer(Modifier.size(6.dp))
+                StatusTag(
+                    label = decisionLabel(decision),
+                    backgroundColor = if (decision == "deny" || decision == "ask_pending") {
+                        colorScheme.errorContainer
+                    } else {
+                        colorScheme.primaryContainer
+                    },
+                    contentColor = if (decision == "deny" || decision == "ask_pending") {
+                        colorScheme.onErrorContainer
+                    } else {
+                        colorScheme.onPrimaryContainer
+                    },
+                )
+            }
+            Spacer(Modifier.weight(1f))
+            Text(
+                text = entry.iso.ifBlank { formatUnix(entry.ts) },
+                fontSize = 12.sp,
+                color = colorScheme.onSurfaceVariantSummary,
+            )
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = entry.packageName ?: "uid=${entry.uid}",
+            fontSize = 14.sp,
+            fontWeight = FontWeight(550),
+            color = colorScheme.onSurface,
+            fontFamily = FontFamily.Monospace,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text(
+            text = buildString {
+                append("uid ").append(entry.uid)
+                if (!entry.cmdName.isNullOrBlank()) append(" · cmd ").append(entry.cmdName)
+                entry.state?.let { append(" · state ").append(it) }
+                entry.detail?.let { append(" · ").append(it) }
+            },
+            fontSize = 12.sp,
+            color = colorScheme.onSurfaceVariantSummary,
+        )
+    }
+}
+
+private fun eventLabel(event: String): String = when (event) {
+    "request" -> "请求"
+    "set_state" -> "改状态"
+    "revoke" -> "撤销"
+    "grant" -> "授权"
+    "migrate" -> "迁移"
+    else -> event
+}
+
+private fun decisionLabel(decision: String): String = when (decision) {
+    "allow" -> "放行"
+    "deny" -> "拒绝"
+    "ask_pending" -> "待询问→拒"
+    else -> decision
 }
 
 // ---------------------------------------------------------------- 复用小组件
@@ -735,10 +988,15 @@ private fun EmptyAuthState(searchEmpty: Boolean) {
             text = if (searchEmpty) {
                 "换个关键词或切换筛选条件试试"
             } else {
-                "当应用通过 AP 请求 root 时，会出现在这里；届时可在此设为允许 / 拒绝"
+                "当应用通过 AP 请求 root 时会出现这里。注意默认态是「待询问」：" +
+                    "新应用首次请求会被拒绝（ask 当前等同拒绝），请在此改为「允许」"
             },
             fontSize = 13.sp,
             color = colorScheme.onSurfaceVariantSummary,
         )
     }
 }
+
+private fun formatUnix(millis: Long): String =
+    java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US)
+        .format(java.util.Date(millis))

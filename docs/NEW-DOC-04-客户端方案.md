@@ -136,17 +136,31 @@ android.newDsl=false
 - **卸载**：二次确认对话框（说明「AP 模块变更通常在下次重启后生效」）。
 - 业务数据仍只经 `ModuleRepository`（`apd module ...` root-exec），客户逻辑未改。
 
-### 3.3A 授权管理页（SuperUser，v0.3 骨架）
+### 3.3A 授权管理页（SuperUser，v0.4 接真实 apd 契约）
 
-照 KSU `SuperUserMiuix.kt` 的版式搭骨架：TopAppBar「授权」+ 右上角筛选（全部/已授权/已拒绝/每次询问）
-+ 刷新；列表首项搜索栏（名称/包名/uid）；列表项 = 圆底首字母图标 + 名称 + 包名 + uid/统计 + 右侧三态标签；
-点卡片进详情（应用信息 + 三态单选：允许/拒绝/每次询问 + 撤销授权 + 统计）。
+照 KSU `SuperUserMiuix.kt` 版式：TopAppBar「授权」+ 审计日志入口 + 筛选菜单（全部/已允许/已拒绝/待询问）
++ 刷新；列表首项搜索栏（应用名/包名/uid）；列表项 = 应用图标 + 名称 + 包名 + uid/统计 + 右侧三态标签；
+点卡片进详情（应用信息 + 三态单选 + 审计日志入口 + 撤销授权 + 权限详情）。
+**审计日志页**：`event/decision/package/cmd_name/iso`（apd 只给脱敏信息：无完整命令、无密钥，UI 不补全不猜测）。
 
-**数据诚实原则**：AP 侧 `apd auth list/set/log/revoke --json` 契约由 apd-dev 落地中，
-`core/AuthRepository.kt` 目前 `API_READY=false`，返回**明确标注的占位假数据**：
-页面顶部常驻 Notice「授权 API 尚未接入…当前列表为占位假数据，变更仅本地预览」；
-`ask`（每次询问）依赖 daemon 挂起请求并回传弹窗，本轮未实现 → **显示但禁用并标注"待实现"**。
-契约落地后只需替换 `AuthRepository` 实现（UI 不用改）。
+**数据契约**（apd commit `d6c9ecb`，经 `ApdClient.rootExec`）：
+- `apd auth list --json` → 裸数组：`{uid, package, label, app_icon_path, state, last_grant_at,
+  last_deny_at, request_count, to_uid, sctx, exclude}`；`last_*_at` 为 **unix 秒**（客户端换算毫秒）；
+- `apd auth set --uid N --state allow|deny|ask --json` / `apd auth revoke --uid N --json` →
+  `{ok, uid, state, previous, package, changed}`；
+- `apd auth log --json --limit N` → 裸数组（最新在前）：`{ts, iso, uid, package, event, state,
+  decision, previous, cmd_name, cmd_args, cmd_sha256, detail}`；
+- **`label`/`app_icon_path` 恒为 null**（apd 无 PackageManager）→ App 侧用 PackageManager 按 package
+  解析应用名/图标；包不存在（uid 无对应包）显示 `uid=xxxxx` + 通用图标（不崩、不空白）。
+
+**三态与默认态（重要）**：
+- `allow` 允许 / `deny` 拒绝；
+- `ask` **Phase 1 不可交互**（daemon 挂起请求+弹窗回传未实现，当前等同拒绝，日志记 `decision=ask_pending`）：
+  详情页显示但**禁用**并标注「Phase 1 不可交互」，提示用户改为允许/拒绝，**不假装可用、不做假弹窗**；
+- **默认授权态是 `ask`** → 新装应用第一次请求 root 会被拒；授权页顶部常驻说明，避免用户误判"App 坏了"。
+
+**降级**：AP 未部署（125）时页面顶部 Notice「尚未部署 AP 守护（需先刷入修补后的镜像）」，
+列表失败原因按退出码给出人话（125/124/126/127/2-契约不匹配）。
 
 ### 3.4 设置页（Settings）
 外观（主题）、Root 密钥（显示/复制/重新生成 + 旧内核失效警告）、日志（路径/复制/清空）、**原镜像备份**（sha1 列表 / 还原到 Downloads / 删除）、AP 部署（`apd deploy --source <nativeLibDir>`，显示 exit code 与完整输出）、关于（版本/工具链/契约版本）。
