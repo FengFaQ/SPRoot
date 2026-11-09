@@ -137,7 +137,7 @@ done
 
 | 项目 | 许可 | 与本项目关系 |
 |---|---|---|
-| KernelSU（`tiann/KernelSU`） | GPL-2.0 | **仅架构思路参考**（薄 UI + 厚 CLI、自研 bootimg、root-exec 模型），未复制代码 |
+| KernelSU（`tiann/KernelSU`） | **GPL-3.0** | **已复制 UI 代码**：miuix 主题/底栏/组件/六个屏幕版式（详见 `NOTICE §6.1` 文件清单）。GPL-3.0 与 AGPL-3.0 兼容，整体按 AGPL-3.0 分发；业务逻辑未取。架构层面（薄 UI + 厚 CLI、自研 bootimg、root-exec 模型）亦参考 |
 | APatch / KernelPatch（`bmax121`） | GPL-2.0 / GPL-3.0 | **仅接口形状与机制参考**，未 vendor、不调用 kptools/kpimg |
 | Skroot-Next（`zh-sc/Skroot-Next`） | GPL-3.0 | **仅调研参考**（密钥 ABI 差异、asm oracle 思路），未复制代码 |
 | Magisk（`topjohnwu/Magisk`） | GPL-3.0 | 仅取用其发布的可执行组件 magiskboot（见 §4.1） |

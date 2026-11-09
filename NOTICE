@@ -51,6 +51,35 @@
 - 新管理器若**复用其代码**则整体须 GPL-3.0 开源；若仅作设计参考、未复制代码，则不受其传染。
   当前新管理器的许可待项目所有人确定。
 
+## 6.1 KernelSU（GPL-3.0）— UI 参考实现（已复制代码）
+
+本项目管理器的 **UI 层**参照 [KernelSU](https://github.com/tiann/KernelSU) 的 **miuix 实现**重写。
+人类决策（2026-11-09）："完全照抄 KSU 的 miuix UI 实现，只关心 miuix 那套，设置项换成我们自己的。"
+
+- 上游许可：**GPL-3.0**（与本项目 AGPL-3.0 **兼容**；GPL-3.0 ⇄ AGPL-3.0 可组合作品按 AGPL-3.0 分发）
+- 对应源码：`https://github.com/tiann/KernelSU`（参考时 clone 的浅克隆，路径 `manager/app/src/main/java/me/weishu/kernelsu/ui/`）
+- 复制的文件（按上游结构改写落位到本项目 `app/src/main/java/com/sproot/manager/ui/`）：
+
+| 上游文件（KernelSU） | 性质 |
+|---|---|
+| `ui/theme/{MiuixTheme,Colors,Type,ThemeExt}.kt` | 参考结构与色板 |
+| `ui/component/bottombar/{BottomBarMiuix,NavigationRailMiuix}.kt` | 复制 |
+| `ui/component/miuix/WarningCard.kt` | 复制 |
+| `ui/component/statustag/StatusTagMiuix.kt` | 复制 |
+| `ui/component/dialog/DialogMiuix.kt` | 复制 |
+| `ui/screen/home/HomeMiuix.kt` | 版式复制（业务内容替换为 SPRoot） |
+| `ui/screen/install/InstallMiuix.kt` | 版式复制 |
+| `ui/screen/flash/FlashMiuix.kt` | 版式复制 |
+| `ui/screen/module/ModuleMiuix.kt` | 版式复制 |
+| `ui/screen/settings/SettingsMiuix.kt` | 版式复制（设置项全部替换为 SPRoot 自有项） |
+| `ui/screen/about/AboutMiuix.kt` | 版式复制 |
+
+- 未复制：KernelSU 的业务逻辑（模块管理/kernel 修补/su 授权等一律未取，本项目业务为自研）
+- 未取 Material 版实现（本项目固定 miuix，无 Material/Miuix 双模式切换）
+- **GPL-3.0 义务**：①随分发物提供 GPL-3.0 全文（APK 内 `assets/licenses/GPL-3.0.txt` 已含）；
+  ②标注来源（本节）；③若修改上游文件则说明——本项目为**改写落位**（包名/主题键/文案不同），
+  修改内容即本仓库 `app/` 下的对应文件，完整源码随本仓库提供。
+
 ## 7. 构建/测试期依赖（不随产物分发或按各自许可）
 
 | 组件 | 用途 | 许可 |
