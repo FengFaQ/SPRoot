@@ -120,9 +120,20 @@ android.newDsl=false
 7. **两级状态**：「我已刷入（标记待重启）」→「已重启并生效（标记激活）」，状态由用户手动回报（无 root 时 App 无法读取 fastboot 结果）。
 8. **常驻日志面板**：级别配色、自动滚底、复制全部。
 
-### 3.3 模块页（Modules）
-- 顶部**能力门禁**：AP 未就绪时展示不可用原因并禁用所有入口。
-- `apd version --json` 探测（经 root-exec）；模块列表为空态 + 后续接入说明；`root-exec` 探针按钮用于快速验证特权链。
+### 3.3 模块页（Modules）—— 按 KSU `ModuleMiuix` 结构重做（v0.2）
+
+- **顶部**：毛玻璃 TopAppBar（标题「模块」+ 排序/筛选菜单 + 刷新）；列表首项为常驻**搜索栏**
+  （按 名称 / id / 作者 / 描述 过滤）。排序菜单：按启用状态分组（默认）/ 按名称 / 有更新优先。
+- **分区列表**：`【已启用 N】` 与 `【已禁用 N】` 两个分区；每个 ModuleItem 卡为
+  「左侧图标 + 名称/版本/作者/描述，右侧 Switch」；**点卡片进入详情页**（不是点开关）。
+- **详情页**（二级页，返回键）：头部信息卡 + 操作卡（`SwitchPreference` 启用/禁用、
+  `ArrowPreference` 卸载）+ 模块信息卡（id/version/versionCode/author/enabled/update_pending/
+  install_status，可复制 id）。
+- **安装**：KSU 式右下角 FAB「+」→ SAF 选 zip → 复制到私有 cache → `validateZip`（PK 头/大小）
+  → `apd module install`；安装中/安装结果（含原始 stdout/stderr 可复制）以卡片置顶展示。
+- **空态**：大图标 + 文案（区分「尚未安装」与「搜索无匹配」）；AP 未就绪时顶部 Notice 提示并禁用操作。
+- **卸载**：二次确认对话框（说明「AP 模块变更通常在下次重启后生效」）。
+- 业务数据仍只经 `ModuleRepository`（`apd module ...` root-exec），客户逻辑未改。
 
 ### 3.4 设置页（Settings）
 外观（主题）、Root 密钥（显示/复制/重新生成 + 旧内核失效警告）、日志（路径/复制/清空）、**原镜像备份**（sha1 列表 / 还原到 Downloads / 删除）、AP 部署（`apd deploy --source <nativeLibDir>`，显示 exit code 与完整输出）、关于（版本/工具链/契约版本）。

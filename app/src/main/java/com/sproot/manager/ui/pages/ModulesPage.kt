@@ -1,10 +1,14 @@
 package com.sproot.manager.ui.pages
 
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.provider.OpenableColumns
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,6 +20,7 @@ import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.add
 import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -26,6 +31,9 @@ import androidx.compose.foundation.layout.systemBars
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -36,10 +44,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -52,51 +63,76 @@ import com.sproot.manager.core.ModuleRepository
 import com.sproot.manager.core.ModulesResult
 import com.sproot.manager.core.SecretStore
 import com.sproot.manager.ui.components.BlurredBar
+import com.sproot.manager.ui.components.ConfirmDialog
 import com.sproot.manager.ui.components.StatusTag
 import com.sproot.manager.ui.components.WarningCard
 import com.sproot.manager.ui.components.WarningLevel
 import com.sproot.manager.ui.components.copyToClipboard
 import com.sproot.manager.ui.components.rememberBlurBackdrop
 import com.sproot.manager.ui.theme.LocalEnableBlur
-import top.yukonga.miuix.kmp.basic.BasicComponent
-import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CardDefaults
+import top.yukonga.miuix.kmp.basic.DropdownImpl
+import top.yukonga.miuix.kmp.basic.FloatingActionButton
 import top.yukonga.miuix.kmp.basic.HorizontalDivider
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
+import top.yukonga.miuix.kmp.basic.ListPopupColumn
 import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
+import top.yukonga.miuix.kmp.basic.PopupPositionProvider
+import top.yukonga.miuix.kmp.basic.PullToRefresh
 import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.Switch
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.basic.TopAppBar
+import top.yukonga.miuix.kmp.basic.rememberPullToRefreshState
 import top.yukonga.miuix.kmp.blur.layerBackdrop
 import top.yukonga.miuix.kmp.icon.MiuixIcons
+import top.yukonga.miuix.kmp.icon.basic.Search
+import top.yukonga.miuix.kmp.icon.extended.Add
+import top.yukonga.miuix.kmp.icon.extended.Back
 import top.yukonga.miuix.kmp.icon.extended.Delete
+import top.yukonga.miuix.kmp.icon.extended.Layers
 import top.yukonga.miuix.kmp.icon.extended.Refresh
+import top.yukonga.miuix.kmp.icon.extended.Sort
 import top.yukonga.miuix.kmp.icon.extended.UploadCloud
+import top.yukonga.miuix.kmp.overlay.OverlayListPopup
+import top.yukonga.miuix.kmp.preference.ArrowPreference
+import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.MiuixTheme.colorScheme
 import top.yukonga.miuix.kmp.utils.overScrollVertical
 import top.yukonga.miuix.kmp.utils.scrollEndHaptic
 
+/** 模块列表排序方式（对应 KSU 的 sortEnabledFirst/sortActionFirst 两个菜单项的简化版）。 */
+private enum class ModuleSort(val label: String) {
+    GROUPED("按启用状态分组"),
+    NAME("按名称排序"),
+    UPDATE("有更新优先"),
+}
+
 /**
- * 模块页 —— 版式照抄 KernelSU `ui/screen/module/ModuleMiuix.kt`：
+ * 模块页 —— 按 KernelSU `ui/screen/module/ModuleMiuix.kt` 的结构重做（人类指令 2026-11-10：
+ * 「完全照抄 KSU，而不是现在的样子」）：
  *
  * ```
- * Scaffold(BlurredBar(TopAppBar("模块" + 刷新动作)))
- *  └─ LazyColumn(12dp 横距, 12dp 卡距)
- *      ├─ WarningCard（AP 未就绪 = Notice，不标红）
- *      ├─ Card 安装模块   BasicComponent(选择 zip) + 开始/取消 + 原始输出
- *      ├─ Card 操作结果    hints（可能原因/建议动作/依据）+ 结构化字段 + 原始输出
- *      ├─ 已安装模块      标题 + 刷新/自检/复制原始输出
- *      ├─ ModuleItem × N  Card(name/version/author + Switch + 分隔线 + 卸载/确认卸载)
- *      └─ Card 说明/契约
+ * Scaffold(BlurredBar(TopAppBar("模块" + 排序菜单 + 刷新)) + FAB「安装模块」)
+ *  └─ PullToRefresh
+ *      └─ LazyColumn(12dp 横距)
+ *          ├─ 搜索栏（BasicTextField + Search 图标，按 名称/ID/作者/描述 过滤）
+ *          ├─ 【已启用】分区头 + ModuleItem 卡 × N
+ *          ├─ 【已禁用】分区头 + ModuleItem 卡 × N
+ *          ├─ 空态（大图标 + 文案）
+ *          └─ 安装中/安装结果卡（保留原始输出，可复制）
  * ```
  *
- * 业务逻辑一行未改：仍走 `ModuleRepository`（`apd module ...` root-exec）；
- * 安装/卸载/启停失败仍由 `ModuleFailureHints` 给出中文可操作提示，原始输出常驻可复制。
+ * ModuleItem 与 KSU 一致：卡内左侧「图标 + 名称/版本/作者/描述」，右侧 Switch；
+ * **点卡片进入详情页**（不是点开关）；底部细分隔线 + 卸载入口（二次确认）。
+ * 详情页同样是 KSU 的二级页结构（返回键 + 卡片 + 操作项）。
+ *
+ * 业务数据仍走 `ModuleRepository`（`apd module ...` root-exec），逻辑未改；
+ * 仅把「安装」从页面内大卡片改为 KSU 式 FAB（选 zip → 校验 → 安装）。
  */
 @Composable
 fun ModulePager(
@@ -107,22 +143,28 @@ fun ModulePager(
     val key = remember { runCatching { SecretStore.get(context).getOrCreateRootKey() }.getOrNull() }
     val apdStatus = remember { ApdClient.status(context) }
     val apdReady = apdStatus.ok
+
     var selfTest by remember { mutableStateOf(ApdSelfTest.load(context)) }
     var result by remember { mutableStateOf<ModulesResult?>(null) }
     var loading by remember { mutableStateOf(false) }
     var actionMsg by remember { mutableStateOf<String?>(null) }
     var showRaw by remember { mutableStateOf(false) }
 
-    var zipPath by remember { mutableStateOf<String?>(null) }
     var zipName by remember { mutableStateOf<String?>(null) }
-    var zipError by remember { mutableStateOf<String?>(null) }
     var installing by remember { mutableStateOf(false) }
     var installRaw by remember { mutableStateOf<String?>(null) }
-    var confirmUninstallId by remember { mutableStateOf<String?>(null) }
+    var installError by remember { mutableStateOf<String?>(null) }
+
+    var query by remember { mutableStateOf("") }
+    var sort by remember { mutableStateOf(ModuleSort.GROUPED) }
+    var showSortPopup by remember { mutableStateOf(false) }
+    var detailModule by remember { mutableStateOf<ModuleInfo?>(null) }
+    var confirmUninstall by remember { mutableStateOf<ModuleInfo?>(null) }
 
     val scrollBehavior = MiuixScrollBehavior()
     val backdrop = rememberBlurBackdrop(LocalEnableBlur.current)
     val barColor = if (backdrop != null) Color.Transparent else colorScheme.surface
+    val pullState = rememberPullToRefreshState()
 
     fun refresh() {
         if (loading || key == null) return
@@ -135,8 +177,15 @@ fun ModulePager(
         }.start()
     }
 
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
-        if (uri == null) return@rememberLauncherForActivityResult
+    /** 选 zip → 复制到私有 cache → 校验 PK 头/大小 → apd module install（与旧逻辑一致）。 */
+    fun installFromUri(uri: Uri) {
+        if (key == null) {
+            installError = "Root 密钥不可用：请到「设置 → Root 密钥」重新生成"
+            return
+        }
+        installing = true
+        installRaw = null
+        installError = null
         Thread {
             runCatching {
                 val name = queryDisplayName(context, uri) ?: "module.zip"
@@ -144,28 +193,102 @@ fun ModulePager(
                 context.contentResolver.openInputStream(uri)?.use { input ->
                     target.outputStream().use { out -> input.copyTo(out) }
                 } ?: throw IllegalStateException("无法读取所选文件")
+                zipName = name
                 val error = ModuleRepository.validateZip(target)
                 if (error != null) {
                     target.delete()
-                    zipPath = null
-                    zipName = name
-                    zipError = error
+                    installError = "校验失败：$error"
+                    installing = false
+                    return@Thread
+                }
+                AppLog.info("Modules", "已选择模块包：$name（${Capabilities.formatBytes(target.length())}）")
+                val r = ModuleRepository.install(context, key, target)
+                installRaw = "exit=${r.exitCode}：${r.message}\n" +
+                    (r.rawStdout.takeIf { it.isNotBlank() }?.let { "[stdout]\n$it" } ?: "") +
+                    (r.rawStderr.takeIf { it.isNotBlank() }?.let { "\n[stderr]\n$it" } ?: "")
+                actionMsg = r.message
+                if (r.ok) {
+                    target.delete()
+                    zipName = null
+                    refresh()
                 } else {
-                    zipPath = target.absolutePath
-                    zipName = name
-                    zipError = null
-                    AppLog.info("Modules", "已选择模块包：$name（${Capabilities.formatBytes(target.length())}）")
+                    installError = r.message
                 }
             }.onFailure {
-                zipError = "复制所选文件失败：${it.javaClass.simpleName}: ${it.message}"
-                AppLog.error("Modules", "复制模块包失败", it)
+                installError = "安装异常：${it.javaClass.simpleName}: ${it.message}"
+                AppLog.error("Modules", "安装模块失败", it)
             }
+            installing = false
         }.start()
     }
 
-    // 首次进入 / 切回本页时自动拉取一次列表（能力就绪才会拉）
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+        if (uri == null) {
+            AppLog.warn("Modules", "用户取消了模块 zip 选择")
+            return@rememberLauncherForActivityResult
+        }
+        runCatching {
+            context.contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION,
+            )
+        }
+        installFromUri(uri)
+    }
+
     LaunchedEffect(isCurrentPage) {
         if (isCurrentPage && apdReady && key != null && result == null && !loading) refresh()
+    }
+
+    // ---------------- 详情页（二级页，KSU ModuleMiuix 的详情等价物） ----------------
+    val detail = detailModule
+    if (detail != null) {
+        BackHandler(enabled = true) { detailModule = null }
+        ModuleDetailPager(
+            module = detail,
+            enabled = apdReady && key != null && !loading && !installing,
+            onBack = { detailModule = null },
+            onToggle = { enable ->
+                if (key == null) return@ModuleDetailPager
+                Thread {
+                    val r = ModuleRepository.setEnabled(context, key, detail.id, enable)
+                    actionMsg = r.message
+                    if (r.ok) {
+                        refresh()
+                        detailModule = detail.copy(enabled = enable)
+                    } else {
+                        AppLog.error("Modules", r.message)
+                    }
+                }.start()
+            },
+            onUninstall = { confirmUninstall = detail },
+        )
+        ConfirmDialog(
+            show = confirmUninstall != null,
+            title = "卸载模块",
+            message = confirmUninstall?.let {
+                "将卸载「${it.name}」（id=${it.id}）。AP 模块变更通常在下次重启后生效，可稍后用「已刷入/重启」验证。"
+            },
+            confirmText = "卸载",
+            onConfirm = {
+                val target = confirmUninstall
+                confirmUninstall = null
+                if (target != null && key != null) {
+                    Thread {
+                        val r = ModuleRepository.uninstall(context, key, target.id)
+                        actionMsg = r.message
+                        if (r.ok) {
+                            detailModule = null
+                            refresh()
+                        } else {
+                            AppLog.error("Modules", r.message)
+                        }
+                    }.start()
+                }
+            },
+            onDismiss = { confirmUninstall = null },
+        )
+        return
     }
 
     Scaffold(
@@ -175,10 +298,473 @@ fun ModulePager(
                     color = barColor,
                     title = "模块",
                     actions = {
+                        Box {
+                            IconButton(onClick = { showSortPopup = true }) {
+                                Icon(
+                                    imageVector = MiuixIcons.Sort,
+                                    contentDescription = "排序 / 筛选",
+                                    tint = colorScheme.onSurface,
+                                )
+                            }
+                            OverlayListPopup(
+                                show = showSortPopup,
+                                popupPositionProvider = top.yukonga.miuix.kmp.basic.ListPopupDefaults.ContextMenuPositionProvider,
+                                alignment = PopupPositionProvider.Align.TopEnd,
+                                onDismissRequest = { showSortPopup = false },
+                                content = {
+                                    ListPopupColumn {
+                                        ModuleSort.entries.forEachIndexed { index, option ->
+                                            DropdownImpl(
+                                                text = option.label,
+                                                optionSize = ModuleSort.entries.size,
+                                                isSelected = sort == option,
+                                                onSelectedIndexChange = {
+                                                    sort = option
+                                                    showSortPopup = false
+                                                },
+                                                index = index,
+                                            )
+                                        }
+                                    }
+                                },
+                            )
+                        }
                         IconButton(onClick = { if (!loading) refresh() }) {
                             Icon(
                                 imageVector = MiuixIcons.Refresh,
                                 contentDescription = "刷新列表",
+                                tint = colorScheme.onSurface,
+                            )
+                        }
+                    },
+                    scrollBehavior = scrollBehavior,
+                )
+            }
+        },
+        floatingActionButton = {
+            FloatingActionButton(
+                modifier = Modifier
+                    .padding(bottom = bottomInnerPadding + 20.dp, end = 20.dp)
+                    .border(0.05.dp, colorScheme.outline.copy(alpha = 0.5f), CircleShape),
+                shadowElevation = 0.dp,
+                onClick = { picker.launch(arrayOf("application/zip", "application/octet-stream", "*/*")) },
+            ) {
+                Icon(
+                    imageVector = MiuixIcons.Add,
+                    contentDescription = "安装模块",
+                    modifier = Modifier.size(32.dp),
+                    tint = colorScheme.onPrimary,
+                )
+            }
+        },
+        popupHost = { },
+        contentWindowInsets = WindowInsets.systemBars.add(WindowInsets.displayCutout)
+            .only(WindowInsetsSides.Horizontal),
+    ) { innerPadding ->
+        Box(modifier = if (backdrop != null) Modifier.layerBackdrop(backdrop) else Modifier) {
+            val refreshTexts = listOf("下拉刷新", "释放刷新", "正在刷新", "刷新完成")
+            PullToRefresh(
+                isRefreshing = loading,
+                pullToRefreshState = pullState,
+                onRefresh = { refresh() },
+                refreshTexts = refreshTexts,
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(
+                    top = innerPadding.calculateTopPadding(),
+                    bottom = bottomInnerPadding + 88.dp,
+                ),
+            ) {
+                val modules = result?.modules.orEmpty()
+                val filtered = remember(modules, query, sort) { filterAndSort(modules, query, sort) }
+                val enabledModules = filtered.filter { it.enabled }
+                val disabledModules = filtered.filter { !it.enabled }
+
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxHeight()
+                        .scrollEndHaptic()
+                        .overScrollVertical()
+                        .nestedScroll(scrollBehavior.nestedScrollConnection)
+                        .padding(horizontal = 12.dp),
+                    contentPadding = PaddingValues(
+                        top = innerPadding.calculateTopPadding() + 8.dp,
+                        bottom = bottomInnerPadding + 96.dp,
+                    ),
+                    overscrollEffect = null,
+                ) {
+                    item { SearchCard(query = query, onQueryChange = { query = it }) }
+
+                    if (!apdReady) {
+                        item {
+                            WarningCard(
+                                message = "模块功能暂不可用：尚未部署 AP 守护（需先刷入修补后的镜像）；" +
+                                    "部署完成后列表与操作才会启用",
+                                level = WarningLevel.Notice,
+                            )
+                        }
+                    }
+
+                    // 安装中 / 安装结果（对应 KSU 的 flash 流程结果，保留原始输出）
+                    if (installing || installRaw != null || installError != null) {
+                        item {
+                            InstallResultCard(
+                                installing = installing,
+                                zipName = zipName,
+                                error = installError,
+                                raw = installRaw,
+                                onCopyRaw = {
+                                    context.copyToClipboard(
+                                        "模块安装原始输出",
+                                        installRaw ?: installError ?: "",
+                                    )
+                                },
+                            )
+                        }
+                    }
+
+                    if (actionMsg != null || result?.hints?.isNotEmpty() == true) {
+                        item {
+                            ResultCard(
+                                result = result,
+                                actionMsg = actionMsg,
+                                showRaw = showRaw,
+                                onToggleRaw = { showRaw = !showRaw },
+                                onCopyRaw = {
+                                    val raw = buildString {
+                                        append("--- apd module 原始输出 ---\n")
+                                        append(result?.rawStdout ?: "<未执行>")
+                                        if (!result?.rawStderr.isNullOrBlank()) {
+                                            append("\n--- stderr ---\n").append(result?.rawStderr)
+                                        }
+                                    }
+                                    context.copyToClipboard("模块原始输出", raw)
+                                },
+                            )
+                        }
+                    }
+
+                    selfTest?.let { test ->
+                        item {
+                            Text(
+                                text = "AP 自检：${test.stageLabel} · exit=${test.exitCode}",
+                                fontSize = 12.sp,
+                                color = colorScheme.onSurfaceVariantSummary,
+                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
+                            )
+                        }
+                    }
+
+                    when {
+                        result == null && apdReady && key != null -> {
+                            item { LoadingRow() }
+                        }
+
+                        loading && modules.isEmpty() -> {
+                            item { LoadingRow() }
+                        }
+
+                        result?.ok == false -> {
+                            item {
+                                WarningCard(
+                                    message = "模块列表加载失败：${result?.message ?: "未知错误"}",
+                                    level = WarningLevel.Error,
+                                )
+                            }
+                        }
+
+                        modules.isEmpty() -> {
+                            item { EmptyState(query.isNotBlank()) }
+                        }
+
+                        else -> {
+                            if (enabledModules.isNotEmpty()) {
+                                item { SectionHeader("已启用", enabledModules.size) }
+                                items(enabledModules, key = { "enabled-${it.id}" }) { module ->
+                                    ModuleItemCard(
+                                        module = module,
+                                        enabled = apdReady && key != null && !loading && !installing,
+                                        onOpenDetail = { detailModule = module },
+                                        onToggle = { enable ->
+                                            if (key == null) return@ModuleItemCard
+                                            Thread {
+                                                val r = ModuleRepository.setEnabled(context, key, module.id, enable)
+                                                actionMsg = r.message
+                                                if (r.ok) refresh() else AppLog.error("Modules", r.message)
+                                            }.start()
+                                        },
+                                        onUninstall = {
+                                            detailModule = module
+                                            confirmUninstall = module
+                                        },
+                                    )
+                                }
+                            }
+                            if (disabledModules.isNotEmpty()) {
+                                item { SectionHeader("已禁用", disabledModules.size) }
+                                items(disabledModules, key = { "disabled-${it.id}" }) { module ->
+                                    ModuleItemCard(
+                                        module = module,
+                                        enabled = apdReady && key != null && !loading && !installing,
+                                        onOpenDetail = { detailModule = module },
+                                        onToggle = { enable ->
+                                            if (key == null) return@ModuleItemCard
+                                            Thread {
+                                                val r = ModuleRepository.setEnabled(context, key, module.id, enable)
+                                                actionMsg = r.message
+                                                if (r.ok) refresh() else AppLog.error("Modules", r.message)
+                                            }.start()
+                                        },
+                                        onUninstall = {
+                                            detailModule = module
+                                            confirmUninstall = module
+                                        },
+                                    )
+                                }
+                            }
+                            if (filtered.isEmpty()) {
+                                item { EmptyState(true) }
+                            }
+                        }
+                    }
+
+                    item { Spacer(Modifier.height(8.dp)) }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 搜索栏
+
+/** 顶部搜索栏：KSU 的 `SuperSearchBar` 的静态简化版（图标 + 输入框 + 清空）。 */
+@Composable
+private fun SearchCard(query: String, onQueryChange: (String) -> Unit) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 12.dp),
+        insideMargin = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                imageVector = MiuixIcons.Basic.Search,
+                contentDescription = null,
+                tint = colorScheme.onSurfaceVariantSummary,
+                modifier = Modifier
+                    .padding(end = 8.dp)
+                    .size(20.dp),
+            )
+            Box(modifier = Modifier.weight(1f)) {
+                if (query.isEmpty()) {
+                    Text(
+                        text = "搜索模块（名称 / id / 作者 / 描述）",
+                        fontSize = 15.sp,
+                        color = colorScheme.onSurfaceVariantSummary,
+                    )
+                }
+                BasicTextField(
+                    value = query,
+                    onValueChange = onQueryChange,
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    textStyle = TextStyle(
+                        fontSize = 15.sp,
+                        color = colorScheme.onSurface,
+                    ),
+                    cursorBrush = SolidColor(colorScheme.primary),
+                )
+            }
+            if (query.isNotEmpty()) {
+                TextButton(text = "清空", onClick = { onQueryChange("") })
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 分区头
+
+@Composable
+private fun SectionHeader(title: String, count: Int) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 4.dp, end = 4.dp, top = 4.dp, bottom = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = title,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Medium,
+            color = colorScheme.onSurface,
+        )
+        Spacer(Modifier.size(6.dp))
+        Text(
+            text = "$count",
+            fontSize = 13.sp,
+            color = colorScheme.onSurfaceVariantSummary,
+        )
+    }
+}
+
+// ---------------------------------------------------------------- 模块条目
+
+/**
+ * 单个模块卡 —— 结构照抄 KSU `ModuleItem`：
+ * 左侧「图标 + 名称 + 版本 + 作者 + 描述」，右侧 Switch；点卡片进详情；
+ * 底部细分隔线 + 卸载入口（确认在详情/列表二次点击后弹对话框）。
+ */
+@Composable
+private fun ModuleItemCard(
+    module: ModuleInfo,
+    enabled: Boolean,
+    onOpenDetail: () -> Unit,
+    onToggle: (Boolean) -> Unit,
+    onUninstall: () -> Unit,
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 12.dp),
+        insideMargin = PaddingValues(16.dp),
+        onClick = onOpenDetail,
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            ModuleIcon()
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(start = 12.dp, end = 8.dp),
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = module.name,
+                        fontSize = 17.sp,
+                        fontWeight = FontWeight(550),
+                        color = colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
+                    if (module.updatePending) {
+                        Spacer(Modifier.size(6.dp))
+                        StatusTag(
+                            label = "有更新",
+                            backgroundColor = colorScheme.tertiaryContainer,
+                            contentColor = colorScheme.onTertiaryContainer,
+                        )
+                    }
+                }
+                Text(
+                    text = "版本：${module.version}（code ${module.versionCode}）",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight(550),
+                    color = colorScheme.onSurfaceVariantSummary,
+                )
+                Text(
+                    text = "作者：${module.author}",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight(550),
+                    color = colorScheme.onSurfaceVariantSummary,
+                )
+                if (module.description.isNotBlank()) {
+                    Text(
+                        text = module.description,
+                        fontSize = 13.sp,
+                        color = colorScheme.onSurfaceVariantSummary,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(top = 2.dp),
+                    )
+                }
+            }
+            Switch(
+                checked = module.enabled,
+                onCheckedChange = onToggle,
+                enabled = enabled,
+            )
+        }
+        HorizontalDivider(
+            modifier = Modifier.padding(vertical = 8.dp),
+            thickness = 0.5.dp,
+            color = colorScheme.outline.copy(alpha = 0.5f),
+        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = if (module.enabled) "已启用" else "已禁用",
+                fontSize = 12.sp,
+                color = if (module.enabled) colorScheme.primary else colorScheme.onSurfaceVariantSummary,
+            )
+            if (module.installStatus.isNotBlank()) {
+                Spacer(Modifier.size(8.dp))
+                Text(
+                    text = module.installStatus,
+                    fontSize = 12.sp,
+                    color = colorScheme.onSurfaceVariantSummary,
+                )
+            }
+            Spacer(Modifier.weight(1f))
+            TextButton(
+                text = "详情",
+                onClick = onOpenDetail,
+                enabled = enabled,
+            )
+            TextButton(
+                text = "卸载",
+                onClick = onUninstall,
+                enabled = enabled,
+            )
+        }
+    }
+}
+
+/** 模块图标：KSU 用模块自带图标；我们后端暂无图标字段，用统一的 Layers 图标占位。 */
+@Composable
+private fun ModuleIcon() {
+    Box(
+        modifier = Modifier
+            .size(44.dp)
+            .background(colorScheme.secondaryContainer.copy(alpha = 0.8f), RoundedCornerShape(12.dp)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            imageVector = MiuixIcons.Layers,
+            contentDescription = null,
+            tint = colorScheme.onSecondaryContainer,
+            modifier = Modifier.size(24.dp),
+        )
+    }
+}
+
+// ---------------------------------------------------------------- 详情页
+
+/**
+ * 模块详情（KSU `ModuleMiuix` 的详情/`ExecuteModuleActionMiuix` 操作页的简化版）：
+ * 头部信息卡 + 操作卡（启用/禁用、卸载）+ 原始字段卡。
+ */
+@Composable
+private fun ModuleDetailPager(
+    module: ModuleInfo,
+    enabled: Boolean,
+    onBack: () -> Unit,
+    onToggle: (Boolean) -> Unit,
+    onUninstall: () -> Unit,
+) {
+    val context = LocalContext.current
+    val scrollBehavior = MiuixScrollBehavior()
+    val backdrop = rememberBlurBackdrop(LocalEnableBlur.current)
+    val barColor = if (backdrop != null) Color.Transparent else colorScheme.surface
+
+    Scaffold(
+        topBar = {
+            BlurredBar(backdrop) {
+                TopAppBar(
+                    color = barColor,
+                    title = module.name,
+                    navigationIcon = {
+                        IconButton(onClick = onBack) {
+                            Icon(
+                                imageVector = MiuixIcons.Back,
+                                contentDescription = "返回模块列表",
                                 tint = colorScheme.onSurface,
                             )
                         }
@@ -199,284 +785,227 @@ fun ModulePager(
                     .overScrollVertical()
                     .nestedScroll(scrollBehavior.nestedScrollConnection)
                     .padding(horizontal = 12.dp),
-                contentPadding = innerPadding,
+                contentPadding = PaddingValues(
+                    top = innerPadding.calculateTopPadding() + 12.dp,
+                    bottom = 24.dp,
+                ),
                 overscrollEffect = null,
             ) {
                 item {
-                    Column(
-                        modifier = Modifier.padding(top = 12.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
-                    ) {
-                        if (!apdReady) {
-                            WarningCard(
-                                message = "模块功能暂不可用：尚未部署 AP 守护（需先刷入修补后的镜像），" +
-                                    "部署完成后本页所有按钮才会启用",
-                                level = WarningLevel.Notice,
-                            )
-                        }
-                        InstallCard(
-                            zipName = zipName,
-                            zipPath = zipPath,
-                            zipError = zipError,
-                            installing = installing,
-                            installRaw = installRaw,
-                            enabled = apdReady && key != null,
-                            onPick = { picker.launch(arrayOf("application/zip", "application/octet-stream", "*/*")) },
-                            onInstall = {
-                                val path = zipPath ?: return@InstallCard
-                                if (key == null) {
-                                    actionMsg = "密钥不可用"
-                                    return@InstallCard
-                                }
-                                installing = true
-                                installRaw = null
-                                Thread {
-                                    val r = ModuleRepository.install(context, key, java.io.File(path))
-                                    installRaw = "exit=${r.exitCode}：${r.message}\n" +
-                                        (r.rawStdout.takeIf { it.isNotBlank() }?.let { "[stdout]\n$it" } ?: "") +
-                                        (r.rawStderr.takeIf { it.isNotBlank() }?.let { "\n[stderr]\n$it" } ?: "")
-                                    actionMsg = r.message
-                                    installing = false
-                                    if (r.ok) {
-                                        zipPath?.let { runCatching { java.io.File(it).delete() } }
-                                        zipPath = null
-                                        zipName = null
-                                        refresh()
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                ModuleIcon()
+                                Column(modifier = Modifier.padding(start = 12.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            text = module.name,
+                                            fontSize = 20.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = colorScheme.onSurface,
+                                        )
+                                        if (module.updatePending) {
+                                            Spacer(Modifier.size(6.dp))
+                                            StatusTag(
+                                                label = "有更新",
+                                                backgroundColor = colorScheme.tertiaryContainer,
+                                                contentColor = colorScheme.onTertiaryContainer,
+                                            )
+                                        }
                                     }
-                                }.start()
-                            },
-                            onCancel = {
-                                zipPath?.let { runCatching { java.io.File(it).delete() } }
-                                zipPath = null
-                                zipName = null
-                                zipError = null
-                                installRaw = null
-                            },
-                        )
-                        ResultCard(
-                            result = result,
-                            actionMsg = actionMsg,
-                            selfTest = selfTest,
-                            showRaw = showRaw,
-                            onToggleRaw = { showRaw = !showRaw },
-                            onCopyRaw = {
-                                val raw = buildString {
-                                    append("--- apd module 原始输出 ---\n")
-                                    append(result?.rawStdout ?: "<未执行>")
-                                    if (!result?.rawStderr.isNullOrBlank()) {
-                                        append("\n--- stderr ---\n").append(result?.rawStderr)
-                                    }
+                                    Text(
+                                        text = "版本 ${module.version}（code ${module.versionCode}）· ${module.author}",
+                                        fontSize = 13.sp,
+                                        color = colorScheme.onSurfaceVariantSummary,
+                                    )
+                                    Text(
+                                        text = if (module.enabled) "已启用" else "已禁用",
+                                        fontSize = 13.sp,
+                                        color = if (module.enabled) colorScheme.primary else colorScheme.onSurfaceVariantSummary,
+                                    )
                                 }
-                                context.copyToClipboard("模块原始输出", raw)
-                            },
-                        )
-                        ListHeaderCard(
-                            loading = loading,
-                            moduleCount = result?.modules?.size,
-                            enabled = apdReady && key != null && !loading,
-                            onRefresh = { refresh() },
-                            onSelfTest = {
-                                if (loading) return@ListHeaderCard
-                                loading = true
-                                Thread {
-                                    selfTest = ApdSelfTest.run(context)
-                                    loading = false
-                                }.start()
-                            },
-                        )
-                    }
-                }
-
-                val modules = result?.modules.orEmpty()
-                if (result?.ok == true && modules.isEmpty()) {
-                    item {
-                        Card(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 12.dp),
-                        ) {
-                            Column(modifier = Modifier.padding(16.dp)) {
+                            }
+                            if (module.description.isNotBlank()) {
+                                Spacer(Modifier.height(10.dp))
                                 Text(
-                                    text = "无已安装模块",
-                                    fontSize = 15.sp,
-                                    fontWeight = FontWeight.Medium,
-                                    color = colorScheme.onSurface,
-                                )
-                                Text(
-                                    text = "AP 返回了空列表（正常状态）。可用上方「选择模块 zip」导入。",
-                                    fontSize = 13.sp,
+                                    text = module.description,
+                                    fontSize = 14.sp,
                                     color = colorScheme.onSurfaceVariantSummary,
                                 )
                             }
                         }
                     }
                 }
-                items(modules) { module ->
-                    ModuleItem(
-                        module = module,
-                        enabled = apdReady && key != null && !loading && !installing,
-                        confirmUninstall = confirmUninstallId == module.id,
-                        onToggle = { enable ->
-                            if (key == null) return@ModuleItem
-                            Thread {
-                                val r = ModuleRepository.setEnabled(context, key, module.id, enable)
-                                actionMsg = r.message
-                                if (r.ok) refresh() else AppLog.error("Modules", r.message)
-                            }.start()
-                        },
-                        onUninstall = {
-                            if (key == null) return@ModuleItem
-                            if (confirmUninstallId != module.id) {
-                                confirmUninstallId = module.id
-                                actionMsg = "再次点击「确认卸载」以卸载 ${module.id}（下次重启后生效）"
-                            } else {
-                                confirmUninstallId = null
-                                Thread {
-                                    val r = ModuleRepository.uninstall(context, key, module.id)
-                                    actionMsg = r.message
-                                    if (r.ok) refresh() else AppLog.error("Modules", r.message)
-                                }.start()
-                            }
-                        },
-                    )
-                }
-
+                item { Spacer(Modifier.height(12.dp)) }
                 item {
-                    Card(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 12.dp),
-                    ) {
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        SwitchPreference(
+                            title = "启用模块",
+                            summary = "启用/禁用由 AP 用户态处理，通常在下次重启后生效",
+                            checked = module.enabled,
+                            onCheckedChange = onToggle,
+                        )
+                        ArrowPreference(
+                            title = "卸载模块",
+                            summary = "移除模块目录并标记 remove_pending，重启后生效",
+                            startAction = {
+                                Icon(
+                                    imageVector = MiuixIcons.Delete,
+                                    contentDescription = null,
+                                    tint = colorScheme.error,
+                                    modifier = Modifier
+                                        .padding(end = 12.dp)
+                                        .size(24.dp),
+                                )
+                            },
+                            onClick = { if (enabled) onUninstall() },
+                        )
+                    }
+                }
+                item { Spacer(Modifier.height(12.dp)) }
+                item {
+                    Card(modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(16.dp)) {
                             Text(
-                                text = "说明 / 契约",
+                                text = "模块信息",
                                 fontSize = 15.sp,
                                 fontWeight = FontWeight.Medium,
                                 color = colorScheme.onSurface,
                             )
-                            Text(
-                                text = "模块生命周期全部由 AP 用户态管理（契约 v1.1 §8.3）：App 只经 root-exec 调用，" +
-                                    "不直接读写 /data/adb。安装/卸载/启停都是两阶段语义——" +
-                                    "变更在下次 post-fs-data 原子生效，因此界面会显示「重启后生效」。",
-                                fontSize = 13.sp,
-                                color = colorScheme.onSurfaceVariantSummary,
+                            InfoLine("id", module.id, monospace = true)
+                            InfoLine("version", module.version)
+                            InfoLine("versionCode", module.versionCode)
+                            InfoLine("author", module.author)
+                            InfoLine("enabled", module.enabled.toString())
+                            InfoLine("update_pending", module.updatePending.toString())
+                            if (module.installStatus.isNotBlank()) {
+                                InfoLine("install_status", module.installStatus)
+                            }
+                            TextButton(
+                                text = "复制 id",
+                                onClick = { context.copyToClipboard("模块 id", module.id) },
                             )
                         }
                     }
                 }
-
-                item { Spacer(Modifier.height(bottomInnerPadding + 12.dp)) }
             }
         }
     }
 }
 
-// ---------------------------------------------------------------- 安装卡
+@Composable
+private fun InfoLine(label: String, value: String, monospace: Boolean = false) {
+    Column(modifier = Modifier.padding(vertical = 3.dp)) {
+        Text(
+            text = label,
+            fontSize = 12.sp,
+            color = colorScheme.onSurfaceVariantSummary,
+        )
+        Text(
+            text = value,
+            fontSize = 14.sp,
+            fontFamily = if (monospace) FontFamily.Monospace else FontFamily.Default,
+            color = colorScheme.onSurface,
+        )
+    }
+}
+
+// ---------------------------------------------------------------- 安装/结果/空态
 
 @Composable
-private fun InstallCard(
-    zipName: String?,
-    zipPath: String?,
-    zipError: String?,
+private fun InstallResultCard(
     installing: Boolean,
-    installRaw: String?,
-    enabled: Boolean,
-    onPick: () -> Unit,
-    onInstall: () -> Unit,
-    onCancel: () -> Unit,
-) {
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Column {
-            BasicComponent(
-                title = "选择模块 zip",
-                summary = zipName
-                    ?: "Magisk/KSU 模块格式；经 AP 用户态安装，App 不直接解压到 /data/adb",
-                onClick = onPick,
-                startAction = {
-                    Icon(
-                        imageVector = MiuixIcons.UploadCloud,
-                        contentDescription = null,
-                        tint = colorScheme.onSurface,
-                        modifier = Modifier.padding(end = 12.dp),
-                    )
-                },
-            )
-            Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
-                zipPath?.let {
-                    Text(
-                        text = "临时副本：$it",
-                        fontSize = 12.sp,
-                        fontFamily = FontFamily.Monospace,
-                        color = colorScheme.onSurfaceVariantSummary,
-                    )
-                }
-                zipError?.let {
-                    Text(text = "校验失败：$it", fontSize = 13.sp, color = colorScheme.error)
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    TextButton(
-                        text = if (installing) "安装中…（最多 300s）" else "开始安装",
-                        onClick = onInstall,
-                        enabled = enabled && !installing && zipPath != null,
-                        colors = ButtonDefaults.textButtonColorsPrimary(),
-                    )
-                    TextButton(text = "取消", onClick = onCancel, enabled = !installing)
-                }
-                if (installing) {
-                    Text(
-                        text = "正在调用 apd module install；请保持 App 在前台。失败会保留原始输出。",
-                        fontSize = 13.sp,
-                        color = colorScheme.onSurfaceVariantSummary,
-                    )
-                }
-                installRaw?.let {
-                    Spacer(Modifier.height(8.dp))
-                    Card(modifier = Modifier.fillMaxWidth()) {
-                        Text(
-                            text = it,
-                            fontSize = 12.sp,
-                            fontFamily = FontFamily.Monospace,
-                            color = colorScheme.onSurface,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(max = 240.dp)
-                                .verticalScroll(rememberScrollState())
-                                .padding(12.dp),
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------- 操作结果卡
-
-@Composable
-private fun ResultCard(
-    result: ModulesResult?,
-    actionMsg: String?,
-    selfTest: ApdSelfTest.Result?,
-    showRaw: Boolean,
-    onToggleRaw: () -> Unit,
+    zipName: String?,
+    error: String?,
+    raw: String?,
     onCopyRaw: () -> Unit,
 ) {
-    if (result == null && actionMsg == null && selfTest == null) return
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 12.dp),
         colors = CardDefaults.defaultColors(
             color = colorScheme.surfaceContainer,
             contentColor = colorScheme.onSurface,
         ),
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
-            selfTest?.let {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = MiuixIcons.UploadCloud,
+                    contentDescription = null,
+                    tint = colorScheme.onSurface,
+                    modifier = Modifier
+                        .padding(end = 8.dp)
+                        .size(20.dp),
+                )
                 Text(
-                    text = "AP 自检：${it.stageLabel} · exit=${it.exitCode}",
-                    fontSize = 13.sp,
-                    color = if (it.isNormalInitialState) colorScheme.onSurfaceVariantSummary else colorScheme.onSurface,
+                    text = when {
+                        installing -> "正在安装模块…（最多 300s）"
+                        error != null -> "安装失败"
+                        else -> "安装结果"
+                    },
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = colorScheme.onSurface,
                 )
             }
+            zipName?.let {
+                Text(
+                    text = "模块包：$it",
+                    fontSize = 12.sp,
+                    color = colorScheme.onSurfaceVariantSummary,
+                )
+            }
+            installing.takeIf { it }?.let {
+                Text(
+                    text = "请保持 App 在前台；失败会保留原始输出。",
+                    fontSize = 12.sp,
+                    color = colorScheme.onSurfaceVariantSummary,
+                )
+            }
+            error?.let {
+                Text(text = it, fontSize = 13.sp, color = colorScheme.error)
+            }
+            raw?.let {
+                Spacer(Modifier.height(6.dp))
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        text = it,
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = colorScheme.onSurface,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 240.dp)
+                            .verticalScroll(rememberScrollState())
+                            .padding(12.dp),
+                    )
+                }
+                TextButton(text = "复制原始输出", onClick = onCopyRaw)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ResultCard(
+    result: ModulesResult?,
+    actionMsg: String?,
+    showRaw: Boolean,
+    onToggleRaw: () -> Unit,
+    onCopyRaw: () -> Unit,
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 12.dp),
+        colors = CardDefaults.defaultColors(
+            color = colorScheme.surfaceContainer,
+            contentColor = colorScheme.onSurface,
+        ),
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
             actionMsg?.let {
                 Text(
                     text = "操作结果：$it",
@@ -493,22 +1022,6 @@ private fun ResultCard(
                         color = colorScheme.onSurface,
                         modifier = Modifier.padding(vertical = 2.dp),
                     )
-                }
-            }
-            result?.parsed?.takeIf { it.isNotEmpty() }?.let { fields ->
-                Spacer(Modifier.height(6.dp))
-                fields.forEach { (k, v) ->
-                    if (k != "error") {
-                        Text(
-                            text = "$k：$v",
-                            fontSize = 12.sp,
-                            fontFamily = FontFamily.Monospace,
-                            color = colorScheme.onSurfaceVariantSummary,
-                        )
-                    }
-                }
-                fields["error"]?.let {
-                    Text(text = "error：$it", fontSize = 12.sp, color = colorScheme.error)
                 }
             }
             result?.takeIf { !it.ok }?.let {
@@ -542,145 +1055,91 @@ private fun ResultCard(
     }
 }
 
-// ---------------------------------------------------------------- 列表头卡
-
 @Composable
-private fun ListHeaderCard(
-    loading: Boolean,
-    moduleCount: Int?,
-    enabled: Boolean,
-    onRefresh: () -> Unit,
-    onSelfTest: () -> Unit,
-) {
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = "已安装模块",
-                    fontSize = MiuixTheme.textStyles.headline1.fontSize,
-                    fontWeight = FontWeight.Medium,
-                    color = colorScheme.onSurface,
-                    modifier = Modifier.weight(1f),
-                )
-                Text(
-                    text = when {
-                        loading -> "加载中…"
-                        moduleCount != null -> "$moduleCount 个"
-                        else -> "未加载"
-                    },
-                    fontSize = 13.sp,
-                    color = colorScheme.onSurfaceVariantSummary,
-                )
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                TextButton(
-                    text = if (loading) "刷新中…" else "刷新列表",
-                    onClick = onRefresh,
-                    enabled = enabled,
-                    colors = ButtonDefaults.textButtonColorsPrimary(),
-                )
-                TextButton(text = "重跑 AP 自检", onClick = onSelfTest, enabled = !loading)
-            }
-        }
+private fun LoadingRow() {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 48.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = "正在加载模块列表…",
+            fontSize = 14.sp,
+            color = colorScheme.onSurfaceVariantSummary,
+        )
     }
 }
 
-// ---------------------------------------------------------------- 模块条目
-
-/** 单个模块卡：照抄 KSU `ModuleItem` 的「名称/版本/作者 + Switch + 分隔线 + 操作」结构。 */
+/** 空态：大图标 + 文案（搜索无结果与"没有安装模块"用不同文案）。 */
 @Composable
-private fun ModuleItem(
-    module: ModuleInfo,
-    enabled: Boolean,
-    confirmUninstall: Boolean,
-    onToggle: (Boolean) -> Unit,
-    onUninstall: () -> Unit,
-) {
-    Card(
+private fun EmptyState(searchEmpty: Boolean) {
+    Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(top = 12.dp),
-        insideMargin = PaddingValues(16.dp),
+            .padding(vertical = 56.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
-                Text(
-                    text = module.name,
-                    fontSize = 17.sp,
-                    fontWeight = FontWeight(550),
-                    color = colorScheme.onSurface,
-                )
-                Text(
-                    text = "版本：${module.version}（code ${module.versionCode}）",
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight(550),
-                    color = colorScheme.onSurfaceVariantSummary,
-                )
-                Text(
-                    text = "作者：${module.author}",
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight(550),
-                    color = colorScheme.onSurfaceVariantSummary,
-                )
-            }
-            if (module.updatePending) {
-                StatusTag(
-                    label = "有更新",
-                    backgroundColor = colorScheme.tertiaryContainer,
-                    contentColor = colorScheme.onTertiaryContainer,
-                )
-                Spacer(Modifier.size(6.dp))
-            }
-            Switch(
-                checked = module.enabled,
-                onCheckedChange = onToggle,
-                enabled = enabled,
+        Box(
+            modifier = Modifier
+                .size(88.dp)
+                .background(colorScheme.surfaceContainer, CircleShape),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = MiuixIcons.Layers,
+                contentDescription = null,
+                tint = colorScheme.onSurfaceVariantSummary,
+                modifier = Modifier.size(40.dp),
             )
         }
-        if (module.description.isNotBlank()) {
-            Text(
-                text = module.description,
-                fontSize = 14.sp,
-                color = colorScheme.onSurfaceVariantSummary,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 2.dp),
-            )
-        }
-        HorizontalDivider(
-            modifier = Modifier.padding(vertical = 8.dp),
-            thickness = 0.5.dp,
-            color = colorScheme.outline.copy(alpha = 0.5f),
+        Text(
+            text = if (searchEmpty) "没有匹配的模块" else "尚未安装任何模块",
+            fontSize = 16.sp,
+            fontWeight = FontWeight.Medium,
+            color = colorScheme.onSurface,
         )
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            TextButton(
-                text = if (confirmUninstall) "确认卸载" else "卸载",
-                onClick = onUninstall,
-                enabled = enabled,
-                colors = if (confirmUninstall) {
-                    ButtonDefaults.textButtonColorsPrimary()
-                } else {
-                    ButtonDefaults.textButtonColors()
-                },
-            )
-            Text(
-                text = if (module.enabled) "已启用" else "已禁用",
-                fontSize = 12.sp,
-                color = if (module.enabled) colorScheme.primary else colorScheme.onSurfaceVariantSummary,
-                modifier = Modifier.align(Alignment.CenterVertically),
-            )
-            if (module.installStatus.isNotBlank()) {
-                Text(
-                    text = module.installStatus,
-                    fontSize = 12.sp,
-                    color = colorScheme.onSurfaceVariantSummary,
-                    modifier = Modifier.align(Alignment.CenterVertically),
-                )
-            }
+        Text(
+            text = if (searchEmpty) {
+                "换个关键词试试；搜索覆盖名称 / id / 作者 / 描述"
+            } else {
+                "点击右下角「+」选择模块 zip 安装；AP 未部署前安装入口不可用"
+            },
+            fontSize = 13.sp,
+            color = colorScheme.onSurfaceVariantSummary,
+        )
+    }
+}
+
+// ---------------------------------------------------------------- 工具
+
+/** 搜索过滤 + 排序（对应 KSU 的搜索/排序菜单能力，纯客户端计算）。 */
+private fun filterAndSort(
+    modules: List<ModuleInfo>,
+    query: String,
+    sort: ModuleSort,
+): List<ModuleInfo> {
+    val q = query.trim().lowercase()
+    val filtered = if (q.isEmpty()) {
+        modules
+    } else {
+        modules.filter { module ->
+            module.name.lowercase().contains(q) ||
+                module.id.lowercase().contains(q) ||
+                module.author.lowercase().contains(q) ||
+                module.description.lowercase().contains(q)
         }
+    }
+    return when (sort) {
+        ModuleSort.GROUPED -> filtered.sortedWith(
+            compareByDescending<ModuleInfo> { it.enabled }.thenBy { it.name.lowercase() },
+        )
+
+        ModuleSort.NAME -> filtered.sortedBy { it.name.lowercase() }
+        ModuleSort.UPDATE -> filtered.sortedWith(
+            compareByDescending<ModuleInfo> { it.updatePending }.thenBy { it.name.lowercase() },
+        )
     }
 }
 
