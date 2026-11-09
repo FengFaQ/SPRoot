@@ -123,7 +123,7 @@ private fun MainScreen(
                     1 -> PatchTab(blurBackdrop)
                     2 -> ModuleTab(blurBackdrop)
                     else -> SettingsTab(
-                        blurBackdrop = blurBackdrop,
+                        backdrop = blurBackdrop,
                         appSettings = appSettings,
                         onSettingsChange = onSettingsChange,
                     )
