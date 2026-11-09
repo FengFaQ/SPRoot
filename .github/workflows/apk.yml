@@ -250,3 +250,130 @@ jobs:
           name: SPRoot-APK
           path: app/build/outputs/apk/**/*.apk
           if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 自动发布：v2 每次构建成功即把 APK 推到 GitHub Releases（滚动 release）
+  #
+  # - tag 固定 `v2-latest`，标记 prerelease（这是"最新自动构建"，不是稳定版）
+  # - 每次上传 <sha7> 固定副本 + 覆盖 latest 副本 + SHA256SUMS
+  # - 只保留最近 10 个历史副本，避免 asset 无限膨胀
+  # - 任何一步失败即 job 红：发布是最后一公里，不允许静默
+  # ---------------------------------------------------------------------------
+  publish-release:
+    needs: build-apk
+    if: github.event_name == 'push' && github.ref == 'refs/heads/v2'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: SPRoot-APK
+          path: dist
+
+      - name: Stage release files
+        run: |
+          set -euo pipefail
+          SHA7=$(echo "$GITHUB_SHA" | cut -c1-7)
+          APK=$(find dist -name '*.apk' | head -1)
+          test -n "$APK" || { echo "::error::artifact 中找不到 APK"; exit 1; }
+          echo "APK=$APK size=$(stat -c %s "$APK")"
+          mkdir -p out
+          cp -f "$APK" "out/SPRoot-$SHA7-release.apk"
+          cp -f "$APK" "out/SPRoot-latest-release.apk"
+          cd out
+          sha256sum ./*.apk > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          echo "SHA7=$SHA7" >> "$GITHUB_ENV"
+
+      - name: Compose release notes
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          set -euo pipefail
+          SIZE=$(stat -c %s out/SPRoot-latest-release.apk)
+          SHA256=$(sha256sum out/SPRoot-latest-release.apk | cut -d' ' -f1)
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          COMMIT_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA"
+          {
+            echo "自动构建（v2 分支，每次 push 触发）"
+            echo
+            echo "- commit: [$GITHUB_SHA]($COMMIT_URL)"
+            echo "- 提交信息: ${COMMIT_MSG}"
+            echo "- 构建时间(UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "- 运行记录: [$GITHUB_RUN_ID]($RUN_URL)"
+            echo
+            echo "资产说明："
+            echo "- SPRoot-latest-release.apk —— 始终指向最新构建，$SIZE 字节"
+            echo "- SPRoot-${SHA7}-release.apk —— 本次 commit 的固定副本"
+            echo "- SHA256SUMS.txt —— 校验值"
+            echo
+            echo "latest 的 sha256: $SHA256"
+            echo
+            echo "注意：这是每次提交自动产出的预发布件（prerelease），未经真机验证。" \
+                 "刷机前请阅读仓库 docs/HANDOFF-2026-11-08.md 的刷入与回滚说明：" \
+                 "只刷 boot/init_boot，切勿执行 vbmeta 相关命令或 --disable-verification。"
+          } > /tmp/notes.md
+          cat /tmp/notes.md
+
+      - name: Publish to rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG=v2-latest
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG 已存在：追加/覆盖资产"
+            gh release upload "$TAG" out/*.apk out/SHA256SUMS.txt --clobber
+            gh release edit "$TAG" --notes-file /tmp/notes.md
+          else
+            echo "创建 release $TAG"
+            gh release create "$TAG" out/*.apk out/SHA256SUMS.txt \
+              --title "SPRoot Manager — v2 自动构建（最新）" \
+              --notes-file /tmp/notes.md \
+              --prerelease \
+              --target "$GITHUB_SHA"
+          fi
+          gh release view "$TAG" --json tagName,url,assets --jq '{tagName,url,assets:[.assets[].name]}'
+
+      - name: Prune old per-commit APKs (keep latest 10)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG=v2-latest
+          KEEP=10
+          gh api "/repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq .id > /tmp/relid
+          RELID=$(cat /tmp/relid)
+          gh api "/repos/$GITHUB_REPOSITORY/releases/$RELID/assets?per_page=100" > /tmp/assets.json
+          python3 - "$KEEP" <<'PYEOF' > /tmp/to_delete.txt
+          import json, re, sys
+          keep = int(sys.argv[1])
+          data = json.load(open('/tmp/assets.json'))
+          pat = re.compile(r'^SPRoot-[0-9a-f]{7}-release\.apk$')
+          items = [a for a in data if pat.match(a['name'])]
+          items.sort(key=lambda a: a['created_at'])
+          for a in items[:-keep] if len(items) > keep else []:
+              print(a['id'], a['name'])
+          PYEOF
+          if [ -s /tmp/to_delete.txt ]; then
+            while read -r aid name; do
+              echo "删除旧资产: $name (id=$aid)"
+              gh api -X DELETE "/repos/$GITHUB_REPOSITORY/releases/assets/$aid" || true
+            done < /tmp/to_delete.txt
+          else
+            echo "无需清理（历史副本未超过 $KEEP 个）"
+          fi
+
+      - name: Job summary
+        run: |
+          {
+            echo "### APK 已发布到 Releases"
+            echo ""
+            echo "- Release: [$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/v2-latest]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/v2-latest)"
+            echo "- 本次资产: SPRoot-${SHA7}-release.apk（同时更新 SPRoot-latest-release.apk）"
+            echo "- 校验值: SHA256SUMS.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
