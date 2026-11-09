@@ -234,9 +234,9 @@ object RcInject {
         }
         val hasImport = initRc.readText().lineSequence().any { it.trim() == IMPORT_LINE }
         return if (hasImport) {
-            VerifyResult(true, "$RCFILE 与 "$IMPORT_LINE" 均在最终产物 ramdisk 中")
+            VerifyResult(true, "$RCFILE 与 $IMPORT_LINE 均在最终产物 ramdisk 中")
         } else {
-            VerifyResult(false, "产物 init.rc 缺少 "$IMPORT_LINE"（import 未生效）")
+            VerifyResult(false, "产物 init.rc 缺少 $IMPORT_LINE（import 未生效）")
         }
     }
 
