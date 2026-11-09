@@ -21,7 +21,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  *   → ②复制到 cache 工作目录 + sha1 内容寻址备份
  *   → ③magiskboot unpack → kernel
  *   → ④kernel 若仍压缩 → magiskboot decompress → kernel.raw
- *   → ⑤PatchEngine.patch(kernel.raw → kernel.patched)  ← 48 位密钥在此注入（JNI，无需 root）
+ *   → ⑤PatchEngine.patch(kernel.raw → kernel.patched)  ← 47 字符内核密钥在此注入（JNI，无需 root；引擎入参补 48）
  *   → ⑥kernel.patched 若原为压缩 → magiskboot compress=<fmt>
  *   → ⑦magiskboot repack → new-boot.img
  *   → ⑧校验（产物存在 / 内核等长 / sha256 / 与输入不同）→ 导出 Downloads/SPRoot/
@@ -285,7 +285,9 @@ object PatchPipeline {
                 PatchEngine.patch(
                     inFile = kernelRaw,
                     outFile = patched,
-                    key = key,
+                    // 引擎 --key 入参 ABI = 48 字符（引擎丢弃第 48 位后写 47+NUL）；
+                    // 本地存储/apd/内核比对一律 47 字符，见 SecretStore 头部注释。
+                    key = SecretStore.engineKeyOf(key),
                     genKey = false,
                     jsonFile = jsonFile,
                     workDir = workDir!!,
@@ -395,7 +397,7 @@ object PatchPipeline {
                     "rc_source=${rcResult!!.source}, rc_reason=${rcResult!!.reason}, " +
                     "rc_idempotent_hit=${rcResult!!.idempotentHit}" +
                     (if (rcResult!!.injected) {
-                        "（rc 已注入 ≠ 已开启自启：需 AP 部署完成并写入 /data/adb/sproot/superkey(0600) 后，开机才会拉起 AP daemon）"
+                        "（rc 已注入 ≠ 已开启自启：需 AP 部署完成并写入 /data/adb/sproot/key(0600) 后，开机才会拉起 AP daemon）"
                     } else {
                         "（不影响产物合规，可手动启动 AP）"
                     }),
@@ -579,7 +581,8 @@ object PatchPipeline {
                 "产物就绪：${exported.displayPath} size=${newBoot.length()} sha256=$outSha",
             )
 
-            val rootKey = PatchEngine.lastRootKey() ?: key
+            // 引擎 report 里的 root_key 是其 48 字符入参；内核真正内嵌的是前 47 位
+            val rootKey = PatchEngine.lastRootKey()?.let { SecretStore.kernelKeyOf(it) } ?: key
             state.value = state.value.copy(
                 stage = PatchStage.DONE,
                 progress = 1f,

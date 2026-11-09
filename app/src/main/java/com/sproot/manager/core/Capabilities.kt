@@ -77,7 +77,7 @@ object Capabilities {
         val keyOk = runCatching { SecretStore.get(context).getOrCreateRootKey() }.isSuccess
         items += CapabilityItem(
             key = "root_key",
-            label = "Root 密钥（48 位，Keystore 加密存储）",
+            label = "Root 密钥（47 字符 + NUL，Keystore 加密存储）",
             ok = keyOk,
             detail = if (keyOk) "已就绪（debug/release 一致，不依赖 BuildConfig.DEBUG）" else "读写失败，见日志",
         )

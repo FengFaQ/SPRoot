@@ -113,7 +113,7 @@ fun HomePage(
                 InfoRow(
                     label = "Root 密钥",
                     value = if (rootKey != null) {
-                        "已就绪：${maskSecret(rootKey)}（前 16 位即 /data 隐藏目录前缀）"
+                        "已就绪：${maskSecret(rootKey)}（47 字符，内核 ABI 47+NUL；前 16 位即 /data 隐藏目录前缀）"
                     } else {
                         "不可用 —— 请到设置页重新生成"
                     },

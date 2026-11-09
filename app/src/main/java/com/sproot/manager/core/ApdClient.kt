@@ -10,7 +10,7 @@ import java.util.concurrent.locks.ReentrantLock
  *
  * ## 职责边界（lead 裁决：收敛到 AP）
  * Kotlin 侧只做三件事：
- *  1. 把 48 位密钥写入**私有目录**临时文件（0600），调用返回后立即删除；
+ *  1. 把 **47 字符内核密钥**写入**私有目录**临时文件（0600），调用返回后立即删除；
  *  2. `apd root-exec --superkey-file <tmp> [--uid] [--scontext] [--timeout] -- <cmd...>` 起进程；
  *  3. **只看 exit code** 判成败（不解析人类文本），并把 stderr/stdout 原样落盘。
  *
@@ -92,7 +92,7 @@ object ApdClient {
      * 唯一 root 调用入口。阻塞，必须在后台线程调用。
      *
      * @param context 用于解析未部署时的 APK 内副本与临时密钥文件目录
-     * @param superKey 48 位密钥（内部截断逻辑由 AP 处理，App 原样写入临时文件）
+     * @param superKey 47 字符内核密钥（内核 ABI 47+NUL；App 原样写入临时文件，apd 读文件后与内核比对）
      * @param command 目标命令 argv（**已经是数组**，不做任何字符串拼接）
      * @param uid 可选 --uid
      * @param sContext 可选 --scontext
@@ -311,7 +311,9 @@ object ApdClient {
     }
 
     private fun writeKeyFile(context: Context, superKey: String): File {
-        require(SecretStore.isValidKey(superKey)) { "密钥必须是 48 位 [A-Za-z0-9]" }
+        require(SecretStore.isValidKey(superKey)) {
+            "密钥必须是 47 字符 [A-Za-z0-9]（内核 ABI 47+NUL），实际长度=${superKey.length}"
+        }
         val dir = File(context.filesDir, "exec-keys").apply { mkdirs() }
         val file = File(dir, "key-${System.nanoTime()}.tmp")
         file.writeText(superKey)

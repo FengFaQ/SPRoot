@@ -82,7 +82,7 @@ fun SettingsPage(
         item {
             SectionCard(
                 title = "Root 密钥",
-                subtitle = "48 位 [A-Za-z0-9]；前 47 位写入内核，前 16 位即隐藏目录前缀。debug/release 行为一致",
+                subtitle = "47 字符 [A-Za-z0-9]（内核 ABI 47+NUL）；前 16 位即隐藏目录前缀。debug/release 行为一致",
             ) {
                 Column {
                     InfoRow(
@@ -94,6 +94,15 @@ fun SettingsPage(
                         },
                         monospace = true,
                     )
+                    if (SecretStore.legacy48Detected) {
+                        VSpacer(6)
+                        InfoRow(
+                            label = "旧密钥提示",
+                            value = "检测到历史 48 字符密钥，已取前 47 位使用；" +
+                                "建议重新生成密钥并重新修补/刷入镜像（旧镜像内嵌密钥可能不一致）",
+                            valueColor = MiuixTheme.colorScheme.error,
+                        )
+                    }
                     VSpacer(10)
                     ActionRow {
                         Button(onClick = { showKey = !showKey }) {

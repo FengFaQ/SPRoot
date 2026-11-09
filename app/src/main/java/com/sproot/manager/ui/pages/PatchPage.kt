@@ -251,7 +251,7 @@ fun PatchPage(modifier: Modifier = Modifier) {
                                 "开机自启（AP daemon）",
                                 if (state.rcInjected) {
                                     "已注入开机自启模板（target=${state.rcTarget}，来源=${state.rcSource}）—— " +
-                                        "**待 AP 部署完成后生效**：AP 部署需写入 /data/adb/sproot/superkey（0600）；" +
+                                        "**待 AP 部署完成后生效**：AP 部署需写入 /data/adb/sproot/key（0600，47 字符）；" +
                                         "在此之前自启不会工作（可手动启动 AP）"
                                 } else {
                                     "未注入（target=${state.rcTarget}，原因=${state.rcReason}）—— 产物仍合规，可手动启动 AP"
@@ -265,7 +265,7 @@ fun PatchPage(modifier: Modifier = Modifier) {
                         val key = state.rootKey
                         if (key != null) {
                             VSpacer(6)
-                            InfoRow("Root 密钥（48 位）", if (showKey) key else maskSecret(key), monospace = true)
+                            InfoRow("Root 密钥（47 字符 + NUL，内核 ABI）", if (showKey) key else maskSecret(key), monospace = true)
                             VSpacer(6)
                             ActionRow {
                                 Button(onClick = { showKey = !showKey }) {
