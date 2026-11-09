@@ -16,7 +16,7 @@
 #    /data/adb/apd                      apd 可执行文件（aarch64）
 #    /data/adb/sproot/key          0600 root:root，内容为 47 字符密钥（无 NUL，逐行为纯文本）
 #                                  —— 与 apd/src/defs.rs::SPROOT_KEY_FILE 严格一致；
-#                                     由 apd deploy 的 step 5/9 原子写入（tmp+fsync+rename）
+#                                     由 apd deploy 的 step 5/10 原子写入（tmp+fsync+rename）
 #    /data/adb/sproot/                 0700 root:root
 
 on post-fs-data
