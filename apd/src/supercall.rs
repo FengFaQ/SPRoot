@@ -22,6 +22,7 @@
 //! `SP_REQUEST_UID` env-injection idea is dropped in v1.1 (E3) — the requesting
 //! uid now comes from the daemon's socket `SO_PEERCRED` (see `daemon.rs`).
 
+use anyhow::{Result, bail, ensure};
 use log::{info, warn};
 
 use crate::secret;
@@ -36,31 +37,57 @@ pub const REQUEST_UID_ENV: &str = "SPROOT_REQUEST_UID";
 
 /// Number of key characters actually embedded in / compared by the kernel.
 /// The public key is 48 chars; the last one is display-only (A1 §4.1, E1).
-pub const KERNEL_KEY_LEN: usize = 47;
-
-/// Return the escalation token: the key truncated to [`KERNEL_KEY_LEN`].
 ///
-/// Accepts both 47- and 48-char keys so callers never have to care. Anything
-/// shorter than 47 is returned unchanged (the kernel compare will fail). A key
-/// longer than the 48-position display format is an ABI mix-up: it is still
-/// reduced to 47 (the kernel's only notion of the key) but the anomaly is
-/// logged — never silent — so a wrong-ABI key does not look like a mere
-/// "kernel rejected the token" failure later (HANDOFF §6.8).
-pub fn escalation_token(key: &str) -> &str {
+/// This is the engine/kernel side of the ABI (`patch_do_execve.cpp`: the hook
+/// compares the exec filename byte-by-byte against these 47 chars and then
+/// expects the NUL terminator). Changing it means re-patching the kernel, so it
+/// is pinned here at compile time: a change in this constant must be a
+/// deliberate, all-chain ABI bump (docs/NEW-DOC-05 §12).
+pub const KERNEL_KEY_LEN: usize = 47;
+const _: () = assert!(KERNEL_KEY_LEN == 47);
+
+/// Return the escalation token: **exactly** [`KERNEL_KEY_LEN`] bytes, or an
+/// error — never a silently-passed-through wrong-length string.
+///
+/// This is the last link of the key ABI chain and the single input to
+/// `execve()`, so a wrong length here is a *silent* escalation failure (the
+/// kernel compares 47 chars + NUL and just returns `ENOENT`). Rules:
+///
+/// * 47 chars — the AP-side canonical token, returned as is;
+/// * 48 chars — the manager's display format (`SecretStore` generates 48, the
+///   last position is display-only, C1 §2.2 / contract v1.1 E1). The first 47
+///   bytes are used and the drop is logged (`warn!`), never silent. Feeding the
+///   full 48-char name to `execve()` would compare 47 bytes + NUL against a
+///   48-byte name → mismatch → rc 125 that looks like "key not deployed";
+/// * shorter than 47, longer than 48, or non-ASCII — hard error. A 49+ key is a
+///   *different* key from another ABI (the Skroot-Next mix-up); truncating it
+///   would be indistinguishable from "key rejected by the kernel".
+pub fn escalation_token(key: &str) -> Result<&str> {
     let key = key.trim();
-    match key.char_indices().nth(KERNEL_KEY_LEN) {
-        Some((idx, _)) => {
-            // 48 = 47 + the display-only position (C1 §2.2); only lengths
-            // beyond that mean two ABIs were mixed up.
-            if key.len() > KERNEL_KEY_LEN + 1 {
-                warn!(
-                    "[supercall] key is {} chars but the ABI is 47 (+1 display); using the first 47",
-                    key.len()
-                );
-            }
-            &key[..idx]
+    ensure!(
+        !key.is_empty(),
+        "no key: escalation needs the 47-char token"
+    );
+    ensure!(
+        key.is_ascii(),
+        "key is not ASCII: the 47-char ABI is [A-Za-z0-9]"
+    );
+    match key.len() {
+        KERNEL_KEY_LEN => Ok(key),
+        n if n == KERNEL_KEY_LEN + 1 => {
+            warn!(
+                "[supercall] 输入 {n} 位（管理器 48 位展示格式，第 48 位仅供展示）：按 47 字节 ABI 取前 {KERNEL_KEY_LEN}"
+            );
+            Ok(&key[..KERNEL_KEY_LEN])
         }
-        None => key,
+        n if n < KERNEL_KEY_LEN => bail!(
+            "key too short for the {KERNEL_KEY_LEN}-char ABI ({n} < {KERNEL_KEY_LEN}): \
+             内核按 47 字符比对，短串必然失配，拒绝透传"
+        ),
+        n => bail!(
+            "key is {n} bytes but the ABI is {KERNEL_KEY_LEN} (48 at most, 1 display position): \
+             疑似两套密钥 ABI 混用（Skroot-Next 48 字节无 NUL），拒绝截断"
+        ),
     }
 }
 
@@ -68,17 +95,25 @@ pub fn escalation_token(key: &str) -> &str {
 ///
 /// Returns `true` when the process is uid 0 after the attempt (including the
 /// already-root short-circuit, which never touches the key). Returns `false`
-/// on invalid/absent key — silent, matching the kernel's silent-reject
-/// behaviour; the caller may log one sanitised line.
+/// when the key cannot form a 47-byte token (length/ASCII ABI violation) or is
+/// rejected by the kernel — the kernel side is silent by design, so AP always
+/// logs exactly one sanitised line and the caller maps `false` to rc 125.
 pub fn escalate(key: &str) -> bool {
     // SAFETY: plain libc calls, no invariants beyond a valid CString.
     if unsafe { libc::getuid() } == 0 {
         return true;
     }
-    let token = escalation_token(key);
-    if token.is_empty() {
-        return false;
-    }
+    let token = match escalation_token(key) {
+        Ok(token) => token,
+        Err(e) => {
+            // Sanitised: the error carries only length/shape, never key bytes.
+            warn!("[supercall] escalation key rejected: {e}");
+            return false;
+        }
+    };
+    // The token is now exactly 47 ASCII bytes by construction (the only shape
+    // the kernel can match); keep the NUL guard for direct low-level callers.
+    debug_assert_eq!(token.len(), KERNEL_KEY_LEN);
     if token.as_bytes().contains(&0) {
         return false;
     }
@@ -124,4 +159,67 @@ pub fn privilege_apd_profile(superkey: Option<&str>) {
 pub fn is_root() -> bool {
     // SAFETY: trivially safe libc call.
     unsafe { libc::getuid() == 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(n: usize) -> String {
+        "a".repeat(n)
+    }
+
+    /// Point 4 of the key-ABI chain (docs/NEW-DOC-05 §12): whatever goes into
+    /// `execve()` must be exactly 47 bytes. 48 is the display format → 47;
+    /// everything else is a loud error, never a silent pass-through.
+    #[test]
+    fn escalation_token_is_exactly_47_or_an_error() {
+        // 47: canonical AP-side token, unchanged.
+        assert_eq!(escalation_token(&key(47)).unwrap(), key(47));
+        // 48: display position dropped, token still exactly 47 (warn! logged).
+        assert_eq!(escalation_token(&key(48)).unwrap(), key(47));
+        // Short keys used to be passed through and then fail inside the kernel
+        // (silently). They must be rejected here instead.
+        for n in [0, 1, 16, 46] {
+            assert!(
+                escalation_token(&key(n)).is_err(),
+                "{n} chars must be rejected, not passed through"
+            );
+        }
+        // 49+ = a different key from another ABI: no truncation.
+        for n in [49, 50, 96] {
+            assert!(escalation_token(&key(n)).is_err(), "{n} chars must be rejected");
+        }
+        // Non-ASCII cannot satisfy a byte-for-byte 47-char compare.
+        assert!(escalation_token(&"é".repeat(47)).is_err());
+        // Surrounding whitespace is normalised away, not counted.
+        assert_eq!(escalation_token(&format!("  {}\n", key(47))).unwrap(), key(47));
+    }
+
+    /// Points 2+3: the canonical file is 47 bytes → `SecretKey` (daemon input)
+    /// is 47 bytes → the escalation token is 47 bytes. A 48-byte file (old
+    /// manager bug / kernel format mixed in) still normalises to 47, with the
+    /// drop logged, so the chain never feeds 48 bytes to the kernel.
+    #[test]
+    fn key_file_to_escalation_token_stays_47() {
+        let path = std::env::temp_dir().join(format!("sproot-key-abi-{}", std::process::id()));
+        std::fs::write(&path, key(47)).unwrap();
+        let stored = secret::read_key_file(&path).expect("47-byte key file must load");
+        assert_eq!(stored.len(), KERNEL_KEY_LEN);
+        assert_eq!(escalation_token(stored.as_str()).unwrap(), key(47));
+
+        // 47 + NUL (kernel-inlined shape accidentally copied into the file).
+        std::fs::write(&path, format!("{}\0", key(47))).unwrap();
+        let stored = secret::read_key_file(&path).expect("47+NUL key file must still load");
+        assert_eq!(stored.len(), KERNEL_KEY_LEN);
+        assert_eq!(escalation_token(stored.as_str()).unwrap(), key(47));
+
+        // 48 alnum (old manager written file): SecretKey keeps 48, token is 47.
+        std::fs::write(&path, key(48)).unwrap();
+        let stored = secret::read_key_file(&path).expect("48-byte key file must still load");
+        assert_eq!(stored.len(), 48);
+        assert_eq!(escalation_token(stored.as_str()).unwrap(), key(47));
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

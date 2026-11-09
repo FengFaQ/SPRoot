@@ -657,11 +657,61 @@ apd --superkey-file /data/adb/sproot/key daemon
 >
 > **发布候选构建要求（R16）**：`libapd.so` 必须来自 `--no-default-features` 的**许可干净构建**（依赖树无 UNKNOWN 项），否则即便 LIC 门禁通过也不得发布；默认构建产物仅供开发/日常使用。`release.yml` 需在候选来源上人工确认（engine 再许可开关同理）。
 
+## 12. 密钥 ABI 全链一致性（静态核对，2026-11-09，apd-dev 落实）
+
+> 背景：HANDOFF §6.8 的第 1/2 条静默错误（rc 路径漂移、clap 参数序）本质都是「同一份密钥在链上被不同层用不同口径解释」。密钥**长度**是第二个同类坑：**历史上 App 生成 48 字符、内核只存 47 字符**（客户端已于 2026-11-09 `5ed19c6` 统一为 47 字符）。任何一环把长度理解错，后果都是「提权静默失败 → 看起来像密钥没部署」（rc 125）。本节把全链五处的长度口径钉死，并在 `apd` 内用单测 + 编译期断言锁住第 1~4 处。
+
+### 12.1 三条不可混淆的事实
+
+| # | 事实 | 长度 | 形态 | 证据 |
+|---|---|---|---|---|
+| **F1** | AP 侧密钥文件 `/data/adb/sproot/key` | **47 字节** | 纯文本、**无 NUL**、无换行，0600 | `apd/src/defs.rs:54`；`apd/src/deploy.rs::write_key_file` |
+| **F2** | 内核 shellcode 内嵌密钥 | **47 字节 + NUL**（48 字节槽位，第 48 字节恒 0） | 编译进跳板的 `ROOT_KEY_LEN` 缓冲 | `engine/src/patch_do_execve.cpp:73-100`；`engine/src/skroot_patch_main.cpp:618-623` |
+| **F3** | 引擎 `--key` 入参 | **48 字符 `[A-Za-z0-9]`**（`--key-abi=47nul` 是唯一支持值） | CLI 参数；写内核时取 `key[0:47] + '\0'` | `engine/src/skroot_patch_main.cpp:61-64,105-107,434-447,470` |
+
+**推论（最关键）**：内核 hook 把 `execve` 的 filename 与 F2 **逐字节比对且以 NUL 结束**。所以 **提权时 `execve` 的文件名必须恰好是 47 字符**：若客户端拿完整 48 字符去 `execve`，内核读到第 48 字节是 NUL、而文件名第 48 字节非 NUL → **必然失配 → `ENOENT` → 静默失败（表现为 125「密钥无效」）**。契约 v1.1 §8 已定 `apd root-exec` 是唯一 root 入口，客户端**不得自行 `execve` 密钥**。
+
+### 12.2 五处口径核对表
+
+| # | 环节 | 代码位置 | 输入 → 输出 | 一致性 |
+|---|---|---|---|---|
+| 1 | deploy 归一 | `apd/src/deploy.rs::abi_key()` | 47 原样；48（展示位，末字节须 NUL/空白/`[A-Za-z0-9]`）→ 前 47 且 `warn!`；49+ / <47 / 非 `[A-Za-z0-9]` → `bail!` | ✅ |
+| 2 | 落盘字节 | `apd/src/deploy.rs::key_material()` / `write_key_file()` | 只接受**恰好 47** 字节；`[..47]` 式截断已删除（否则会写出与内核 token 不符的密钥）；tmp→0600→fsync→rename 原子；写后擦内存副本 | ✅（`deploy` 的 smoke_check 再断言 `len==47 && 无 NUL && mode==0600`） |
+| 3 | daemon 读取 | `apd/src/secret.rs::read_key_file()` → `SecretKey` | 读文件后丢弃空白/NUL（兼容误写的 47+NUL）；canonical 文件即 47 → `SecretKey::len()==47`；48（旧管理器写法的文件）保留 48，交给第 4 处归一 | ✅ |
+| 4 | 提权 execve | `apd/src/supercall.rs::escalation_token()` | 47 原样；48 → 前 47 且 `warn!`；**<47 / >48 / 非 ASCII → `Err`**（不再静默透传），`escalate()` 记一条脱敏日志后返回 `false` | ✅（本次新增，**提权成败最后一环**） |
+| 5 | 引擎嵌入 | `engine/src/skroot_patch_main.cpp` | `--key` 必须 48 字符 alnum；嵌入取 `key[0:47] + NUL`；`--key-abi` 仅接受 `47nul`，其余一律 E101 | ⏳ engine-dev 回执（静态读码一致，证据 F3） |
+
+**客户端侧口径（`5ed19c6`，2026-11-09）**：`SecretStore.KEY_LENGTH = 47`，生成/存储/`ApdClient` 传输一律 47 并严格校验；唯一例外是调引擎时用 `engineKeyOf()` 把 47 补位到 48（第 48 位被引擎 `erase` 丢弃，见 F3）。因此上表第 1 行的「48 兼容」分支现仅服务**历史 48 字符旧密钥文件/旧 APK**，正常路径不再触发。
+
+### 12.3 断言（随 CI 编译的单元测试）
+
+| 断言 / 测试 | 钉住的点 | 负样本（先证伪再交付） |
+|---|---|---|
+| `deploy::tests::abi_key_accepts_exactly_47` | 1 | — |
+| `deploy::tests::abi_key_maps_48_and_47_plus_nul_to_47` | 1（48 / 47+NUL 归一为 47；48th 非 NUL/空白/alnum 报错） | 若改成「48 一律报错」→ 该测试 FAIL，且历史 48 字符密钥/旧 APK 的部署被打断 |
+| `deploy::tests::abi_key_rejects_49_short_and_symbols` | 1+2 | 把 `key_material` 改回 `[..47]` 截断 → **FAIL**（实测） |
+| `deploy::tests::rc_template_matches_defs_and_writer_path` | 起链 rc / defs / 写入路径三方 | 把 rc 参数序改成 `daemon --superkey-file …` → **FAIL**（实测） |
+| `supercall::tests::escalation_token_is_exactly_47_or_an_error` | 4 | 把短密钥改回「原样透传」→ **FAIL**（实测） |
+| `supercall::tests::key_file_to_escalation_token_stays_47` | 2+3+4（47 字节文件 → SecretKey 47 → token 47；47+NUL 兼容；48 文件 → token 47） | 链上任一处口径不一致即 FAIL |
+| 编译期 `const _: () = assert!(KERNEL_KEY_LEN == 47);` | 4（ABI 常量） | 改常量而不重打内核 → **编译失败**，强制走全链评审 |
+
+### 12.4 剩余待办 / 风险
+
+1. ~~**ui-client 48 → 47**~~：**已完成**（`5ed19c6`，2026-11-09）：`SecretStore.KEY_LENGTH = 47`，生成/存储/apd 传输统一 47；仅调引擎 `--key` 时用 `engineKeyOf()` 补位 48（被引擎丢弃）。`apd` 的 48 兼容分支保留作为**历史文件/旧 APK 兜底**，正常路径不再触发；待历史密钥全部重生成后可收窄为「仅 47」。
+2. **engine-dev**：F3 需回执确认（尤其 `--key-abi` 拒绝分支与被嵌入的 `key[0:47]` 偏移）；若 patcher 把 `--key` 直接改成收 47（去掉 `erase`），客户端需删掉 `engineKeyOf()` 补位，本节 F3 同步修订。
+3. **禁止路径**：任何客户端/脚本不得自行 `execve(密钥)`（契约 v1.1 §8）；唯一条入口是 `apd root-exec`。若未来出现直连需求，必须先经过本节第 4 处的同一归一口径。
+4. **变更纪律**：改 `KERNEL_KEY_LEN`、rc 的 `--superkey-file` 路径、`defs::SPROOT_KEY_FILE` 任意一者，都按「全链 ABI 变更」处理：重打内核 + 重新修补 + 同步客户端，并更新本节。
+
+### 12.5 核对结论
+
+五处静态核对**全部一致**（唯一待回执项是第 5 处引擎侧，静态读码一致）。`apd` 侧第 1~4 处由 6 条新增单测（全仓 7 条全绿）+ 1 条编译期断言锁死，且每条新增断言都用负样本证明过会 FAIL。本节与 `docs/HANDOFF-2026-11-08.md` §6.7/§6.8、`docs/NEW-DOC-01` §3.5.4 互为索引。
+
 ## 附录 A · 证据索引（本文所有结论的源码/文档出处）
 
 | 结论 | 出处 |
 |---|---|
 | 提权=execve(47 字符)，成功看 getuid()==0 | `engine/src/patch_do_execve.cpp:76-98,113-135`；`engine/src/skroot_patch_main.cpp:312-317`；`docs/SPROOT-DOC-A1` §4.1/§4.3 |
+| **密钥 ABI 全链（AP 文件 47 / 内核 47+NUL / 引擎 48→47+NUL / execve 必须 47）** | **§12**；`apd/src/deploy.rs::{abi_key,key_material}`；`apd/src/secret.rs::read_key_file`；`apd/src/supercall.rs::escalation_token`；`engine/src/skroot_patch_main.cpp:61-64,105-107,434-447,618-623` |
 | 隐藏目录名=key[0:16]、filldir 双路隐藏 | `engine/src/patch_filldir64.cpp:52-62`；A1 §4.2/§4.4 |
 | AP 侧提权实现已就位 | `app/apd/src/supercall.rs:42-83` |
 | 授权表用户态化（flock/单写者/tmp+rename/保护 uid） | `app/apd/src/auth_list.rs:27-149`；`app/apd/src/package.rs:13-21,127-185,241-330` |
@@ -697,3 +747,4 @@ apd --superkey-file /data/adb/sproot/key daemon
 ---
 
 *版本：v1.2（2026-11-08 夜间自主令，sys-guard）。v1.1 → v1.2：① `module list --json` / `selftest --json` schema 定稿（与 app-client 对齐）；② 新增 §11 发布门禁（release.yml）；③ P2 收尾记录（AGPL/许可清单/实测体积）。历史：v1.1（2026-11-08，sys-guard）。v1.0 草案 → v1.1：① 契约 v1.1 已三方会签并**冻结（2026-11-08 21:23 +08，TBD-10 关闭）**；② 补入 §2.2「修补链 ≠ 特权链」边界铁律；③ §7 backlog P0 进入实施（交叉编译链依赖 CI）。下一交付：P0 代码落地 + host `cargo check` 通过记录。*
+*版本补充：v1.3（2026-11-09，apd-dev）：新增 §12「密钥 ABI 全链一致性」（五处口径静态核对 + 6 条新断言，逐条以负样本证伪）；`supercall::escalation_token()` 改为返回 `Result`（<47 / >48 / 非 ASCII 硬报错，不再静默透传；48 归一到 47 并告警）。*
