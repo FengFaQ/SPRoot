@@ -26,6 +26,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -63,6 +64,7 @@ import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CardDefaults
 import top.yukonga.miuix.kmp.basic.Icon
+import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.LinearProgressIndicator
 import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
 import top.yukonga.miuix.kmp.basic.Scaffold
@@ -71,6 +73,7 @@ import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.basic.TopAppBar
 import top.yukonga.miuix.kmp.blur.layerBackdrop
 import top.yukonga.miuix.kmp.icon.MiuixIcons
+import top.yukonga.miuix.kmp.icon.extended.Back
 import top.yukonga.miuix.kmp.icon.extended.Copy
 import top.yukonga.miuix.kmp.icon.extended.ExpandLess
 import top.yukonga.miuix.kmp.icon.extended.ExpandMore
@@ -109,6 +112,7 @@ import top.yukonga.miuix.kmp.utils.scrollEndHaptic
 fun PatchPager(
     bottomInnerPadding: Dp = 0.dp,
     isCurrentPage: Boolean = true,
+    onBack: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val state = PatchPipeline.uiState.value
@@ -120,6 +124,13 @@ fun PatchPager(
     var showKey by remember { mutableStateOf(false) }
     var showErrorDetail by remember { mutableStateOf(true) }
     var showResetConfirm by remember { mutableStateOf(false) }
+    // 上次成功的产物（来自 InstallState）：用于「已修补 → 查看产物/刷入指引」入口
+    var installSnap by remember { mutableStateOf(InstallState.load(context)) }
+    LaunchedEffect(isCurrentPage, state.stage) {
+        if (isCurrentPage || state.stage == PatchStage.DONE) {
+            installSnap = InstallState.load(context)
+        }
+    }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         if (uri == null) {
@@ -166,7 +177,16 @@ fun PatchPager(
             BlurredBar(backdrop) {
                 TopAppBar(
                     color = barColor,
-                    title = "修补",
+                    title = "修补内核 / 自启注入",
+                    navigationIcon = {
+                        IconButton(onClick = onBack) {
+                            Icon(
+                                imageVector = MiuixIcons.Back,
+                                contentDescription = "返回主页",
+                                tint = colorScheme.onSurface,
+                            )
+                        }
+                    },
                     scrollBehavior = scrollBehavior,
                 )
             }
@@ -199,13 +219,21 @@ fun PatchPager(
                         )
                         if (state.sourceUri != null && state.initBootSourceUri == null) {
                             WarningCard(
-                                message = "未选择 init_boot.img：将无法注入开机自启" +
-                                    "（本机 ramdisk 可能位于 init_boot，例如魅族 21）",
+                                message = "未选择 init_boot.img：无法注入自启脚本" +
+                                    "（本机 ramdisk 可能位于 init_boot，例如魅族 21；不影响内核修补产物）",
                                 level = WarningLevel.Notice,
                             )
                         }
                         ModeCard(state = state)
                         ProgressCard(state = state, onStart = { PatchPipeline.start(context) })
+                        if (state.stage != PatchStage.DONE && installSnap.artifacts.isNotEmpty()) {
+                            PreviousProductsCard(
+                                snapshot = installSnap,
+                                onCopyCommand = { cmd ->
+                                    context.copyToClipboard("刷入命令", cmd)
+                                },
+                            )
+                        }
                         if (state.hasError) {
                             ErrorCard(
                                 state = state,
@@ -250,9 +278,9 @@ private fun SelectImageCard(
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
         BasicComponent(
-            title = "选择 boot.img",
+            title = "1 · 选择 boot.img（修补内核）",
             summary = state.sourceName
-                ?: "必须是本机 boot.img（Android boot image）；kernel 本体/压缩包会被拒绝",
+                ?: "为内核打提权补丁（kallsyms → hook → shellcode → 密钥）；必选，kernel 本体/压缩包会被拒绝",
             onClick = onPick,
             startAction = {
                 Icon(
@@ -264,9 +292,10 @@ private fun SelectImageCard(
             },
         )
         BasicComponent(
-            title = "选择 init_boot.img（可选，强烈建议）",
+            title = "2 · 选择 init_boot.img（可选 · 注入自启脚本）",
             summary = state.initBootSourceName
-                ?: "ramdisk 在 init_boot 的机型（如魅族 21）必须选它，否则开机自启无法注入",
+                ?: "init_boot 里只有 generic ramdisk、没有 kernel，不做内核修补；这里只注入 init.sproot.rc，" +
+                "让 AP daemon 开机自启（ramdisk 在 init_boot 的机型如魅族 21 必须选）",
             onClick = onPickInitBoot,
             startAction = {
                 Icon(
@@ -486,22 +515,23 @@ private fun SuccessCard(
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp)) {
             Text(
-                text = "修补完成（产物已导出）",
+                text = "内核修补 / 自启注入完成（产物已导出）",
                 fontSize = MiuixTheme.textStyles.headline1.fontSize,
                 fontWeight = FontWeight.Medium,
                 color = colorScheme.onSurface,
             )
             Text(
                 text = if (state.initBootOutputPath != null) {
-                    "导出了 ≠ 刷进去了：boot + init_boot 两个产物都要刷（见下方指引）；刷入后回到本页标记状态"
+                    "boot.img 已修补内核（提权能力），init_boot.img 已注入自启脚本（AP 开机自启）；" +
+                        "两个产物都要刷（见下方指引），刷入后回到本页标记状态"
                 } else {
-                    "导出了 ≠ 刷进去了：请按下方指引手动刷入；刷入后回到本页标记状态"
+                    "boot.img 已修补内核（提权能力）；未包含自启注入产物。导出了 ≠ 刷进去了，请按指引手动刷入"
                 },
                 fontSize = 13.sp,
                 color = colorScheme.onSurfaceVariantSummary,
             )
             Spacer(Modifier.height(8.dp))
-            KeyValueRow("产物", state.outputPath!!, monospace = true)
+            KeyValueRow("内核修补产物（boot.img）", state.outputPath!!, monospace = true)
             KeyValueRow("大小", Capabilities.formatBytes(state.outputBytes), monospace = true)
             KeyValueRow("sha256", state.outputSha256 ?: "—", monospace = true)
             KeyValueRow(
@@ -531,9 +561,9 @@ private fun SuccessCard(
             }
             state.initBootOutputPath?.let { initPath ->
                 Spacer(Modifier.height(6.dp))
-                KeyValueRow("init_boot 产物", initPath, monospace = true)
-                KeyValueRow("init_boot 大小", Capabilities.formatBytes(state.initBootBytes), monospace = true)
-                KeyValueRow("init_boot sha256", state.initBootOutputSha256 ?: "—", monospace = true)
+                KeyValueRow("自启注入产物（init_boot.img）", initPath, monospace = true)
+                KeyValueRow("自启注入产物大小", Capabilities.formatBytes(state.initBootBytes), monospace = true)
+                KeyValueRow("自启注入产物 sha256", state.initBootOutputSha256 ?: "—", monospace = true)
             }
             state.reportPath?.let { KeyValueRow("引擎报告", it, monospace = true) }
             state.backupSha1?.let { KeyValueRow("原镜像备份", "sha1=$it", monospace = true) }
@@ -567,6 +597,67 @@ private fun SuccessCard(
 }
 
 /**
+ * 上次成功的产物（从 [InstallState] 读取）。
+ *
+ * 人类指令（2026-11-10）：修补页不再独立成 Tab，而是从主页进入。
+ * 已修补/已刷入的用户进来后应直接看到**产物 + 刷入指引**（KSU 的 Home→Flash 模型），
+ * 而不是空白的选择镜像页。
+ */
+@Composable
+private fun PreviousProductsCard(
+    snapshot: InstallState.Snapshot,
+    onCopyCommand: (String) -> Unit,
+) {
+    val bootArtifact = snapshot.artifacts.firstOrNull { it.label == "boot" }
+    val initBootArtifact = snapshot.artifacts.firstOrNull { it.label == "init_boot" }
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                text = "已修补产物（上次成功）",
+                fontSize = MiuixTheme.textStyles.headline1.fontSize,
+                fontWeight = FontWeight.Medium,
+                color = colorScheme.onSurface,
+            )
+            Text(
+                text = "当前状态：${snapshot.status.label} · ${snapshot.updatedAtText}",
+                fontSize = 12.sp,
+                color = colorScheme.onSurfaceVariantSummary,
+            )
+            snapshot.artifacts.forEach { artifact ->
+                KeyValueRow(
+                    label = if (artifact.label == "init_boot") {
+                        "自启注入产物（init_boot.img）"
+                    } else {
+                        "内核修补产物（boot.img）"
+                    },
+                    value = artifact.displayPath,
+                    monospace = true,
+                )
+                KeyValueRow("sha256", artifact.sha256, monospace = true)
+            }
+            snapshot.note?.let {
+                Text(
+                    text = "备注：$it",
+                    fontSize = 12.sp,
+                    color = colorScheme.onSurfaceVariantSummary,
+                )
+            }
+            val bootPath = bootArtifact?.displayPath ?: snapshot.artifactDisplayPath
+            if (bootPath != null) {
+                Spacer(Modifier.height(8.dp))
+                FlashGuide(
+                    bootPath = bootPath,
+                    initBootPath = initBootArtifact?.displayPath,
+                    onCopy = onCopyCommand,
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            TwoLevelStatus()
+        }
+    }
+}
+
+/**
  * 刷入指引 —— 版式照抄 FlashMiuix 的命令卡：等宽命令 + 复制按钮。
  * AVB 结论（NEW-DOC-04 §4.4）：三家实现都不碰 AVB 密码学，只刷 boot、不碰 vbmeta。
  */
@@ -577,9 +668,9 @@ private fun FlashGuide(bootPath: String, initBootPath: String?, onCopy: (String)
     val commands = buildList {
         add("进入 bootloader" to "adb reboot bootloader")
         add("查看当前槽位（A/B 机型）" to "fastboot getvar current-slot")
-        add("① 刷入 boot（双槽都刷）" to "fastboot flash --slot=all boot $bootName")
+        add("① 刷入 boot（内核修补，双槽都刷）" to "fastboot flash --slot=all boot $bootName")
         if (initBootName != null) {
-            add("② 刷入 init_boot（双槽都刷；自启 rc 在这里）" to "fastboot flash --slot=all init_boot $initBootName")
+            add("② 刷入 init_boot（自启脚本注入，双槽都刷）" to "fastboot flash --slot=all init_boot $initBootName")
         }
         add("重启" to "fastboot reboot")
     }
@@ -593,9 +684,9 @@ private fun FlashGuide(bootPath: String, initBootPath: String?, onCopy: (String)
         Column(modifier = Modifier.padding(16.dp)) {
             Text(
                 text = if (initBootPath != null) {
-                    "刷入指引（boot + init_boot 两个产物都要刷，按①→②顺序；不碰 vbmeta）"
+                    "刷入指引（boot=内核修补、init_boot=自启注入；两个都要刷，按①→②顺序；不碰 vbmeta）"
                 } else {
-                    "刷入指引（只刷 boot 分区，不碰 vbmeta）"
+                    "刷入指引（只刷 boot 分区 = 内核修补；不碰 vbmeta）"
                 },
                 fontSize = 15.sp,
                 fontWeight = FontWeight.Medium,

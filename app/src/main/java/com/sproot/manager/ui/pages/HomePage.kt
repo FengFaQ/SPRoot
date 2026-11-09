@@ -177,7 +177,7 @@ fun HomePager(
                             refreshing = refreshing,
                             onRefresh = refresh,
                         )
-                        NextStepCard(onGoPatch = onGoPatch)
+                        NextStepCard(snapshot = snapshot, onGoPatch = onGoPatch)
                         Spacer(Modifier.height(bottomInnerPadding))
                     }
                 }
@@ -362,6 +362,25 @@ private fun StatusCard(snapshot: HomeSnapshot, onClick: () -> Unit) {
                         fontSize = 13.sp,
                         maxLines = 2,
                     )
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        text = when (status) {
+                            InstallState.Status.PATCHED_PENDING_FLASH,
+                            InstallState.Status.FLASHED_PENDING_REBOOT,
+                            InstallState.Status.ACTIVE,
+                            -> "点击查看产物与刷入指引"
+                            else -> "点击进入修补内核流程"
+                        },
+                        fontSize = 12.sp,
+                        color = content.copy(alpha = 0.75f),
+                    )
+                    if (snapshot.install.artifacts.size > 1) {
+                        Text(
+                            text = "产物：内核修补（boot）+ 自启注入（init_boot）",
+                            fontSize = 12.sp,
+                            color = content.copy(alpha = 0.75f),
+                        )
+                    }
                 }
             }
         }
@@ -527,14 +546,26 @@ private fun CapabilityCard(
     }
 }
 
-/** 下一步引导：照 KSU 的 `ArrowPreference` 入口卡（右侧箭头由组件自带）。 */
+/**
+ * 下一步引导：照 KSU 的 `ArrowPreference` 入口卡（右侧箭头由组件自带）。
+ *
+ * 人类指令（2026-11-10）：修补页不独立成 Tab，Home 是唯一入口。
+ *  - 未修补 → 「修补内核（boot.img）」
+ *  - 已修补 → 「查看产物与刷入指引」
+ */
 @Composable
-private fun NextStepCard(onGoPatch: () -> Unit) {
+private fun NextStepCard(snapshot: HomeSnapshot, onGoPatch: () -> Unit) {
+    val hasArtifact = snapshot.install.artifacts.isNotEmpty() ||
+        snapshot.install.artifactDisplayPath != null
     Card(modifier = Modifier.fillMaxWidth()) {
         ArrowPreference(
-            title = "去修补 boot.img",
-            summary = "选择本机 boot.img → 进程内修补 → 导出可刷产物（全程无需 root）；" +
-                "产物与刷入指引都在修补页",
+            title = if (hasArtifact) "查看产物与刷入指引" else "修补内核（boot.img）",
+            summary = if (hasArtifact) {
+                "上次修补的内核补丁产物与 fastboot 刷入指引都在这里；刷入后回到本页标记状态"
+            } else {
+                "选择本机 boot.img → 进程内修补内核（提权）→ 可选注入 init_boot 自启脚本 → " +
+                    "导出可刷产物（全程无需 root）"
+            },
             onClick = onGoPatch,
         )
     }

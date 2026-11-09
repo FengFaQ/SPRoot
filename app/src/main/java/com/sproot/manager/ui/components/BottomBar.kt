@@ -29,7 +29,6 @@ import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Home
 import top.yukonga.miuix.kmp.icon.extended.Layers
 import top.yukonga.miuix.kmp.icon.extended.Settings
-import top.yukonga.miuix.kmp.icon.extended.Update
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.utils.springAnimateToPage
 
@@ -95,10 +94,15 @@ fun rememberMainPagerState(
     }
 }
 
-/** 底部导航目的地（页面映射：Home→主页 / Install+Flash→修补 / Module→模块 / Settings→设置）。 */
+/**
+ * 底部导航目的地（3 项）。
+ *
+ * 人类指令（2026-11-10）：「修补页面不应该独立出来，将修补页面集成在点击主页未修补后跳转」。
+ * 因此修补/刷入是**主页触发的二级页**（KSU 的 Home→Install/Flash 模型），不是独立 Tab。
+ */
 enum class BottomBarDestination(val label: String, val icon: ImageVector) {
     Home("主页", MiuixIcons.Home),
-    Patch("修补", MiuixIcons.Update),
+
     Module("模块", MiuixIcons.Layers),
     Setting("设置", MiuixIcons.Settings),
 }

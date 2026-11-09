@@ -87,10 +87,12 @@ object PatchPipeline {
     }
 
     /**
-     * P2 双镜像：选择可选的 init_boot.img。
+     * P2 双产物：选择可选的 init_boot.img —— **只用于注入自启脚本，不做内核修补**。
      *
-     * 为什么需要它：魅族 21 等机型的 ramdisk 在 init_boot 分区（boot 的 ramdisk_size=0），
-     * 只修 boot 时 rc 注入只能记 no_ramdisk → AP 永远无法开机自启。
+     * 事实（人类核实，2026-11-10）：Android 13+ 的 init_boot 分区里只有 generic ramdisk、
+     * **没有 kernel**；SP 的修补是纯内核字节补丁（kallsyms→hook→shellcode→密钥），
+     * 因此 init_boot 无可修补之物。它唯一的作用是承载 ramdisk，让我们把 `init.sproot.rc`
+     * 注入进去，使 AP daemon 开机自启（魅族 21 的 boot.ramdisk_size=0，ramdisk 在 init_boot）。
      */
     fun selectInitBootInput(uri: Uri?, displayName: String?) {
         val current = state.value
@@ -174,7 +176,7 @@ object PatchPipeline {
     private fun execute(context: Context, sourceUri: Uri) {
         var workDir: File? = null
         var rcResult: RcInject.Result? = null
-        // P2 双镜像：init_boot 产物与 rc 注入归属
+        // P2 双产物：init_boot = 自启脚本注入产物（无内核修补）；boot = 内核修补产物
         var initBootProduct: Exporter.Exported? = null
         var initBootSha: String? = null
         var initBootBytesOut = 0L
@@ -408,13 +410,15 @@ object PatchPipeline {
                 return
             }
 
-            // ---------- ⑥.4 P2：init_boot.img 修补（ramdisk 的权威落点，D-12） ----------
-            // 真机（魅族 21）：boot 的 ramdisk_size=0，ramdisk 在 init_boot。
-            // 因此**双镜像输入时 init_boot 优先注入 rc**；失败/未选才回退到 boot ramdisk。
-            // 产物断言与 boot 同等严格：ramdisk 级回读（rc/import 真在最终镜像里）+ AVB-1/2/3；
+            // ---------- ⑥.4 P2：init_boot.img 自启脚本注入（ramdisk 的权威落点，D-12） ----------
+            // ⚠️ 对 init_boot **不做内核修补**（它只有 generic ramdisk、没有 kernel）：
+            //    这里只做「解包 → 注入 init.sproot.rc + init.rc import → repack → 回读 → AVB」。
+            // 真机（魅族 21）：boot 的 ramdisk_size=0，ramdisk 在 init_boot，因此 init_boot 优先注入；
+            // 失败/未选才回退到 boot ramdisk。产物断言与 boot 同等严格：
+            // ramdisk 级回读（rc/import 真在最终镜像里）+ AVB-1/2/3；
             // 任一失败即中止，且**不导出任何产物**（不允许"一半成功"的半成品被刷入）。
             if (!initBootUriString.isNullOrBlank()) {
-                stage(PatchStage.REPACK, 82f, "解包 init_boot.img（自启注入权威落点）")
+                stage(PatchStage.REPACK, 82f, "注入自启脚本：解包 init_boot.img")
                 val initWork = File(workDir, "init_boot").apply {
                     check(mkdirs() || isDirectory) { "无法创建 init_boot 工作目录：${absolutePath}" }
                 }
@@ -485,14 +489,14 @@ object PatchPipeline {
                 val initPatched = File(initWork, "init_boot_patched.img")
                 initNew.copyTo(initPatched, overwrite = true)
 
-                // 回读（T-12 等价）：rc 必须真的在最终 init_boot 镜像的 ramdisk 里
+                // 回读断言（kernel 级 T-12 的 ramdisk 等价物）：rc 必须真的在最终 init_boot 镜像里
                 if (initBootRcInjected) {
                     val rcVerify = RcInject.verifyProduct(context, initPatched, initWork)
                     if (!rcVerify.ok) {
                         finishFailure(
-                            "init_boot 回读校验失败（rc 未进最终镜像，T-12）",
+                            "自启注入回读校验失败（rc 未进最终 init_boot 镜像）",
                             rcVerify.detail + "\n\n已中止，未导出任何产物。工作目录：" + (workDir?.absolutePath ?: "—"),
-                            "T-12",
+                            "RC-VERIFY",
                         )
                         return
                     }
@@ -566,7 +570,7 @@ object PatchPipeline {
                 )
                 AppLog.info(
                     TAG,
-                    "init_boot 产物就绪：sha256=$initBootSha size=$initBootBytesOut rc_injected=$initBootRcInjected",
+                    "自启注入产物就绪（init_boot.img）：sha256=$initBootSha size=$initBootBytesOut rc_injected=$initBootRcInjected",
                 )
             } else {
                 AppLog.warn(
@@ -786,7 +790,8 @@ object PatchPipeline {
                 TAG,
                 "产物就绪：${exported.displayPath} size=${newBoot.length()} sha256=$outSha",
             )
-            // P2：init_boot 产物（与 boot 同批导出；此前任一校验失败都已中止，不会只出一半）
+            // P2：自启注入产物 init_boot（与内核修补产物 boot 同批导出；
+            // 此前任一校验失败都已中止，不会只出一半）
             if (initBootUriString.isNullOrBlank()) {
                 state.value = state.value.copy(initBootOutputPath = null)
             } else {
@@ -805,7 +810,7 @@ object PatchPipeline {
                 state.value = state.value.copy(initBootOutputPath = initBootProduct.displayPath)
                 AppLog.info(
                     TAG,
-                    "init_boot 产物就绪：${initBootProduct.displayPath} size=$initBootBytesOut sha256=$initBootSha",
+                    "自启注入产物就绪：${initBootProduct.displayPath} size=$initBootBytesOut sha256=$initBootSha",
                 )
             }
 
@@ -814,7 +819,7 @@ object PatchPipeline {
             state.value = state.value.copy(
                 stage = PatchStage.DONE,
                 progress = 1f,
-                phase = "修补完成，产物已导出",
+                phase = "内核修补 / 自启注入完成，产物已导出",
                 running = false,
                 outputPath = exported.displayPath,
                 outputSha256 = outSha,

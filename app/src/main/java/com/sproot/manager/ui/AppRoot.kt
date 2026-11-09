@@ -36,21 +36,25 @@ import com.sproot.manager.ui.theme.ThemePrefs
 import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.blur.layerBackdrop
 
-/** 主分页数量（主页 / 修补 / 模块 / 设置）。 */
+/** 主分页数量（主页 / 模块 / 设置）。修补/刷入是主页触发的二级页，不是 Tab。 */
 private object MainPagerConfig {
-    const val PAGE_COUNT = 4
+    const val PAGE_COUNT = 3
 }
 
 /**
  * 应用根 —— 骨架照抄 KernelSU `ui/MainActivity.kt` 的 miuix 分支：
  *
  * ```
- * MiuixTheme(ThemeController)                         ← ui/theme/MiuixTheme.kt
- *  ├─ 关于页（二级页面：BackHandler + 全屏 AboutPager）  ← 对应 KSU 的 Route.About
- *  └─ Scaffold(bottomBar = BlurredBar(NavigationBar))  （或分屏 SideRail）
- *      └─ HorizontalPager(4 页)                        ← 手势横滑 + 底栏联动
- *          └─ 每页自带 Scaffold + BlurredBar(TopAppBar) ← 与 KSU 页面结构一致
+ * MiuixTheme(ThemeController)                          ← ui/theme/MiuixTheme.kt
+ *  ├─ 关于页（二级页面：BackHandler + 全屏 AboutPager）   ← KSU Route.About
+ *  ├─ 修补/刷入页（二级页面：主页触发）                   ← KSU Home→Install/Flash 模型
+ *  └─ Scaffold(bottomBar = BlurredBar(NavigationBar))   （或分屏 SideRail）
+ *      └─ HorizontalPager(3 页：主页/模块/设置)          ← 手势横滑 + 底栏联动
+ *          └─ 每页自带 Scaffold + BlurredBar(TopAppBar)  ← 与 KSU 页面结构一致
  * ```
+ *
+ * 人类指令（2026-11-10）：修补页不独立成 Tab —— 由主页状态卡进入（未修补→修补内核流程；
+ * 已修补→产物/刷入指引），与 KSU "Home 是唯一入口" 一致。
  *
  * 去掉的 KSU 复杂度（均为与 miuix 版式无关的业务能力）：
  * Material/Miuix 双模式、浮动底栏、导航角标、Navigation3 全量路由。
@@ -62,13 +66,21 @@ fun AppRoot(modifier: Modifier = Modifier) {
     val context = LocalContext.current
     var appSettings by remember { mutableStateOf(ThemePrefs.load(context)) }
     var showAbout by rememberSaveable { mutableStateOf(false) }
+    var showPatch by rememberSaveable { mutableStateOf(false) }
 
     SPRootTheme(appSettings = appSettings) {
-        if (showAbout) {
-            BackHandler(enabled = true) { showAbout = false }
-            AboutPager(onBack = { showAbout = false })
-        } else {
-            MainScreen(
+        when {
+            showPatch -> {
+                BackHandler(enabled = true) { showPatch = false }
+                PatchPager(onBack = { showPatch = false })
+            }
+
+            showAbout -> {
+                BackHandler(enabled = true) { showAbout = false }
+                AboutPager(onBack = { showAbout = false })
+            }
+
+            else -> MainScreen(
                 modifier = modifier,
                 appSettings = appSettings,
                 onSettingsChange = { next ->
@@ -77,6 +89,7 @@ fun AppRoot(modifier: Modifier = Modifier) {
                     ThemePrefs.saveKeyColor(context, next.keyColor)
                 },
                 onOpenAbout = { showAbout = true },
+                onOpenPatch = { showPatch = true },
             )
         }
     }
@@ -88,6 +101,7 @@ private fun MainScreen(
     appSettings: AppSettings,
     onSettingsChange: (AppSettings) -> Unit,
     onOpenAbout: () -> Unit,
+    onOpenPatch: () -> Unit,
 ) {
     val useNavigationRail = shouldShowSplitPane()
     val pagerState = rememberPagerState(initialPage = 0) { MainPagerConfig.PAGE_COUNT }
@@ -123,15 +137,10 @@ private fun MainScreen(
                     0 -> HomePager(
                         bottomInnerPadding = bottomInnerPadding,
                         isCurrentPage = isCurrentPage,
-                        onGoPatch = { mainPagerState.animateToPage(1) },
+                        onGoPatch = onOpenPatch,
                     )
 
-                    1 -> PatchPager(
-                        bottomInnerPadding = bottomInnerPadding,
-                        isCurrentPage = isCurrentPage,
-                    )
-
-                    2 -> ModulePager(
+                    1 -> ModulePager(
                         bottomInnerPadding = bottomInnerPadding,
                         isCurrentPage = isCurrentPage,
                     )

@@ -105,8 +105,13 @@ android.newDsl=false
 ### 3.2 修补页（Patch）——本项目的核心
 自上而下：
 1. **选择镜像**：SAF `OpenDocument("*/*")` + `takePersistableUriPermission`；展示文件名/URI。
-   **P2 双镜像**：`boot.img` 必选 + `init_boot.img` 可选（强烈建议）；未选 init_boot 时页面明确提示
-   「将无法注入开机自启（本机 ramdisk 可能位于 init_boot）」，不静默跳过。
+   **P2 双产物（两种不同的事，不可混称"修补 init_boot"）**：
+   `boot.img` **修补内核**（kallsyms→hook→shellcode→密钥，获得提权能力）；
+   `init_boot.img` **注入自启脚本**（Android 13+ 的 init_boot 只有 generic ramdisk、**没有 kernel**，
+   无可修补之物；这里只注入 `init.sproot.rc` + `init.rc` import，让 AP daemon 开机自启）。
+   未选 init_boot 时页面明确提示「无法注入自启脚本（本机 ramdisk 可能位于 init_boot）」。
+   **修补页不独立成 Tab**：主页是唯一入口；未修补 → 进入内核修补流程，已修补 → 查看产物/刷入指引
+   （KSU 的 Home→Install/Flash 模型）。
 2. **修补模式**（PatchMode）：`仅导出` / `导出并给出刷入指引`；`从备份还原`、`卸载还原` 以 `enabled=false` 占位（避免"点了必然失败"）。
 3. **进度**：`阶段标题 + 阶段说明 + 百分比 + LinearProgressIndicator`；引擎进度来自 NDJSON，占 35%→72% 区间。
 4. **错误区（常驻）**：`errorTitle/errorDetail` 一经写入不自动消失，仅"重置"清除；提供「展开/收起详情」「复制全部（含日志）」「日志文件路径」。
@@ -139,9 +144,10 @@ android.newDsl=false
 5 修补        NativeEngine.patch(kernel.raw → kernel.patched, key48, json=progress.ndjson)
 6 覆盖内核    **必须**把修补结果写回 `kernel`（压缩则 compress=<fmt> kernel.patched kernel，否则直接复制）
               记录 kernel/kernel.orig/kernel.patched 三者 sha256；若 kernel == kernel.orig → T-12 中止
-6.4 init_boot（P2）  P2 双镜像：copy → 备份 → magiskboot unpack → 在 init_boot ramdisk 注入 rc
+6.4 init_boot 自启注入（P2）  **不做内核修补**（init_boot 无 kernel）：copy → 备份 → magiskboot unpack
+                   → 在 init_boot ramdisk 注入 init.sproot.rc + init.rc import
                    （D-12：init_boot 优先、boot 回退）→ repack → **ramdisk 级回读**（rc 真在最终镜像）
-                   → AVB-1/2/3 → 产物 init_boot_patched.img
+                   → AVB-1/2/3 → 产物 init_boot_patched.img（自启注入产物）
 7 重打包      magiskboot repack boot.img → new-boot.img
 7.5 回读断言 把 new-boot.img 复制到 verify/ 再 unpack（必要时再 decompress）：
               回读 kernel sha256 **必须等于** kernel.patched 且 **不等于** kernel.orig/raw，否则 T-12 中止
@@ -452,8 +458,9 @@ CI 行为（硬失败）：
 - **UI 完全照抄 KSU miuix 版**：四页骨架 + 关于页；设置项全部替换为 SPRoot 自己的 8 项；
   业务逻辑类（PatchPipeline/ApdClient/InstallState/PatchEngine/Capabilities/SecretStore/BackupStore、
   Elf/MiniJson/ModuleExitCode 等）**未改动逻辑**（P2 与 47 密钥口径属功能修复，另行记录）。
-- **P2 双镜像**：`boot.img` + `init_boot.img` → 两个产物；init_boot ramdisk 优先注入 rc；
-  两个产物分别做 ramdisk 级回读（T-12 等价）与 AVB-1/2/3；全通过才导出；
+- **P2 双产物**：`boot.img` → **内核修补产物**（kernel 级 T-12）；`init_boot.img` → **自启注入产物**
+  （ramdisk 级回读：rc + import 真在最终镜像），init_boot 无 kernel、不做内核修补；
+  两产物分别做回读断言与 AVB-1/2/3；全通过才导出；
   `InstallState.artifacts` 持久化 `products[]`。
 - **密钥口径**：本地/AP/内核 47 字符（内核 ABI 47+NUL）；引擎 `--key` 入参 48（引擎内部 erase 末位），
   由 `SecretStore.engineKeyOf()` 补位，见 §9.1。
