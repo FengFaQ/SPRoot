@@ -605,6 +605,7 @@ python3 quality/static/check_kt_imports.py
 | 2 | 42637756697 | 跨包用 Composable 漏 import；函数形参改名后调用点未同步 + 漏必填参数 | ✅ `check_kt_imports` A / `check_kt_signatures` 覆盖 |
 | 3 | 42722204812 | Compose 扩展函数 `drawIntoCanvas` 漏 import（扩展函数写在别的包） | ✅ `check_kt_imports` B 覆盖（扩展名白名单） |
 | 4 | 42721703071 | `Icons.Rounded.*` / miuix 图标名不存在或依赖已移除 | ✅ `check_kt_imports` C 全面禁用 material `Icons.*`；miuix 图标名仍需编译校验（白名单暂不含图标名） |
+| 6 | 42807799287 | Android 平台 API 存在性（`ProcessBuilder.Redirect.DISCARD` 在目标 bootClasspath 上不可用）——静态文本检查器无法判断"某个 Java/Android API 在当前 compileSdk 是否存在" | ⚠️ 边界：编译器/lint 是唯一防线；已记入 §10 边界（本次改为 `Redirect.to(/dev/null)`） |
 | 5 | 42805281686 | **本项目自有扩展函数**跨包使用却删掉了 import（`context.copyToClipboard(...)`；旧检查器只查"定义在别的包的大写类型/Composable"，漏了小写扩展） | ✅ `check_kt_imports` 新增规则 D（自动收集 `fun Receiver.name(...)`，非 private 的跨包使用必须 import）；负样本已验证 FAIL |
 
 ### 10.2 推送流程约定（硬规则）

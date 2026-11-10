@@ -135,8 +135,10 @@ object DaemonBootstrap {
             )
             AppLog.info(TAG, "启动 AP 守护（source=$source）：apd root-exec -- $DEPLOYED_DAEMON ... daemon")
             val builder = ProcessBuilder(argv)
-            builder.redirectOutput(ProcessBuilder.Redirect.DISCARD)
-            builder.redirectError(ProcessBuilder.Redirect.DISCARD)
+            // 不用 Redirect.DISCARD（API 级别不保证可用）：丢弃输出到 /dev/null
+            val devNull = File("/dev/null")
+            builder.redirectOutput(ProcessBuilder.Redirect.to(devNull))
+            builder.redirectError(ProcessBuilder.Redirect.to(devNull))
             proc = builder.start()
 
             // 轮询确认（最多 ~2.4s；daemon 首次启动要做 auth store/事件阶段）
