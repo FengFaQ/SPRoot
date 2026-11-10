@@ -21,6 +21,7 @@
 | **`--workdir` 所有权契约（2026-11-09 真机事故后）** | **显式传入 `--workdir` ⇒ 目录及内容生命周期归调用方，引擎不得删除其中任何内容；只有默认 workdir（`<out>.work`）由引擎成功收尾时回收**（§8.1）。行为证据：A9d `--self-test-workdir` 13 例矩阵（CI 必跑）+ Tier B B9 事故现场回归 / B10 默认回收正控。 |
 | **密钥 ABI 契约（P0，提权链）** | CLI `--key` **严格 48 字符**（47/49/非 alnum → E101）；内核只写 **`key[0:47]` + NUL = 48 字节**（`embed_key_bytes()`，内联断言）；`report.key_spec` 输出 `abi="47+nul"/bytes=48/last_byte_is_nul=true/input_len=48`（§7.5）。行为证据：A10 `--self-test-keyabi` 17 例（CI 必跑）+ Tier B B7。**用户态提权串必须 47 字符**。 |
 | **用户态 daemon 启动方式（2026-11-10 评估）** | SK 引擎**无任何内核态拉起用户态的能力**（`call_usermodehelper`/`kernel_thread`/`kthread_run`/`init_task` 全零命中）；KSU 亦需改 ramdisk/init_boot，APatch 靠常驻内核运行时做 init.rc 虚拟化才不需要。**选型：A（App 自引导）先落地 → B（提权时内核顺带拉起）作兜底 → C（init hook + umh）不建议**。详见 §9。 |
+| **模块卸载 umount modules（2026-11-10 评估）** | 符号可用（`path_umount`/`kern_path`/`path_put` 实测在 kallsyms），setuid hook 结构可行；但静态 shellcode 无运行时数据 → 只能「固定挂载点 + 全局」，**做不出 per-app 开关**；且模块挂载由 metamodule 决定 → 覆盖率不可控。**建议方案 ③（不做，UI 不出该开关）**；`filldir64` 只挡列目录、挡不住 `mountinfo`/`statfs`/已知路径 `open`。详见 §10。 |
 | 推荐集成 | **主形态 JNI（`libskrootpatch.so` + `System.loadLibrary("skrootpatch")`）**，次形态静态 exec（`skroot-patch` 从 `nativeLibraryDir` 真实路径 exec，**禁止** symlink 到 `filesDir`；该可执行件默认不进 APK）。 |
 | 实测编译耗时 | 全量 100+ TU，12 核并行 **18 秒**（`make objs`，见 §3.4）。 |
 | 打包工具 | **magiskboot v31.1 ARM64**（SKRoot 官方路径；988,984 B，静态 AArch64，sha256 `97e9ec75…bb54`），CI 内固定版本+哈希校验并随 artifact 分发；自研 bootimg 保留为交叉校验/回退（§7）。**禁止 AIK**。 |
@@ -133,7 +134,7 @@ $NDKB/aarch64-linux-android29-clang++ -shared -static-libstdc++ -Wl,-soname,libs
 llvm-strip --strip-all <build>/jni/libskrootpatch.so
 ```
 
-**asmjit / capstone 如何编**：两者都是**源码内编**（非预编译库），asmjit 只编 `asmjit/arm/*` + `asmjit/core/*`（**裁掉 x86 后端可省 ~200 KB**，当前 Makefile 仍包含 x86 源，见 §11-R3），capstone 只编 `arch/AArch64` + 公共 `cs.c/MC*.c/SStream.c/utils.c/Mapping.c`。两者与目标架构无关（asmjit 是「生成 arm64 机器码」，capstone 是「反汇编 arm64」），可在任意宿主上交叉编译，实测 0 报错（仅 263 处 `-Wunused-function` 类告警）。
+**asmjit / capstone 如何编**：两者都是**源码内编**（非预编译库），asmjit 只编 `asmjit/arm/*` + `asmjit/core/*`（**裁掉 x86 后端可省 ~200 KB**，当前 Makefile 仍包含 x86 源，见 §12-R3），capstone 只编 `arch/AArch64` + 公共 `cs.c/MC*.c/SStream.c/utils.c/Mapping.c`。两者与目标架构无关（asmjit 是「生成 arm64 机器码」，capstone 是「反汇编 arm64」），可在任意宿主上交叉编译，实测 0 报错（仅 263 处 `-Wunused-function` 类告警）。
 
 ### 3.3 产物与校验（实测）
 
@@ -769,7 +770,190 @@ init_boot.img: ramdisk=2,131,370 B     ← rc 只能注进这里
 3. **C 不做**；若未来确实要实现“免 ramdisk 且开机自启”，应单独立项评估 **C′（rc 虚拟化）**——需明确“引入常驻内核运行时”这一架构变更，并做许可与真机风险双重评审，**不要**以“加个 hook”的名义低估工程量。
 4. **对外口径**：「我们要修 init_boot」的准确表述是——**本机 ramdisk 在 init_boot（GKI 布局），而我们的守护自启走 ramdisk rc（KSU 走 ramdisk `/init`，同一层级）**；APatch 不需要 ramdisk 是因为它有常驻内核运行时做 rc 虚拟化，不是因为我们漏了什么。
 
-## 10. 包体与体积
+## 10. 模块卸载（umount modules）可行性评估（2026-11-10）
+
+> **本节结论先行**：
+> 1. **符号可用**：`path_umount` / `kern_path` / `path_put` 在真机 kallsyms 中全部可解析（实测地址见 §10.1），`do_umount`/`ksys_umount` 不存在（已内联）——与 KSU 依赖同一原语。
+> 2. **setuid hook 结构可行**：Android 应用降权走 `__sys_setresuid`（zygote `SpecializeCommon`），**不应 hook `commit_creds`**（调用面过广且可能在加锁/原子上下文，`path_umount` 会睡眠）。
+> 3. **但能力受限**：静态 shellcode 模型**没有运行时数据**，做不出 KSU 的「allowlist + 运行时记录挂载点」语义 → 最简可行只能是「**固定挂载点 + 全局（所有非 root 进程都卸）**」。**per-app 开关（人类要的那个）在内核侧无法诚实实现**。
+> 4. **致命前提**：我们的模块挂载**不在 apd 手里**（`apd/src` 里 `mount`/`overlay`/`MS_BIND` 零命中），而由 **metamodule 的 `metamount.sh`** 决定 → 引擎在 patch 时**不知道**挂载点 → “固定路径列表”无法保证覆盖第三方 metamodule 的任意 bind mount。
+> 5. **`filldir64` 不是替代**：现有 filldir64 只隐藏**名字恰为 16 字节、等于 `key[0:16]` 的隐藏目录**（`FOLDER_HEAD_ROOT_KEY_LEN=16`，`patch_filldir64.cpp:52`），与模块挂载无关，且挡不住 `mountinfo`/`statfs`/已知路径 `open`。
+> 6. **建议：方案 ③（本轮不做，UI 不出现该开关）**。若人类确认必须过「mountinfo 类」检测 → 前置条件是把**模块挂载收归自有**（固定单一 overlay 挂载点），再按 §10.7 实施 ②；否则 ② 会变成“看着能用、覆盖不确定”的假功能，正是我们一直在避免的空断言式交付。
+
+### 10.1 符号可用性（真机 kallsyms 实测，`samples/meizu21` 抽出的 33,892,864 B Image）
+
+| 符号 | 实测 | 用途 | 备注 |
+|---|---|---|---|
+| `path_umount` | ✅ 0x003b5e64 | 卸载单个已解析 path（Android common kernel 提供，KSU 同款） | 调用它即可，无需 hook |
+| `kern_path` | ✅ 0x00393e50 | 把字符串路径解析成 `struct path` | 需要它才能给 `path_umount` 备参数 |
+| `path_put` | ✅ 0x0039352c | 释放 `kern_path` 的引用 | 不调会泄漏 dentry/mnt 引用 |
+| `__arm64_sys_umount` | ✅ 0x003b6338 | `umount(2)` 入口 | 备选（需构造 `struct filename`，比 `kern_path` 更难） |
+| `do_umount` / `ksys_umount` | ❌ **不存在** | — | 本内核已内联/未导出 → **只能走 `path_umount`** |
+| `__sys_setresuid` | ✅ 0x000d018c | **主 hook 点**（Android 降权） | 入口 `x0=ruid, x1=euid, x2=suid` |
+| `__sys_setuid` / `__sys_setreuid` | ✅ 0x000cfffc / 0x000cfe08 | 兜底 hook（可选） | 与 setresuid 参数寄存器不同 |
+| `commit_creds` | ✅ 0x000e7168 | ❌ **禁止作为 hook 点** | 见 §10.2 |
+| `filp_open` / `kernel_read` / `kmalloc_trace` | ✅ 0x00380e58 / 0x003829f8 / 0x002f1550 | 仅“位图文件”方案需要（§10.3-d） | `kmalloc`/`kvmalloc` 未导出 |
+
+结论：**KSU 的 umount 原语在本机完全可用**；“符号不可用”不是阻塞项，阻塞项是**配置数据**与**挂载点来源**（§10.3/§10.5）。
+
+### 10.2 setuid hook：hook 哪个函数、组数契约、体积预算
+
+**Android 应用降权实际路径**（`frameworks/base/core/jni/com_android_internal_os_Zygote.cpp::SpecializeCommon`）：
+
+```
+zygote fork → unshare(CLONE_NEWNS) → mount 私有化(/storage,/mnt 等)
+            → setgroups → setresgid → setresuid(uid,uid,uid)          ← ★ 降权终点
+```
+因此：
+
+| 方案 | 评价 |
+|---|---|
+| hook `__sys_setresuid`（**推荐**） | 覆盖 Android 应用降权的**唯一实际路径**；进程上下文、可睡眠 → `path_umount` 安全；此时代码已 `unshare` 出自己的 mnt ns（**依赖此顺序，真机必须验证**） |
+| hook `__sys_setuid` / `__sys_setreuid` | 兜底：直接调 `setuid(2)` 的进程（少数旧代码/工具）；不做也能覆盖 Android 应用 |
+| hook `commit_creds` | ❌ **禁止**：①调用面涵盖内核线程创建、能力变更、`setgroups` 等，热路径代价高；②可能处于加锁/原子上下文，`path_umount` 睡眠 → 死锁/panic；③KSU 也刻意放在 syscall 层 |
+
+**组数契约（`hook_groups_expected` 严格等值，硬约束）** —— 三个选项：
+
+| 选项 | 做法 | 代价 |
+|---|---|---|
+| **(c) 可选独立组（推荐）** | 新增 `--umount-modules off\|on`（**默认 off**）；`hook_groups_expected_count(ge61, huawei, umount)` 扩为三参：off 时不变（14/15、11/12），on 时 +1（15/16、12/13） | 需同步：`patch_pipeline.h` 计数函数、A8 矩阵（扩到 8 例）、NEW-DOC-02 §2.3、qa `verify_patch.py` 的期望组数 |
+| (a) 无条件独立组 | 组数恒 +1 | 破坏现有契约（默认行为变化），不建议 |
+| (b) 并入 `filldir64` 组 | 组数不变 | 语义混淆（“隐藏目录”与“卸载挂载”是两件事），blob 归属难解释，不建议 |
+
+**体积预算**（真机实测）：
+
+| 项 | 值 |
+|---|---|
+| `die` 区（≥6.1 分支 shellcode 宿主） | 696 B |
+| 已用 | 180 B（do_execve 164 + 4 个跳转） |
+| **余量** | **516 B** |
+| 单条路径的 umount 代码（`kern_path`→`path_umount`→`path_put` + 错误分支） | ≈ 60–80 B |
+| 路径字符串 | 每条 = 挂载点长度 + 1（NUL） |
+| 主干（寄存器保存/恢复、uid 守卫、循环、返回原入口） | ≈ 180–220 B |
+| **3 条路径合计** | **≈ 400–460 B** → **能放进 516 B，但余量只剩 60–120 B** |
+| 4–5 条路径 | ≈ 480–560 B → **越界**，需把一段挪到 `__drm_puts_coredump` 剩余 156 B（跨区跳转，复杂度+风险+） |
+
+→ **结论**：只有“固定 3 条左右挂载点”的体积预算。这也从体积上说明：**KSU 的“任意数量挂载点”在本模型里不可能**。
+
+### 10.3 配置传递：最简可行方案与能力边界
+
+内核里“哪些 uid 要 umount / 哪些挂载点要卸”必须有来源。四种可能：
+
+| 方案 | 可行性 | 说明 |
+|---|---|---|
+| **(a) 固化“默认全 umount”+ uid 规则（推荐，最简）** | ✅ 可行（≈0 额外字节） | shellcode 只判 `uid >= 10000`（app）→ 卸；`uid == 0` → 跳过（root 进程看得到模块）；其余系统 uid → 跳过。**无 per-app 例外** |
+| (b) 内核内存位图 + daemon 更新 | ❌ 当前模型不可行 | 需要可写内核内存 + 运行期基址（KASLR）→ 与本引擎“只 patch 只读 text、只用 PC 相对寻址”的模型冲突（与 §9.5 同一硬点） |
+| (c) 反向：只卸“已授权集合”之外 | ❌ 不可行 | 同样需要运行时数据（授权表是动态的，patch 时未知） |
+| (d) 位图**文件**：`/data/adb/sproot/umount_allow.bin`（8 KB 位图），setuid 时 `filp_open`+`kernel_read` 读位图判 bit | ⚠️ 技术可行但代价高 | 符号齐（`filp_open`/`kernel_read`/`kmalloc_trace` 实测存在），但要 +150–250 B shellcode、每次 app 启动做一次文件读、且 `kernel_read` **签名跨内核版本不同**（4.14/5.x/6.x 有变体）→ 版本兼容风险；另需 apd 维护该位图 |
+
+**能力边界（必须向人类讲清）**：
+
+| 能力 | 方案 (a) | 方案 (d) | KSU |
+|---|---|---|---|
+| 非 root 应用看不到模块挂载 | ✅ | ✅ | ✅ |
+| **per-app 开关（人类要的）** | ❌ 只能全局 | ✅（但代价见上） | ✅ |
+| 任意数量/任意 metamodule 挂载点 | ❌ 仅固定 N 条 | ❌ 仅固定 N 条 | ✅（运行时记录） |
+| 热路径代价（每次 app 进程创建） | 低（纯内存比较） | 中（一次文件读+位图查） | 低（内存位图） |
+
+→ **UI 语义现实**：如果内核侧只能做 (a)，那么授权页的「每个应用一个 umount 开关」**就是假的**（开关存了，但内核不读）。这正是“永远 PASS 的空断言”的 UI 版，必须避免。
+
+### 10.4 `umount` vs `filldir64`：反检测效果的**实际**差异
+
+先说清现有能力：`filldir64`/`compat_filldir` 的判据是**目录项名长度 == 16 且逐字节等于 `key[0:16]`**（`patch_kernel_root.h:8`、`patch_filldir64.cpp:52`）——它隐藏的是 **SK 隐藏目录本身**，与模块挂载**无关**。
+
+| 检测手段 | `filldir64`（隐藏目录名） | `umount`（真卸载） | 说明 |
+|---|---|---|---|
+| `getdents`/`ls /data/adb/modules` | ✅ 可挡（若扩展规则按名字隐藏） | ❌ 不挡 | umount 只影响挂载点；`/data/adb/modules` 是普通目录，需另做隐藏 |
+| **`/proc/self/mountinfo`、`/proc/self/mounts`、`/proc/1/mountinfo`** | ❌ **挡不住** | ✅ **挡得住** | mount 列表由 namespace 维护（seq_file），与 getdents 无关；这是 KSU umount 的**核心价值** |
+| `statfs()` / `fstatfs()` 于挂载点 | ❌ | ✅（ENOENT） | 可看出 overlay/magic 变化 |
+| `open()`/`stat()`/`access()` **已知路径**（如 `/system/app/X.apk`、`/system/xbin/su`） | ❌ **挡不住** | ✅（ENOENT） | 隐藏名字不等于隐藏内容；反检测最常打这条 |
+| `readlink()`/`getxattr()`/`inotify` 于已知路径 | ❌ | ✅ | 同上 |
+| `/proc/self/maps`（模块替换了 .so） | ❌ | ⚠️ 视挂载点而定 | umount 后该进程不会看到被替换的 .so |
+
+**结论**：两者是**互补而非替代**——`umount` 解决“内容/挂载可见”，`filldir64` 解决“目录里出现名单”。人类要的反检测（过 `mountinfo`/`statfs`/已知路径探测）**只有 umount 能挡**；但只做 umount、不做目录隐藏，仍会漏 `/data/adb/modules` 这类“非挂载的目录”。
+
+### 10.5 致命前提：模块挂载拓扑不由引擎决定
+
+代码事实：
+
+- `grep -n "mount\|overlay\|MS_BIND" apd/src/*.rs` → **只有** `setns`（切到全局 ns）与“metamodule 存在性”相关逻辑；**apd 自己不做模块挂载**；
+- 模块挂载由 **metamodule** 的 `metamount.sh` 执行（`apd/src/event.rs:198`、`metamodule.rs:260`）；
+- 因此**挂载点集合在 patch 时不可知**：第三方 metamodule 可以用 overlayfs 挂 `/system`，也可以对 `system/` 下每个文件做 bind mount（Magisk 式，数量可达数百）。
+
+→ 静态 shellcode 的“固定 3 条路径”在 overlay 型 metamodule 上可能刚好命中，在 bind 型上**几乎必然漏**。**没有“记录式挂载点跟踪”就没有 KSU 级覆盖率**，而记录式跟踪 = 常驻运行时（§9.5 同一结论）。
+
+**两条出路**：
+1. **先把模块挂载收归自有**：规定 SPRoot 模块只允许**单一固定挂载点**（如 `/system` 的 overlayfs，路径固定为 `/system`），然后 ② 的“固定 3 条路径”就有确定覆盖面。代价：放弃第三方 metamodule 生态（与“沿用 apd/metamodule 语义”的 D1 决策冲突）。
+2. **接受“尽力而为”**：只卸固定点 + 目录隐藏，UI 上不承诺“完全隐藏”。→ 但这与人类预期（KSU 等价）不符。
+
+### 10.6 与 launcher（§9.4）的工程量/风险对比
+
+| 维度 | B：launcher（§9.4） | umount modules（本节 ②） |
+|---|---|---|
+| 新增 hook 点 | **0**（并入现有 `do_execve` 组内分支） | **1 个新增入口**（`__sys_setresuid`；兜底再 +2） |
+| 新增符号解析 | 1（`call_usermodehelper`） | 4（`__sys_setresuid` + `kern_path`/`path_umount`/`path_put`） |
+| shellcode 体积 | 250–320 B（余量 516 B → 富余 ~200 B） | **400–460 B（余量 516 B → 仅剩 60–120 B）**，3 条路径封顶 |
+| 组数契约 | 并入 `do_execve` 组 → **不变** | 独立组 → `hook_groups_expected` 需三参扩展 + A8 矩阵扩 8 例 |
+| 触发频率 | 每次密钥提权（低频，人为触发） | **每次 app 进程创建**（`setresuid`）→ **热路径**，必须极轻 |
+| 配置数据 | 无需（口令即触发） | **必需**（per-app 列表）→ 当前模型无 → 只能全局或加文件读取 |
+| 失败影响面 | daemon 没起来（可降级、App 可重试） | 若 hook 时机/命名空间判断错 → **可能影响 zygote 命名空间下所有应用**（模块全丢）；最坏 panic |
+| 真机不可测部分（静态断言测不到） | kCFI/域（SID）差异 | **命名空间作用域**（hook 时是否已 unshare）、共享 ns 风险、热路径稳定性、系统 uid 误伤 |
+| 工期估 | 1–2 人日 + 真机窗口 | 3–5 人日 + **多轮真机**（含开机/多 app 并发回归） |
+| 现有断言体系可覆盖度 | 高（Tier A/B + 负样本可覆盖字节级设计） | 中（字节级可覆盖；**作用域/稳定性只能真机**） |
+
+### 10.7 断言与负样本设计（仅当人类选 ② 时实施）
+
+**A. `--self-test-umount`（纯字节级，CI 必跑）**，断言清单：
+
+| 断言 | 判据 |
+|---|---|
+| hook 目标正确 | blob 的入口跳转目标符号 == `__sys_setresuid`；**blob/report 中不得出现 `commit_creds`** |
+| uid 守卫 | 存在 `cmp w?, #0`（跳过 root）与 `cmp w?, #10000`（app 门槛）两条件；且**跳转方向**为“不满足则跳到返回路径” |
+| umount 三连 | 每条路径的代码段含 3 个 `bl`，其相对偏移解算后分别等于 `kern_path`/`path_umount`/`path_put` 偏移 |
+| 挂载点字符串 | 内联字符串表逐字节等于 patch 时选定的路径（且 ≤3 条） |
+| `MNT_DETACH` | 立即数 == 2（`detach` 语义；用 0 会因 busy 失败） |
+| 无绝对地址 | 全 blob 事件不得出现 `movz/movk` 拼地址或 literal 池中的绝对地址（沿用 §9.4 的“只 PC 相对”约束） |
+| 寄存器/栈平衡 | `stp`/`ldp`、`sub sp`/`add sp` 成对且立即数一致；返回前 sp 复原 |
+| 失败静默 | `path_umount` 返回后**不得**有 `cbnz/cbz` 分支到 panic/printk 路径；错误只走“跳到下一条” |
+
+**负样本（必须先把断言打红）**：
+1. hook 目标改成 `commit_creds` → “hook 目标正确”必须 FAIL；
+2. uid 守卫换成 `cmp #10000` + 相等跳转（app 反被跳过）→ 守卫断言 FAIL；
+3. `MNT_DETACH` 立即数改 0 → 断言 FAIL；
+4. 删掉 `path_put` 调用 → “三连”断言 FAIL；
+5. 把某条路径字符串改 1 字节 / 少 NUL → 字符串断言 FAIL；
+6. 在 `path_umount` 后加 `cbnz` → “失败静默”断言 FAIL。
+
+**B. Tier B（真内核，有 KERNEL_IMAGE 时）**：
+- 断言 `report.umount.{enabled,hook_symbol,symbols{kern_path,path_umount,path_put},paths[],shellcode_bytes}` 与实际一致；每个符号偏移 == kallsyms 实测值；
+- 负样本：把符号名拼错 → `--umount-modules on` 时必须 **E202 且不产出 `--out`**（显式开启绝不静默降级）；默认 off 时才允许“不织入 + report 标注”。
+
+**C. 真机 S3（唯一能验证语义的层级，必须单列一轮）**：
+- 非 root app 进程内 `/proc/self/mountinfo` **不含**模块挂载点；同一时刻 root 进程内**仍含**；
+- 相邻进程不受影响（两个 app 先后启动，先启动者挂载状态不变）→ 验证 namespace 隔离；
+- 连续 30 次冷启动 app 无 panic、无 `avc` 风暴、`/data/system/dropbox` 无 NativeCrash；
+- 系统 uid（1000/1001…）进程行为不变（确认守卫没误伤）。
+
+### 10.8 给人类的选择题（建议原文转述）
+
+| 方案 | 能力 | 引擎改动 | 风险 | 诚实度 |
+|---|---|---|---|---|
+| **① 仅 `filldir64` 软隐藏（含扩展成按名字隐藏 `/data/adb/modules`）** | 只能挡“列目录”；`mountinfo`/`statfs`/已知路径 `open` **仍可见** | 零（现有能力）+ 可选 +~30 B | 低 | ✅ 如实标注“仅目录名隐藏” |
+| **② `setuid` hook + `path_umount`（照 KSU）** | **能过 mountinfo/statfs 类检测**；但只能**全局**（无 per-app）、只能**固定挂载点**（≤3），且覆盖率取决于 metamodule 挂载方式 | 大（新 hook 组 + 4 符号 + 400–460 B + 组数契约扩展） | **高**（热路径 + 命名空间作用域，真机不可测部分最大） | ⚠️ 若 UI 出 per-app 开关而内核不支持 = 假功能 |
+| **③ 先不做，UI 不出现该开关** | 无 | 零 | 无 | ✅ |
+
+**我的建议：③（本轮）**，理由按重要性排序：
+1. **UI 语义无法诚实落地**：人类要的是“每个应用一个开关”，而内核侧最简方案只有全局；做 per-app 需要位图文件（+150–250 B、`kernel_read` 版本风险、每 app 启动一次文件读）——这不是“顺手加个 hook”。
+2. **覆盖率不可控**：模块挂载由第三方 metamodule 决定（§10.5），固定路径列表在 bind-mount 型 metamodule 上会漏；先做会得到“有时有效”的功能，比没有更难排查。
+3. **风险等级最高**：这是目前唯一会**改动每个 app 进程创建路径**、且失败可能波及整个 zygote 命名空间的改法；静态断言只能覆盖字节级，作用域语义只能真机验证。
+4. **依赖顺序**：② 的正确前提是“模块挂载收归自有（固定单一 overlay）”，这与“沿用 metamodule 生态”的 D1 决策冲突，需人类先裁决模块方案，再谈 umount。
+
+**若人类坚持要 ②，前置条件（建议写进任务书）**：
+- 先定“模块挂载方案”（是否放弃第三方 metamodule、固定单一挂载点）；
+- 接受“全局开关”（授权页不做 per-app umount 开关，或明确标注 per-app 仅为记录、不影响内核行为——**不推荐**）；
+- 单列一轮真机验证（S3-umount），未过真机前不进入发布门禁。
+
+## 11. 包体与体积
 
 | 组合 | 增量 | 评价 |
 |---|---|---|
@@ -777,11 +961,11 @@ init_boot.img: ramdisk=2,131,370 B     ← rc 只能注进这里
 | 仅 exec 形态 | 2.81 MB（2,950,880 B） | 需 legacy packaging + 路径规范 |
 | 两形态都带 | 5.69 MB | 仅调试期（排障时 exec 形态可直接抓 stderr） |
 
-优化空间（未实施，列入 §11-R3）：裁掉 asmjit x86 后端（~200 KB）、`-ffunction-sections -Wl,--gc-sections`、`-flto`（预估可降到 ~2.0–2.3 MB）；`capstone` 仅 A64 已裁，`cJSON` 不可省（report）。
+优化空间（未实施，列入 §12-R3）：裁掉 asmjit x86 后端（~200 KB）、`-ffunction-sections -Wl,--gc-sections`、`-flto`（预估可降到 ~2.0–2.3 MB）；`capstone` 仅 A64 已裁，`cJSON` 不可省（report）。
 
 ---
 
-## 11. 风险与待决
+## 12. 风险与待决
 
 | # | 风险/待决 | 影响 | 建议 |
 |---|---|---|---|
@@ -795,7 +979,7 @@ init_boot.img: ramdisk=2,131,370 B     ← rc 只能注进这里
 
 ---
 
-## 12. 验收门禁映射（lead 的 10 条 → 本文证据）
+## 13. 验收门禁映射（lead 的 10 条 → 本文证据）
 
 | 门禁 | 本文落点 |
 |---|---|
@@ -847,7 +1031,7 @@ bash engine/android/verify_artifact.sh
 KERNEL_IMAGE=samples/gki-kernel-arm64.Image bash engine/android/verify_artifact.sh
 ```
 
-## 13. 许可证与合规（D-3）
+## 14. 许可证与合规（D-3）
 
 | 组件 | 位置 | 许可证 | 结论 |
 |---|---|---|---|
