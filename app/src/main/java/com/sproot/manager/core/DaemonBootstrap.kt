@@ -111,7 +111,10 @@ object DaemonBootstrap {
             )
         }
         when (probe.stage) {
-            "daemon_ready" -> return save(context, Result(State.RUNNING, "AP 守护已在运行", probe.stage, now))
+            "daemon_ready" -> {
+                markInstalled(context, probe)
+                return save(context, Result(State.RUNNING, "AP 守护已在运行", probe.stage, now))
+            }
             "undeployed", "escalation_failed", "no_ap_binary" -> return save(
                 context,
                 Result(State.NOT_DEPLOYED, probe.stageLabel, probe.stage, now),
@@ -158,6 +161,7 @@ object DaemonBootstrap {
                 val p = runCatching { ApdSelfTest.run(context, timeoutSec = PROBE_TIMEOUT_SEC) }.getOrNull() ?: return@repeat
                 lastProbe = p
                 if (p.stage == "daemon_ready") {
+                    markInstalled(context, p)
                     return save(context, Result(State.STARTED, "已自引导启动 AP 守护（pid 见自检）", p.stage, System.currentTimeMillis()))
                 }
                 if (p.stage == "escalation_failed" || p.stage == "no_ap_binary") {
@@ -189,6 +193,13 @@ object DaemonBootstrap {
             runCatching { proc?.destroy() }
             runCatching { if (keyFile.exists() && !keyFile.delete()) AppLog.warn(TAG, "临时密钥文件删除失败：${keyFile.absolutePath}") }
         }
+    }
+
+    /** daemon 就绪 = 设备运行在修补后的内核 → 安装状态置 ACTIVE（主页「已安装」的唯一来源）。 */
+    private fun markInstalled(context: Context, probe: ApdSelfTest.Result) {
+        runCatching {
+            InstallState.markActiveDetected(context, "AP 守护就绪（真实探测：stage=${probe.stage}）")
+        }.onFailure { AppLog.warn(TAG, "写入 ACTIVE 状态失败（不影响运行）：${it.message}") }
     }
 
     /** 0600 临时密钥文件（与 ApdClient.rootExec 同一 ABI：47 字符明文）。 */

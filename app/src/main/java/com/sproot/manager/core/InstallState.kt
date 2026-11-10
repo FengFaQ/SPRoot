@@ -154,6 +154,22 @@ object InstallState {
         )
     }
 
+    /**
+     * 真实探测到 AP 守护就绪（`apd selftest` stage=daemon_ready / 自引导成功）→
+     * 设备确实运行在修补后的内核上。这是主页「已安装」的**唯一可靠来源**
+     * （人类 2026-11-10：授权成功 ≠ 已安装；PATCHED_PENDING_FLASH/FLASHED_PENDING_REBOOT 都不算）。
+     */
+    fun markActiveDetected(context: Context, evidence: String) {
+        save(
+            context,
+            load(context).copy(
+                status = Status.ACTIVE,
+                updatedAt = System.currentTimeMillis(),
+                note = evidence.take(200),
+            ),
+        )
+    }
+
     fun markError(context: Context, reason: String) {
         save(
             context,

@@ -98,6 +98,10 @@ android.newDsl=false
 
 ### 3.1 主页（Home）
 1. **刷入状态卡**（人类指令 B，2026-11-10）：第一行 **`未安装 / 已安装`**（不再用"已修补/未修补"）；
+   **「已安装」= 仅 `ACTIVE`**（设备真的在运行修补后的内核、daemon 可用）：由 App 自引导探测到
+   `apd selftest stage=daemon_ready` 时置 `ACTIVE`（`InstallState.markActiveDetected`）；
+   `PATCHED_PENDING_FLASH` / `FLASHED_PENDING_REBOOT` / `UNPATCHED` / `ERROR` 一律"未安装"。
+   **授权成功绝不等于安装成功**：auth 路径与 InstallState 无任何联动（已核查）。
    下面只保留两项：**引擎 <version> · JNI ABI v2** 与 **GKI <os.version>**。点卡片进入修补页。
    删除：`AP 待部署` 模式行、状态 hint、`SK 产物已导出，尚未刷入设备`、`点击查看产物与刷入指引`。
 2. **设备信息卡**：机型/Android/ABI/内核/App 版本。

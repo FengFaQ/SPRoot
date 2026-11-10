@@ -246,9 +246,10 @@ private fun HomeWarnings(snapshot: HomeSnapshot) {
 @Composable
 private fun StatusCard(snapshot: HomeSnapshot, onClick: () -> Unit) {
     val status = snapshot.install.status
-    val installed = status == InstallState.Status.ACTIVE ||
-        status == InstallState.Status.PATCHED_PENDING_FLASH ||
-        status == InstallState.Status.FLASHED_PENDING_REBOOT
+    // 人类定义（2026-11-10）：**已安装 = 仅 ACTIVE**（设备真的在运行修补后的内核、daemon 可用）。
+    // 已修补未刷入 / 已刷入待重启 / 未修补 / 错误 一律"未安装"。
+    // 授权成功绝不等于安装成功：认证/授权路径不得改动安装状态（已核查无联动）。
+    val installed = status == InstallState.Status.ACTIVE
     val (container, content) = when {
         installed -> colorScheme.secondaryContainer to colorScheme.onSecondaryContainer
         status == InstallState.Status.ERROR -> colorScheme.errorContainer to colorScheme.onErrorContainer
