@@ -8,6 +8,7 @@
 #   - check_kt_syntax.py     Kotlin 字符串/三引号/括号配对 + 嵌套双引号（推前自检 #1）
 #   - check_kt_signatures.py Kotlin 具名参数 vs 函数定义签名（推前自检 #2）
 #   - check_kt_imports.py    Kotlin 跨包缺 import（推前自检 #3）
+#   - check_builtin_assets.py 内置模块物料校验（builtin-components.json ↔ assets，可复现防漂移）
 # 三个 check_kt_* 的背景：连发两次「CI 才暴露的低级编译错误」后固化的本地自检，
 # 现在作为门禁拦住**所有**改 app/ 的提交（不只靠人记得跑）。
 #
@@ -72,6 +73,14 @@ jobs:
             echo "::error::quality/static/check_error_codes.py 缺失（错误码门禁不可缺）"; exit 1; }
           python3 quality/static/check_error_codes.py
           echo "check_error_codes.py PASS"
+
+      - name: check_builtin_assets.py (内置模块物料)
+        run: |
+          set -e
+          [ -f quality/static/check_builtin_assets.py ] || {
+            echo "::error::check_builtin_assets.py 缺失（内置组件可复现门禁不可缺）"; exit 1; }
+          python3 quality/static/check_builtin_assets.py
+          echo "check_builtin_assets.py PASS"
 
       - name: verify_patch.py --help (脚本自检)
         run: |

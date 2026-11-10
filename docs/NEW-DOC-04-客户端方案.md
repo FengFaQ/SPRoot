@@ -555,6 +555,17 @@ CI 行为（硬失败）：
   由 `SecretStore.engineKeyOf()` 补位，见 §9.1。
 - **APK 体积**：15.4MB → 11.2MB（移除 material-icons-extended，改 miuix-icons）。
 
+### 9.0B 内置模块组件（A 步：物料入仓，2026-11-10）
+
+- assets 打入官方 release 原样 zip（不修改内容）：
+  `app/src/main/assets/builtin/neozygisk-v2.4.zip`（NeoZygisk v2.4 build 289，**GPL-3.0**，module id=`zygisksu`）
+  与 `mountify-205.zip`（Mountify v2.0.5 build 205，**Unlicense**，module id=`mountify`）；
+- 清单 `app/builtin-components.json`：name/version/version_code/module_id/file/size/sha256/source_url/
+  upstream/license/license_url（可复现，供设置页展示来源与许可证）；
+- CI 门禁 `quality/static/check_builtin_assets.py`：清单 ↔ assets 双向校验（存在性/size/sha256/未登记 zip），
+  已接入 ci-static（防"物料被悄悄替换"）；
+- 说明：仅入仓，**不构建**任何东西；安装流程（apd module install + Mountify config 注入 APatch）在 B 步。
+
 ### 9.0A UI 精简与 App 自引导（已完成，2026-11-10，人类指令 A–E）
 
 - **B 主页**：删除环境自检块与"查看产物/刷入指引"入口；刷入状态卡改「未安装/已安装 + 引擎 + GKI」。

@@ -1,0 +1,37 @@
+{
+  "_comment": "内置模块组件清单（可复现 + 设置页展示来源/许可证）。assets 里是官方 release 原样产物，App 不修改其内容；CI 由 quality/static/check_builtin_assets.py 校验 sha256/size 漂移。",
+  "schema": 1,
+  "updated": "2026-11-10",
+  "components": [
+    {
+      "id": "neozygisk",
+      "name": "NeoZygisk",
+      "version": "v2.4",
+      "version_code": 289,
+      "module_id": "zygisksu",
+      "file": "app/src/main/assets/builtin/neozygisk-v2.4.zip",
+      "size": 2401208,
+      "sha256": "93a1425c67bb89f58a0dcb9fc823ec93f6472214f221e667a70b67c6a6e061a1",
+      "source_url": "https://github.com/JingMatrix/NeoZygisk/releases/download/v2.4/NeoZygisk-v2.4-289-release.zip",
+      "upstream": "https://github.com/JingMatrix/NeoZygisk",
+      "license": "GPL-3.0",
+      "license_url": "https://www.gnu.org/licenses/gpl-3.0.html",
+      "notes": "原样分发官方 release（module.prop: id=zygisksu, versionCode=289）；不修改源码/脚本"
+    },
+    {
+      "id": "mountify",
+      "name": "Mountify",
+      "version": "v2.0.5",
+      "version_code": 205,
+      "module_id": "mountify",
+      "file": "app/src/main/assets/builtin/mountify-205.zip",
+      "size": 554882,
+      "sha256": "2b1850e73bfb0b3dcec8b250272ee9a172b7456f5e2cb53bb5b11d5a0b8848c9",
+      "source_url": "https://github.com/backslashxx/mountify/releases/download/205/mountify.zip",
+      "upstream": "https://github.com/backslashxx/mountify",
+      "license": "Unlicense",
+      "license_url": "https://unlicense.org/",
+      "notes": "公有领域（module.prop: id=mountify, versionCode=205）；原样分发，安装后由 App 注入 APatch 配置（B 步）"
+    }
+  ]
+}
