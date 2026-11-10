@@ -21,7 +21,7 @@
 | **`--workdir` 所有权契约（2026-11-09 真机事故后）** | **显式传入 `--workdir` ⇒ 目录及内容生命周期归调用方，引擎不得删除其中任何内容；只有默认 workdir（`<out>.work`）由引擎成功收尾时回收**（§8.1）。行为证据：A9d `--self-test-workdir` 13 例矩阵（CI 必跑）+ Tier B B9 事故现场回归 / B10 默认回收正控。 |
 | **密钥 ABI 契约（P0，提权链）** | CLI `--key` **严格 48 字符**（47/49/非 alnum → E101）；内核只写 **`key[0:47]` + NUL = 48 字节**（`embed_key_bytes()`，内联断言）；`report.key_spec` 输出 `abi="47+nul"/bytes=48/last_byte_is_nul=true/input_len=48`（§7.5）。行为证据：A10 `--self-test-keyabi` 17 例（CI 必跑）+ Tier B B7。**用户态提权串必须 47 字符**。 |
 | **用户态 daemon 启动方式（2026-11-10 评估）** | SK 引擎**无任何内核态拉起用户态的能力**（`call_usermodehelper`/`kernel_thread`/`kthread_run`/`init_task` 全零命中）；KSU 亦需改 ramdisk/init_boot，APatch 靠常驻内核运行时做 init.rc 虚拟化才不需要。**选型：A（App 自引导）先落地 → B（提权时内核顺带拉起）作兜底 → C（init hook + umh）不建议**。详见 §9。 |
-| **模块卸载 umount modules（2026-11-10 评估）** | 符号可用（`path_umount`/`kern_path`/`path_put` 实测在 kallsyms），setuid hook 结构可行；但静态 shellcode 无运行时数据 → 只能「固定挂载点 + 全局」，**做不出 per-app 开关**；且模块挂载由 metamodule 决定 → 覆盖率不可控。**建议方案 ③（不做，UI 不出该开关）**；`filldir64` 只挡列目录、挡不住 `mountinfo`/`statfs`/已知路径 `open`。详见 §10。 |
+| **模块卸载 umount modules（2026-11-10 评估）** | 符号可用（`path_umount`/`kern_path`/`path_put` 实测在 kallsyms），setuid hook 结构可行；但静态 shellcode 无运行时数据 → 只能「固定挂载点 + 全局」，**做不出 per-app 开关**；且模块挂载由 metamodule 决定 → 覆盖率不可控。**建议方案 ③（不做，UI 不出该开关）**；`filldir64` 只挡列目录、挡不住 `mountinfo`/`statfs`/已知路径 `open`。**⚠️ 本评估只完成了符号级与代码级验证，真机 `path_umount` 调用未验证**（见 §10「验证边界」）。详见 §10。 |
 | 推荐集成 | **主形态 JNI（`libskrootpatch.so` + `System.loadLibrary("skrootpatch")`）**，次形态静态 exec（`skroot-patch` 从 `nativeLibraryDir` 真实路径 exec，**禁止** symlink 到 `filesDir`；该可执行件默认不进 APK）。 |
 | 实测编译耗时 | 全量 100+ TU，12 核并行 **18 秒**（`make objs`，见 §3.4）。 |
 | 打包工具 | **magiskboot v31.1 ARM64**（SKRoot 官方路径；988,984 B，静态 AArch64，sha256 `97e9ec75…bb54`），CI 内固定版本+哈希校验并随 artifact 分发；自研 bootimg 保留为交叉校验/回退（§7）。**禁止 AIK**。 |
@@ -771,7 +771,7 @@ init_boot.img: ramdisk=2,131,370 B     ← rc 只能注进这里
 | ② **客户端先探测** | App 先 `connect()` daemon socket（~50 ms 超时）；不存在才 exec `T_launch` → 每个 boot 只会触发一次 | ui-client 侧 10 行逻辑 |
 | ③ **apd 单实例 flock** | `apd/src/daemon.rs:136` `flock(LOCK_EX\|LOCK_NB)`：并发/重复启动只有一个成功，其余静默退出 | 已在 apd 中实现 |
 
-→ 这也解释了 **C 为什么必须有一次标志**：C 的触发点（init exec / 任意 exec）**不受调用方控制**、也没有“口令”可区分，只能靠内核状态去重；而 B 的触发是“调用方拿着密钥显式要求”，天然可去重。
+→ **结论（B vs C 的本质差别）**：**C 之所以必须有一次标志，是因为它的触发点（init exec / 任意 exec）不受调用方控制、也没有“口令”可区分，只能靠内核状态去重；而 B 的触发是“调用方拿着密钥显式要求”，天然可去重 —— 所以 B 不需要任何可写内核状态，也不受“只 PC 相对寻址”的约束。**
 
 #### 9.4.4 失败语义：绝不 panic、绝不影响 execve 原路径
 
@@ -835,6 +835,8 @@ init_boot.img: ramdisk=2,131,370 B     ← rc 只能注进这里
 
 ### 9.5 为什么不建议 C（init hook + `call_usermodehelper`）
 
+> **与 B 的分水岭**：C 的触发点不受调用方控制（且无口令可区分）→ 只能靠**内核可写状态**去重，因此必然踩上“需要可写段 + 运行期基址（KASLR）”这条本引擎刻意回避的线；B 由调用方持密钥显式触发 → 去重全在用户态。
+
 1. **触发时机不成立（硬事实）**：init 由 `kernel_init` exec，`/data` 由 init 自己在其后的阶段挂载 → “hook init 首次 exec 就拉 daemon”时 `/data/adb/apd` **还不存在**，UMH 必然失败。要可用必须“等 /data 就绪” → 需要轮询/延迟/重试逻辑。
 2. **“只拉一次”需要可写内存**：一次性标志必须放在可写段（`.data`/`.bss`），而 shellcode 取该地址同样需要运行期基址（KASLR）推导；当前引擎刻意只用 PC 相对寻址（零 KASLR 依赖），引入绝对地址即新增一类机型风险。
 3. **SID 不对（APatch 用实证避开了这一点）**：UMH 的 helper 继承 kernel 上下文（`kthreadd` → `init_cred`），exec 后**不是** `u:r:magisk:s0` / `init` 域。APatch 特意走“由 init 自己 exec（`su -Z u:r:magisk:s0 exec /data/adb/apd`）”，就是为了拿对域。我们走 UMH 会得到一个“root 但域不对”的 daemon，apd 的后续能力（模块挂载、域转换、socket 授权）都可能静默失效。
@@ -865,6 +867,12 @@ init_boot.img: ramdisk=2,131,370 B     ← rc 只能注进这里
 > 4. **致命前提**：我们的模块挂载**不在 apd 手里**（`apd/src` 里 `mount`/`overlay`/`MS_BIND` 零命中），而由 **metamodule 的 `metamount.sh`** 决定 → 引擎在 patch 时**不知道**挂载点 → “固定路径列表”无法保证覆盖第三方 metamodule 的任意 bind mount。
 > 5. **`filldir64` 不是替代**：现有 filldir64 只隐藏**名字恰为 16 字节、等于 `key[0:16]` 的隐藏目录**（`FOLDER_HEAD_ROOT_KEY_LEN=16`，`patch_filldir64.cpp:52`），与模块挂载无关，且挡不住 `mountinfo`/`statfs`/已知路径 `open`。
 > 6. **建议：方案 ③（本轮不做，UI 不出现该开关）**。若人类确认必须过「mountinfo 类」检测 → 前置条件是把**模块挂载收归自有**（固定单一 overlay 挂载点），再按 §10.7 实施 ②；否则 ② 会变成“看着能用、覆盖不确定”的假功能，正是我们一直在避免的空断言式交付。
+
+> **⚠️ 验证边界（必读，2026-11-10）**：本节评估**未在真机上验证过 `path_umount` 的实际调用**。
+> **实测到的只有**：①`path_umount`/`kern_path`/`path_put` 等符号在真机 kallsyms 中**存在且地址可解析**（§10.1）；
+> ②相关代码事实（zygote 降权路径、apd 不做挂载、filldir64 隐藏规则）来自源码级核对。
+> **未验证的**：在 `setresuid` hook 时点调用 `path_umount` 是否真的只影响该进程的 mount namespace（依赖 zygote 先 `unshare(CLONE_NEWNS)` 的顺序）、是否波及共享 namespace、热路径（每次 app 进程创建）是否稳定、系统 uid 是否被误伤。
+> 因此 §10 的结论是「**设计级可行 + 符号级已验证**」，**不是**「已验证可用」；真机验证必须按 §10.7-C 单列一轮（S3-umount），未过真机不得进入发布门禁。
 
 ### 10.1 符号可用性（真机 kallsyms 实测，`samples/meizu21` 抽出的 33,892,864 B Image）
 
