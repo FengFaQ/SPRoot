@@ -97,11 +97,30 @@ android.newDsl=false
   设置页设置项**全部替换为 SPRoot 自己的**（主题 / Root 密钥 / 日志 / 原镜像备份 / AP 部署 / 引擎自检 / 工作目录清理 / 关于许可）。
 
 ### 3.1 主页（Home）
-1. **安装状态卡**（来自 `InstallState`）：`未修补 / 修补中 / 已修补·待刷入 / 已刷入·待重启 / 已激活 / 错误` + 产物路径 + sha256 + 最近更新时间 + 备注。
-2. **SPRoot 状态卡**：修补引擎状态（是否加载 + 版本）、AP 守护（路径/架构/是否部署）、Root 密钥（脱敏展示，只显示前 4+后 4）。
-3. **设备信息卡**：机型/Android/ABI/内核/App 版本。
-4. **环境自检卡**：手动触发 `Capabilities.collect()`，逐条 ✓/✗ + 详情，阻断项标红。
-5. **下一步卡**：引导到修补页。
+1. **刷入状态卡**（人类指令 B，2026-11-10）：第一行 **`未安装 / 已安装`**（不再用"已修补/未修补"）；
+   下面只保留两项：**引擎 <version> · JNI ABI v2** 与 **GKI <os.version>**。点卡片进入修补页。
+   删除：`AP 待部署` 模式行、状态 hint、`SK 产物已导出，尚未刷入设备`、`点击查看产物与刷入指引`。
+2. **设备信息卡**：机型/Android/ABI/内核/App 版本。
+3. **提示区**：引擎未就绪、上次修补失败、密钥不可用、**AP 守护自启动失败**（A）、历史 48 位密钥。
+   「环境自检」与「查看产物/刷入指引」入口已删除（B）。
+
+### 3.1A App 自引导启动 AP 守护（A，替代 init_boot 必要性）
+
+人类质疑「为什么非要改 init_boot」——APatch/SK 都不需要改 init_boot。核实结论：SK 引擎只有提权/隐藏 hook，
+没有 `call_usermodehelper` 之类启动器，旧方案靠 ramdisk 的 rc 拉起 daemon 属于绕路。
+**SP 提权不依赖 daemon**（内核直接比对密钥），因此 App 可以自己提权拉起 daemon：
+
+```
+App 冷启动 / 收到 BOOT_COMPLETED（新增 RECEIVE_BOOT_COMPLETED + BootReceiver）
+  → apd selftest --json 探测（stage=daemon_ready 即在跑，幂等，不重复启动）
+  → 未运行且已部署 → apd root-exec -- /data/adb/apd --superkey-file /data/adb/sproot/key daemon
+    （daemon 常驻；确认就绪后销毁 root-exec 父进程，daemon 在独立进程组存活）
+  → 未部署（undeployed/escalation_failed）= 正常初始态，不标红 → App 不重试拉起
+  → 拉起失败 → 结果落 SharedPreferences，主页以**错误卡显示原因**（不静默，下次启动/开机重试）
+```
+`init_boot.img` 因此降级为**可选（高级）**：默认流程只需要 `boot.img`；不再"强烈建议"，
+未选也不再当缺陷提示；**保留**其注入代码（选中才注入）。未选 init_boot 时补丁管线
+**不再回退改 boot ramdisk 注入 rc**（`PatchPipeline` ⑥.5 跳过），避免无谓 ramdisk 改动/AVB 风险。
 
 ### 3.2 修补页（Patch）——本项目的核心
 自上而下：
@@ -110,14 +129,15 @@ android.newDsl=false
    `boot.img` **修补内核**（kallsyms→hook→shellcode→密钥，获得提权能力）；
    `init_boot.img` **注入自启脚本**（Android 13+ 的 init_boot 只有 generic ramdisk、**没有 kernel**，
    无可修补之物；这里只注入 `init.sproot.rc` + `init.rc` import，让 AP daemon 开机自启）。
-   未选 init_boot 时页面明确提示「无法注入自启脚本（本机 ramdisk 可能位于 init_boot）」。
-   **修补页不独立成 Tab**：主页是唯一入口；未修补 → 进入内核修补流程，已修补 → 查看产物/刷入指引
-   （KSU 的 Home→Install/Flash 模型）。
-2. **修补模式**（PatchMode）：`仅导出` / `导出并给出刷入指引`；`从备份还原`、`卸载还原` 以 `enabled=false` 占位（避免"点了必然失败"）。
-3. **进度**：`阶段标题 + 阶段说明 + 百分比 + LinearProgressIndicator`；引擎进度来自 NDJSON，占 35%→72% 区间。
-4. **错误区（常驻）**：`errorTitle/errorDetail` 一经写入不自动消失，仅"重置"清除；提供「展开/收起详情」「复制全部（含日志）」「日志文件路径」。
-5. **结果区**：产物路径、大小、sha256、**内核等长校验**、引擎报告、备份 sha1、Root 密钥（脱敏/显示/复制）。
-6. **刷入指引卡**（`EXPORT_AND_GUIDE` 模式）：魅族 21 为 A/B 双槽，命令模板 `fastboot flash --slot=all boot <file>`；**AVB 风险提示位**（`--disable-verity --disable-verification flash vbmeta` 模板，标注"待 patcher 结论"）。
+   `init_boot.img` 为**可选（高级）**（A：App 自引导已负责拉起 daemon，不再依赖 rc 自启）；
+   未选不提示缺陷、不"强烈建议"。
+   **修补页不独立成 Tab**：主页是唯一入口（KSU 的 Home→Install/Flash 模型）。
+2. **进度**：`百分比 + LinearProgressIndicator + 当前阶段 + 引擎阶段`；引擎进度来自 NDJSON，占 35%→80% 区间。
+3. **错误区（常驻）**：`errorTitle/errorDetail` 一经写入不自动消失，仅"重置"清除；提供「展开/收起」「复制」。
+4. **结果区**：产物路径、大小、sha256、**内核等长校验**、AVB、自启注入（若选了 init_boot）、Root 密钥（脱敏/显示/复制）。
+5. **页面最下方一行小字**：`导出 TXT 日志到 Downloads/SPRoot/`，点击导出 session 日志，失败 Toast 提示。
+6. **已删除（人类指令 C）**：所有说明性/提示小字、修补模式选择（含"导出并给出刷入指引"）、日志面板、
+   已修补产物区块、刷入指引卡、两级状态标记、所有 WarningCard。
 7. **两级状态**：「我已刷入（标记待重启）」→「已重启并生效（标记激活）」，状态由用户手动回报（无 root 时 App 无法读取 fastboot 结果）。
 8. **常驻日志面板**：级别配色、自动滚底、复制全部。
 
@@ -191,10 +211,11 @@ OFF = 撤销（`apd auth revoke`→deny）；乐观更新 + 失败回滚重载�
 5 修补        NativeEngine.patch(kernel.raw → kernel.patched, key48, json=progress.ndjson)
 6 覆盖内核    **必须**把修补结果写回 `kernel`（压缩则 compress=<fmt> kernel.patched kernel，否则直接复制）
               记录 kernel/kernel.orig/kernel.patched 三者 sha256；若 kernel == kernel.orig → T-12 中止
-6.4 init_boot 自启注入（P2）  **不做内核修补**（init_boot 无 kernel）：copy → 备份 → magiskboot unpack
-                   → 在 init_boot ramdisk 注入 init.sproot.rc + init.rc import
-                   （D-12：init_boot 优先、boot 回退）→ repack → **ramdisk 级回读**（rc 真在最终镜像）
-                   → AVB-1/2/3 → 产物 init_boot_patched.img（自启注入产物）
+6.4 init_boot 自启注入（P2，**仅在用户选了 init_boot（高级）时执行**）  **不做内核修补**（init_boot 无 kernel）：
+                   copy → 备份 → magiskboot unpack → 在 init_boot ramdisk 注入 init.sproot.rc + init.rc import
+                   → repack → **ramdisk 级回读**（rc 真在最终镜像）→ AVB-1/2/3 →
+                   产物 init_boot_patched.img（自启注入产物）
+                   未选 init_boot：**跳过注入且不回退改 boot ramdisk**（A：自启由 App 自引导负责）
 7 重打包      magiskboot repack boot.img → new-boot.img
 7.5 回读断言 把 new-boot.img 复制到 verify/ 再 unpack（必要时再 decompress）：
               回读 kernel sha256 **必须等于** kernel.patched 且 **不等于** kernel.orig/raw，否则 T-12 中止
@@ -512,6 +533,16 @@ CI 行为（硬失败）：
 - **密钥口径**：本地/AP/内核 47 字符（内核 ABI 47+NUL）；引擎 `--key` 入参 48（引擎内部 erase 末位），
   由 `SecretStore.engineKeyOf()` 补位，见 §9.1。
 - **APK 体积**：15.4MB → 11.2MB（移除 material-icons-extended，改 miuix-icons）。
+
+### 9.0A UI 精简与 App 自引导（已完成，2026-11-10，人类指令 A–E）
+
+- **B 主页**：删除环境自检块与"查看产物/刷入指引"入口；刷入状态卡改「未安装/已安装 + 引擎 + GKI」。
+- **C 修补页**：删除全部说明小字/模式选择/日志面板/已修补产物/刷入指引；底部新增 TXT 日志导出到 Downloads/SPRoot/。
+- **D 授权页**：主数据源改为 PackageManager 枚举**所有已安装用户应用**（默认未授权），每行 root 授权开关
+  （授予/撤销，走 `apd auth set/revoke`），详情三态 + 审计日志；**不做 UMOUNT 开关**（内核能力未实现，等 engine-dev）。
+- **E 模块页**：删除「可能原因」「AP 自检」等 KSU 没有的区块。
+- **A App 自引导**：冷启动 + BOOT_COMPLETED 探测并拉起 AP 守护（§3.1A）；init_boot 降级为可选高级项，
+  未选时补丁管线不再改 boot ramdisk 注入 rc。
 
 1. **native 资产落地**：
    - `libapd.so` ← CI 固定 artifact **`apd-aarch64-latest`**（含 `libapd-arm64.so` + `apd-version.txt`，约 1.35 MB）；工作流已按此名拉取并重命名为 `libapd.so`，同时把 `apd-version.txt` 打到 `app/src/main/assets/`；

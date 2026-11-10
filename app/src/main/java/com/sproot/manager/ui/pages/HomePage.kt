@@ -37,6 +37,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.sproot.manager.BuildConfig
+import com.sproot.manager.core.DaemonBootstrap
 import com.sproot.manager.core.InstallState
 import com.sproot.manager.core.PatchEngine
 import com.sproot.manager.core.SecretStore
@@ -176,6 +177,7 @@ data class HomeSnapshot(
     val install: InstallState.Snapshot = InstallState.Snapshot(),
     val engine: PatchEngine.EngineStatus? = null,
     val keyReady: Boolean = false,
+    val daemon: DaemonBootstrap.Result? = null,
     val loaded: Boolean = false,
 ) {
     companion object {
@@ -186,6 +188,7 @@ data class HomeSnapshot(
                 install = InstallState.load(context),
                 engine = engine,
                 keyReady = keyReady,
+                daemon = DaemonBootstrap.load(context),
                 loaded = true,
             )
         }
@@ -218,7 +221,15 @@ private fun HomeWarnings(snapshot: HomeSnapshot) {
                 level = WarningLevel.Error,
             )
         }
-        // ⑤ 历史 48 字符密钥（仍在用前 47 位，建议重生成重刷）
+        // ⑤ AP 守护自启动失败（人类指令 A：失败必须可见，不静默）
+        val daemon = snapshot.daemon
+        if (daemon != null && daemon.state == DaemonBootstrap.State.FAILED) {
+            WarningCard(
+                message = "AP 守护自启动失败：" + daemon.message,
+                level = WarningLevel.Error,
+            )
+        }
+        // ⑥ 历史 48 字符密钥（仍在用前 47 位，建议重生成重刷）
         if (SecretStore.legacy48Detected) {
             WarningCard(
                 message = "检测到历史 48 字符密钥，已取前 47 位使用；建议重新生成密钥并重新修补镜像",

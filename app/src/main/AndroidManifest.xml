@@ -9,6 +9,9 @@
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
 
+    <!-- App 自引导（人类指令 A）：BOOT_COMPLETED 时拉起 AP 守护，不再依赖 init_boot rc -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
     <!-- SK 引擎/magiskboot 只交付 arm64 -->
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
 
@@ -38,6 +41,16 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- 开机自引导：收到 BOOT_COMPLETED 后确保 AP 守护在运行（幂等，先探测后拉起） -->
+        <receiver
+            android:name=".core.BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
     </application>
 
 </manifest>

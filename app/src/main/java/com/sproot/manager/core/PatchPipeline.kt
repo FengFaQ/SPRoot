@@ -502,7 +502,10 @@ object PatchPipeline {
                     }
                     AppLog.info(TAG, "init_boot 回读校验通过：${rcVerify.detail}")
                 } else {
-                    AppLog.info(TAG, "init_boot 未注入 rc（${rcResult?.reason}）→ 产物仍导出，但本机自启不会生效")
+                    AppLog.info(
+                        TAG,
+                        "init_boot 未注入 rc（${rcResult?.reason}）→ 产物仍导出；自启由 App 自引导（冷启动/BOOT_COMPLETED）负责",
+                    )
                 }
 
                 // AVB 硬断言（与 boot 同等严格）
@@ -573,9 +576,9 @@ object PatchPipeline {
                     "自启注入产物就绪（init_boot.img）：sha256=$initBootSha size=$initBootBytesOut rc_injected=$initBootRcInjected",
                 )
             } else {
-                AppLog.warn(
+                AppLog.info(
                     TAG,
-                    "未选择 init_boot.img：ramdisk 若在 init_boot 分区（如魅族 21），rc 将无法注入 → 自启不会生效。",
+                    "未选择 init_boot.img：跳过自启注入（人类指令 A：改由 App 冷启动/BOOT_COMPLETED 自引导拉起 AP 守护）",
                 )
             }
 
@@ -583,7 +586,14 @@ object PatchPipeline {
             // 目标优先级（D-12）：init_boot.img 的 ramdisk 优先，boot.img 回退。
             // 双镜像时若 init_boot 已注入成功，则 boot 不再重复注入（一个落点，避免二义性）。
             val ramdisk = File(workDir, "ramdisk.cpio")
-            if (rcResult?.injected == true) {
+            if (initBootUriString.isNullOrBlank()) {
+                // 人类指令 A（2026-11-10）：自启不再依赖 ramdisk rc —— App 自己提权拉起 daemon。
+                // 未选择 init_boot（高级选项）时**不改 boot ramdisk**，避免无谓的 ramdisk 改动/AVB 风险。
+                AppLog.info(
+                    TAG,
+                    "未选择 init_boot.img：跳过开机自启 rc 注入（App 冷启动 / BOOT_COMPLETED 自引导拉起 AP 守护）",
+                )
+            } else if (rcResult?.injected == true) {
                 AppLog.info(
                     TAG,
                     "rc 已在 ${rcResult?.target} 注入成功，boot ramdisk 不再重复注入" +
@@ -819,7 +829,11 @@ object PatchPipeline {
             state.value = state.value.copy(
                 stage = PatchStage.DONE,
                 progress = 1f,
-                phase = "内核修补 / 自启注入完成，产物已导出",
+                phase = if (state.value.rcTarget.isBlank()) {
+                    "内核修补完成，产物已导出"
+                } else {
+                    "内核修补 / 自启注入完成，产物已导出"
+                },
                 running = false,
                 outputPath = exported.displayPath,
                 outputSha256 = outSha,
