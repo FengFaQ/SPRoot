@@ -9,7 +9,8 @@
 检查项：
   1. 普通字符串 / 字符字面量 / 三引号字符串 是否闭合；
   2. `()` `[]` `{}` 是否配对（忽略字符串、注释内的括号）；
-  3. 块注释是否闭合；
+  3. 块注释是否闭合（**按 Kotlin 嵌套语义**：注释里的 `/*` 会再开一层——KDoc 里写
+     `/data/adb/*` 这类路径就会踩到，真实事故 run 42809437255）；
   4. **字符串字面量后紧跟标识符/`$`**（= 极可能漏转义的嵌套双引号）：
      `"$A 与 "$B" 均在"` 在词法上被切成 3 个字符串，括号/引号都是平衡的，
      编译器才会报 "unexpected token"。本检查专门拦这一类（真实事故形态）。
@@ -33,6 +34,7 @@ def check_file(path):
     stack = []
     problems = []
     in_triple = in_str = in_char = in_line_comment = in_block_comment = False
+    block_depth = 0
     while i < n:
         c = src[i]
         nxt = src[i + 1] if i + 1 < n else ""
@@ -45,8 +47,15 @@ def check_file(path):
             i += 1
             continue
         if in_block_comment:
+            if c == "/" and nxt == "*":
+                block_depth += 1
+                i += 2
+                continue
             if c == "*" and nxt == "/":
-                in_block_comment = False
+                block_depth -= 1
+                if block_depth <= 0:
+                    in_block_comment = False
+                    block_depth = 0
                 i += 2
                 continue
             i += 1

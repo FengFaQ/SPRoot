@@ -70,8 +70,8 @@ object ApdClient {
      * **引导器**（唯一可作为"被执行文件"的路径）：永远 `nativeLibraryDir/libapd.so`。
      *
      * SELinux 域约束（真机事故，人类 2026-11-10 指出）：`untrusted_app` 域只对
-     * `nativeLibraryDir`（apk_data_file）有 execute 权限；`/data/adb/*`（adb_data_file/apk_data_file
-     * 的其它标签）**不可由 app 域 exec**。若把 `/data/adb/apd` 当引导器 → 部署完成后
+     * `nativeLibraryDir`（apk_data_file）有 execute 权限；`/data/adb/` 下的路径（adb_data_file/
+     * apk_data_file 的其它标签）**不可由 app 域 exec**。若把 `/data/adb/apd` 当引导器 → 部署完成后
      * root-exec 全线 SELinux 拒绝（"部署前能用，部署后反而不能用"）。
      * 因此引导器固定为 nativeLibraryDir；部署目标只作为**参数**交给 root 去执行。
      */
