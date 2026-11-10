@@ -694,12 +694,25 @@ init_boot.img: ramdisk=2,131,370 B     ← rc 只能注进这里
 
 → **“要修 init_boot”不是架构缺陷，而是两件事的交集**：①SK 内核无启动器（§9.1）＋②本机 ramdisk 在 init_boot（实测）。非 GKI 机型（ramdisk 在 boot）只需修 boot.img，与 KSU 的“只修 boot”表现一致。
 
+#### 9.2.1 为什么 SKRoot 本身**不需要** init_boot，而我们引入 apd 后才需要
+
+这是后来人最容易误解的一条，必须写清：**复杂度不是“无端增加”，而是产品形态变化的必然成本**。
+
+| 维度 | SKRoot / 我们的 SK 引擎（纯提权） | SPRoot 产品（提权 + 常驻服务） |
+|---|---|---|
+| 内核 patch 做的事 | 只做两件：① 按密钥把 **当前 execve 的进程**变成 root；② 隐藏自身痕迹（filldir64/audit/avc/cfi） | 同上（引擎不变） |
+| 有常驻进程吗 | **没有**——A1 文档「无 daemon、无 socket、无设备节点」，代码零命中（§9.1） | **有**：`apd`（模块管理 / 第三方 root 授权 socket / root-exec 服务） |
+| “谁在开机时拉起它” | **不存在这个问题**（无进程需拉起） | **必须回答**：rc 注入（现状）→ B（内核启动器）→ C（不建议） |
+| 需要动 ramdisk 吗 | 不需要 | 现状方案需要（本机 ramdisk 在 init_boot，§9.2 实测） |
+
+→ **结论**：SKRoot 的“零 ramdisk 改动”来自它是**纯提权方案**，不是因为它解决了启动问题；一旦我们选择“常驻 daemon 提供模块管理/授权/root-exec”，就必然产生“自启”这一新问题，而 SK 模型没有提供任何内核侧解法。若想砍掉这条复杂度，等价于砍掉模块管理与授权服务（回到 KSU 式“无 daemon + on-demand”）——那是产品决策，不是引擎优化。
+
 ### 9.3 三方案对比
 
 | | **A：App 自引导** | **B：提权时顺带拉起** | **C：init hook + `call_usermodehelper`** |
 |---|---|---|---|
 | 机制 | App 先用密钥 exec 一次（内核 hook 授 root）→ 该进程再 `exec /data/adb/apd daemon` | 在 `do_execve` 密钥命中分支后，**内核**调 `call_usermodehelper("/data/adb/apd", argv, envp, UMH_WAIT_EXEC)` | 新增 hook（如 init 首次 exec 或某低频繁 exec 点）→ 一次性标志 → `call_usermodehelper` |
-| 引擎改动 | **0** | 小（见 §9.4） | 大（时机/标志/符号/风险，见 §9.5） |
+| 引擎改动 | **0** | **中**（≈422 B shellcode + 双口令 + 1 符号，见 §9.4） | 大（时机/标志/符号/风险，见 §9.5） |
 | **能否实现“开机自启”** | ❌ 需用户打开一次 App | ❌ 需先有人提权一次 | ⚠️ 理论可以，但**触发时机在 `/data` 挂载之前**（见 §9.5） |
 | 真机风险 | 低（纯用户态链路；依赖现有 avc 绕过） | 中（改 exec 热路径；daemon 以 kernel cred/SID 运行） | **高**（早期启动路径，失败=无法开机/bootloop） |
 | 何时可交付 | **立即可做**（ui-client 已在做） | A 之后按需 | 不建议排期 |
@@ -711,41 +724,114 @@ init_boot.img: ramdisk=2,131,370 B     ← rc 只能注进这里
 
 **我们的 avc 绕过使 A 在技术上可行**（关键前提）：`avc_check` 的放行判据是「uid=0 + 满 cap + securebits=0」，而提权后进程恰好满足 → 其后续 `exec /data/adb/apd`、写 `/data/adb` 的 AVC 拒绝会被改为放行（`patch_current_avc_check.cpp:20-50` + `patch_avc_denied.cpp:25-41`）。**残留风险**：进程 SELinux **域**仍是 `untrusted_app`（改的是 cred 不是 sid），apd 在该域下的 socket/模块/setcon 行为与 init 拉起时不同，**必须真机实测**。
 
-### 9.4 若做 B：最小改动清单（含断言与负样本）
+### 9.4 若做 B：详细设计（argv / 触发点 / 只拉一次 / 失败语义 / 断言）
 
-**空间与符号预算（在真机镜像 `samples/meizu21` 抽出的 33,892,864 B Image 上实测）**：
+> 本节是“设计稿”，不含代码；Lead 确认 A 的真机结果后可直接照此开工。
 
-| 项 | 实测值 | 说明 |
+#### 9.4.1 argv 与 envp：逐条内容、字节数与顺序约束
+
+`apd` 的 clap 契约（`apd/src/cli.rs:23-27`）是 **`--superkey-file` 必须写在子命令之前**（顶层参数）——这正是交接文档 §6.8 教训 #2 的同一类坑，写反了 daemon 根本起不来（rc=2）。
+
+| # | argv 项 | 字节（含 NUL） | 说明 |
+|---|---|---|---|
+| `argv[0]` | `/data/adb/apd` | 14 | 程序路径（`defs::DAEMON_PATH` 稳定路径） |
+| `argv[1]` | `--superkey-file` | 16 | **顶层参数，必须在 `daemon` 之前** |
+| `argv[2]` | `/data/adb/sproot/key` | 21 | `defs::SPROOT_KEY_FILE`，47 字符纯文本（0600 root） |
+| `argv[3]` | `daemon` | 7 | 子命令 |
+| `argv[4]` | `NULL` | — | 指针表终止项（缺了就内核读越界） |
+| envp | `PATH=/sbin:/system/sbin:/system/bin:/system/xbin` | 48 | **不能省**：见下 |
+| envp | `ANDROID_ROOT=/system` | 21 | 兼容按 Android 环境探测的脚本 |
+| envp | `ANDROID_DATA=/data` | 19 | 同上 |
+| envp | `NULL` | — | 指针表终止项 |
+
+**envp 为什么不能传 NULL（实证）**：`apd/src/module.rs:147-158` 的 `get_common_script_envs()` 把模块脚本的 `PATH` 拼成 `"<当前 PATH>:<BINARY_DIR>"`。若 apd 以**空 envp** 被拉起，模块脚本会拿到 `PATH=:/data/adb/ap/bin` → 脚本内部调用 `sh`/`mount`/`grep` 等命令**全部找不到**，表现为“模块装了但没生效”（**静默失败**，正是我们要防的那类）。`ANDROID_ROOT`/`ANDROID_DATA` 属保守补齐（部分脚本据此判断环境），如字节紧张可先省，但 `PATH` 必须保留。
+
+#### 9.4.2 触发点：在 `do_execve` hook 的哪个位置
+
+现有 hook 结构（`patch_do_execve.cpp:73-138`，≥6.1 分支宿主在 `die` 区）：
+
+```
+[48B 内联密钥缓冲][恢复的 do_execve 首指令][密钥逐字节比较循环]
+   └─ 命中(走到 w15==0) ─→ [凭据改写: uid/gid=0 + 满 cap + securebits][清 TIF_SECCOMP/seccomp]
+   └─ 未命中 ─→ [label_end: b 回 do_execve+4]        [label_end: b 回 do_execve+4]
+```
+
+**插入点**：凭据改写与 seccomp 清理**之后**、`label_end` **之前**。理由：
+1. 此时“密钥已匹配 + 提权已完成”两个事实都成立；launcher 的任何失败都不会影响提权（**失败域解耦**，见 §9.4.4）；
+2. 此处在 `do_execveat_common` 入口、进程上下文、无锁无原子约束 → `call_usermodehelper` 可安全睡眠（`UMH_WAIT_EXEC`）；
+3. 不改变 `execve` 的语义（block 结束后照常跳回 `do_execve+4`）。
+
+#### 9.4.3 “只拉一次”：不需要可写内核标志（与 C 的关键差异）
+
+先回答 Lead 的问题：**B 不需要可写标志，因此不受“只 PC 相对寻址”的限制，B 可行**。三层保障全部在用户态 / 调用方控制下：
+
+| 层 | 机制 | 证据 |
 |---|---|---|
-| shellcode 可用区 `die` | 0x24bd4 起、到下一符号 **696 B** | ≥6.1 分支的 shellcode 宿主（`root_key_region=0x24bd4`） |
-| `die` 已用 | **180 B**（do_execve 164 + 4 个 4 B 跳转） | 含 48 B 内联密钥缓冲 |
-| `die` 余量 | **≈516 B** | 加 launcher 可用 |
-| `__drm_printfn_coredump` / `__drm_puts_coredump` | 252 B（已用 140）/ 212 B（已用 56） | 另两处宿主 |
-| 全量已打补丁字节 | 508 B | 来自真实 report.json |
-| `call_usermodehelper` | **在 kallsyms 中，0x000d5878**（下一符号间距 164 B） | patch 时可解析，无需运行时 kallsyms |
-| `kallsyms_lookup_name` | 在 kallsyms 中，0x001a4354 | 备用（不推荐运行时解析） |
+| ① **双口令（推荐，且几乎必需）** | `T_escalate = key[0:47]`（47 字符，纯提权，apd 自己也用它）；`T_launch = key[0:47] + 'D'`（48 字符，**提权 + 拉起**，仅 App 使用） | `apd/src/supercall.rs:101-138`：apd 启动时 `escalate()` 会 `execve(T_escalate)`；若 launcher 与提权共用同一口令，则“非 root 启动的 apd”会再触发一次内核拉起（有界抖动，不是死循环：UMH 拉起的 apd 是 uid 0，`supercall.rs:103-105` 会立即 `return true` 不再 execve）。双口令把这个抖动彻底归零 |
+| ② **客户端先探测** | App 先 `connect()` daemon socket（~50 ms 超时）；不存在才 exec `T_launch` → 每个 boot 只会触发一次 | ui-client 侧 10 行逻辑 |
+| ③ **apd 单实例 flock** | `apd/src/daemon.rs:136` `flock(LOCK_EX\|LOCK_NB)`：并发/重复启动只有一个成功，其余静默退出 | 已在 apd 中实现 |
 
-**改动清单（约 1–2 人日 + 真机窗口）**：
+→ 这也解释了 **C 为什么必须有一次标志**：C 的触发点（init exec / 任意 exec）**不受调用方控制**、也没有“口令”可区分，只能靠内核状态去重；而 B 的触发是“调用方拿着密钥显式要求”，天然可去重。
 
-1. **新增 `engine/src/patch_daemon_launcher.{h,cpp}`（自有代码，非上游衍生）**：asmjit 生成 launcher shellcode——
-   - 栈上构造 argv（**注意 clap 顶层参数序**，`apd` 的 `--superkey-file` 必须在子命令前）：
-     `["/data/adb/apd", "--superkey-file", "/data/adb/sproot/key", "daemon", NULL]` → 4 个内联字符串（13+15+20+7 ≈ 55 B）+ 40 B 指针表 + 调用序列，**估 250–320 B**（在 516 B 余量内，但缓冲很薄）；
-   - 字符串地址用 `adr` **PC 相对**取得（**禁止嵌入绝对内核地址**：当前 patch 模型不含 KASLR 基址，硬编码绝对地址在启用 KASLR 的机型上必崩）；
-   - `mov x3, #1`（`UMH_WAIT_EXEC`）+ 间接调用；返回失败**静默**（不 panic、不改 exec 结果）。
-2. **`analyze/symbol_analyze.{h,cpp}` 新增 `call_usermodehelper` 解析**：找不到时**降级不织入**并在 report 标 `launcher.resolved=false`（不阻断修补）。
-3. **上游衍生文件的小幅插入**：`patch_do_execve.cpp` 在密钥命中分支后加一条 `bl launcher`（约 +20 B）。**这是 B 唯一必须动上游文件的地方**；备选“另挂一个 hook 点”不可行（同一函数只能有一个入口 hook）。
-4. **CLI 契约**：新增 `--launcher <off|on>`（**默认 off**，保持现有契约与 CI 不变）+ report 新增 `launcher {enabled, symbol, shellcode_bytes, trigger}`。
-5. **组数契约**：launcher **并入 `do_execve` 组**（不新增 group）→ `hook_groups_expected` 仍为 14/15（11/12），**不破坏“组数严格等值”断言**；若作为独立组则必须同步 `hook_groups_expected_count()` + A8 矩阵 + qa 断言（不推荐）。
+#### 9.4.4 失败语义：绝不 panic、绝不影响 execve 原路径
 
-**必须新增的断言（按铁律，先证伪再入库）**：
+| 场景 | 设计行为 |
+|---|---|
+| `call_usermodehelper` 返回负值（apd 不存在 / `/data` 未挂载 / SELinux 拒绝） | **丢弃返回值**（x0 不参与任何判断）；**不 printk / 不 WARN / 不 audit**（避免 dmesg 痕迹与审计噪声） |
+| 拉起失败 | **提权仍然成立**（凭据改写已在前一步完成）；App 侧可降级走 A（自己 exec apd）→ **B 永远不成为单点故障** |
+| 重复触发 | 由 §9.4.3 三层机制收敛；即使触发两次，flock 保证只有一个 daemon |
+| 被 exec 的目标文件不存在（`T_launch` 正常不存在） | 与现有 47 字符口令行为一致：`execve` 返回 `-ENOENT`，但进程**已是 root**（`apd/src/supercall.rs:124-135` 的成功判据即 `getuid()==0`） |
+| App 侧时序 | exec `T_launch` → 拿 root → 连接 socket，失败则重试（5×100 ms），仍失败则降级 A（自己 exec apd） |
 
-| 断言 | 判据 | 负样本（必须先打红） |
+#### 9.4.5 寄存器/栈纪律（静态可断言）
+
+- 进入 block 时 `do_execveat_common` 的首指令已在 shellcode 内执行（prologue 可能已下推 sp）→ block 自己 `sub sp` 的帧必须 **成对复原**；
+- 保存并恢复 **x0–x5**（`do_execveat_common` 的入参 `fd`/`filename`/`argv`/`envp` 在 x0–x3），**不得**触碰 x19–x28/x29/x30（被调者保存寄存器）；
+- argv/envp 指针表 + 4 条字符串指针全部构造在**栈上**；
+- 字符串地址用 `adr` **PC 相对**取（禁止绝对地址：本 patch 模型不含 KASLR 基址）；
+- 调用用 **`bl`（直接相对分支，±128 MB）**：本镜像 33.9 MB，`die`@0x24bd4 → `call_usermodehelper`@0xd5878 位移 ≈ 736 KB，必在范围内；且两者随内核基址同偏移 → **KASLR 安全**；
+- **修正早期说法**：kCFI 只约束**间接调用站点**（`blr`）、BTI 只约束**间接分支目标**，`bl` 两者都不涉及 → **launcher 不依赖 `cfi_bypass` 组**（真机仍保留一条“未被拦”的验证项，成本极低）。
+
+#### 9.4.6 预算（实测口径）
+
+| 组成 | 字节 |
+|---|---|
+| argv/envp 字符串 | 14+16+21+7 + 48+21+19 ≈ **146 B** |
+| 指针表（argv 5 + envp 4） | **72 B** |
+| 第二口令缓冲（`T_launch` 48+NUL） | **49 B** |
+| 第二比较循环 + 分支标志 | ≈ **45 B** |
+| 栈帧/保存寄存器/`adr`×7/`bl`/恢复/入口跳转 | ≈ **110 B** |
+| **合计** | **≈ 422 B** |
+| `die` 余量 | **516 B** → **余量约 94 B（很薄）** |
+| 若 envp 传 NULL（不推荐） | ≈ 334 B → 余量 ~182 B，但模块脚本 PATH 失效 |
+
+→ 结论：**能做，但只够“一条固定 argv/envp + 双口令”，没有多余空间做重试/多个挂载点/额外逻辑**。这也是为什么 §9.3 把它归为“引擎侵入度中等”而非“小改”。
+
+#### 9.4.7 改动清单（约 1–2 人日 + 真机窗口）
+
+1. **新增 `engine/src/patch_daemon_launcher.{h,cpp}`（自有代码，非上游衍生）**：asmjit 生成上文 block（argv/envp/双口令/`bl`），提供 `--self-test-launcher` 用的“字节布局自描述”（供断言逐项核对）。
+2. **`analyze/symbol_analyze.{h,cpp}` 新增 `call_usermodehelper` 解析**：默认 off 时找不到只记 `launcher.resolved=false` 不阻断；`--launcher on` 时找不到 → **E202 且不产出 `--out`**（显式开启绝不静默降级）。
+3. **`patch_do_execve.cpp` 小幅插入**：在凭据改写后插入“口令判别 + `bl launcher`”（约 +30 B，含双口令分支）。这是 B 唯一必须动上游衍生文件的地方。
+4. **CLI/契约**：`--launcher <off|on>`（**默认 off**）+ report 新增 `launcher {enabled, token_is_distinct, symbol_addr, shellcode_bytes, argv, envp}`。
+5. **组数契约**：并入 `do_execve` 组 → `hook_groups_expected` 保持 14/15（11/12）不变。
+6. **真机前置**：apd `selftest --json` 新增 `startup_source`（`init-rc`/`app-exec`/`kernel-umh`）+ `parent_pid` —— 否则无法证明“哪条路径真正拉起”，B 的验收会退化成空断言。
+
+#### 9.4.8 断言与负样本（先证伪再入库）
+
+| 断言 | 判据 | 负样本（必须打红） |
 |---|---|---|
-| `--self-test-launcher`（CI 必跑） | launcher blob 中：内联字符串逐字节 == 上述 argv 四条；指针表 5 项且末项为 0；`UMH_WAIT_EXEC` 立即数 == 1；调用点为 `blr` 前有**位置无关**的目标装载（`adr/adrp+add` 或 literal load），**不得**出现裸绝对地址 | 改字符串 1 字节 / 指针表少 NULL / 立即数改 2 / 换成硬编码绝对地址 → 断言必须红 |
-| Tier B（真内核） | report `launcher.symbol_addr` == kallsyms 中 `call_usermodehelper` 偏移；`hooks[do_execve].new_bytes` 含该调用序列 | 把符号名拼错 → 期望 `launcher.resolved=false` 或 E202，**且产物仍正常生成**（不得因 launcher 失败而丢修补） |
-| 真机 S3 | apd `selftest --json` **必须新增 `startup_source`**（`init-rc` / `app-exec` / `kernel-umh`）+ `parent_pid` | 不实现该字段 → **B 无法验收**（否则又是“永远 PASS 的空断言”） |
+| `--self-test-launcher`：双口令 | `T_launch`（48 字节）≠ `T_escalate`（47 字节 + NUL），且两者逐字节前缀关系正确 | 把两口令合并成同一串 → FAIL |
+| argv 内容与顺序 | 4 条字符串逐字节相等；`argv[1] == "--superkey-file"`、`argv[3] == "daemon"`；`argv[4]` 为 NULL | 交换 1/3 顺序、少 NULL、改 1 字节 → FAIL |
+| envp | 至少含 `PATH=...` 且 PATH 非空；`envp[last] == NULL` | 删 PATH、或 envp 置 NULL → FAIL |
+| 调用形态 | blob 内**恰好一处 `bl`**，其位移解算 == `call_usermodehelper` 偏移；**不得**出现 `blr`（间接调用） | 改 `blr`、或目标偏移改 4 字节 → FAIL |
+| 等待模式 | `mov x3, #1`（`UMH_WAIT_EXEC`） | 改 0/2 → FAIL |
+| 失败静默 | `bl` 之后到返回之间**不得**有 `cbz/cbnz/tbz/tbnz`（不按返回值分支）、不得有 `prfm/str` 到 printk 类 | 插一条 `cbnz` → FAIL |
+| 栈/寄存器平衡 | `stp/ldp`、`sub sp/add sp` 成对且立即数一致；保存集覆盖 x0–x5 | 删一条 `ldp` / 帧不复原 → FAIL |
+| 无绝对地址 | 无 `movz/movk` 拼接地址、无 8 字节绝对寻址常量 | 把 `adr` 换成绝对地址 → FAIL |
+| Tier B | report `launcher.symbol_addr` == kallsyms 偏移；`hooks[do_execve].new_bytes` 含该 block | 符号名拼错 + `--launcher on` → 期望 E202 且无产物 |
+| 真机 S3 | apd `startup_source == "kernel-umh"`；App 首次提权后 daemon 可用；**无 panic/avc 风暴** | 不实现 `startup_source` → 视为未验收 |
 
-**B 的风险清单**：①kCFI/kCFI 检查（间接调用）依赖现有 `cfi_bypass` 组生效——**必须真机确认不会 panic**；②daemon 以 kernel cred（uid 0 + 满 cap）与 **kernel/init 域 SID** 运行，与 `service ... user root` 拉起的语义不同，apd 的 socket/模块/setcon 行为需实测；③每次密钥提权都会尝试拉起（apd 有单实例 `flock`，重复启动无害但有多余进程抖动；若要“只拉一次”需**可写标志**，而当前 patch 模型只写只读 text → 不建议为此引入 data 段 patch）。
+**B 的剩余风险**：①daemon 以 **kernel 域 SID + uid0** 运行（不是 init 拉起时的域），apd 的 socket/模块/`-Z` 行为需真机实测；②模块脚本的 `PATH`/cwd（UMH 的 cwd 为 `/`）需实测覆盖；③`--launcher on` 引入的是**每次提权**的一次 UMH 调用（低频，可接受）。
 
 ### 9.5 为什么不建议 C（init hook + `call_usermodehelper`）
 
