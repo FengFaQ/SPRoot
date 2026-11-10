@@ -4,15 +4,15 @@
   "engine": {
     "description": "SKRoot 修补引擎 JNI 共享库（aarch64 ET_DYN，Android 侧 System.loadLibrary(\"skrootpatch\")）",
     "artifact": "skroot-engine-arm64",
-    "run_id": 42635720094,
+    "run_id": 42817636832,
     "file": "libskrootpatch.so",
     "target": "libskrootpatch.so",
-    "sha256": "62955d8fedab5c24ae87b9472c6c5506aab55efe7d57964b03da4c54a1382fd1",
-    "size": 3018552,
+    "sha256": "e294b8aa7171425212774f2ccbe7b9fd08f987a8df3c165202f7d049e4e7d558",
+    "size": 3066816,
     "extra_assets": {
-      "ENGINE-META.txt": "ad89061d9fb034636d0a4fc39922a6164add45a8fa5679d0d09f1aad6cb25e5e",
-      "SYMBOLS-libskrootpatch.txt": "fb44c76336100c54826e38780a10ff944ce99e2c892f998ef23c05e95f1cd5b4",
-      "SHA256SUMS": "40893e9cdbf9b65d398671a7863d7b59c8bc5c481374b1571c34df1b3efb0d36"
+      "ENGINE-META.txt": "8812ce049b19b8f08daaecf508a432710cabec7df41a1e05c02e2461a6eb4717",
+      "SYMBOLS-libskrootpatch.txt": "663826aa21db479a12f555ed87f953d02a7ed8b53239968288367a235d22b42d",
+      "SHA256SUMS": "6ad3f98f19a462cd6cb6d7ec6b6a14421f6ac128b1d52b1c978a1bf51ccd5e1a"
     }
   },
   "apd": {
