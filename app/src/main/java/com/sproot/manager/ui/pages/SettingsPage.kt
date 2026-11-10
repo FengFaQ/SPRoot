@@ -277,12 +277,8 @@ fun SettingsPager(
                                         return@Thread
                                     }
                                     val nativeLib = context.applicationInfo.nativeLibraryDir
-                                    val r = ApdClient.apd(
-                                        context = context,
-                                        superKey = k,
-                                        subCommand = listOf("deploy", "--source", nativeLib),
-                                        timeoutSec = 120,
-                                    )
+                                    // 部署链固定：libapd.so root-exec -- libapd.so deploy --source <nativeLib>
+                                    val r = ApdClient.deployApd(context, k, nativeLib)
                                     deployResult = buildString {
                                         append("exit=").append(r.exitCode).append("（").append(r.describe()).append("）")
                                         if (r.stdout.isNotBlank()) append("\n").append(r.stdout.trim())

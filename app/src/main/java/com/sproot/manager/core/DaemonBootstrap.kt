@@ -128,7 +128,8 @@ object DaemonBootstrap {
         var lastProbe: ApdSelfTest.Result = probe
         try {
             val argv = listOf(
-                ApdClient.apdBinary(context).absolutePath,
+                // 引导器：app 域只能 exec nativeLibraryDir；/data/adb/apd 仅作为 root 的目标命令
+                ApdClient.apdBootstrap(context).absolutePath,
                 "--superkey-file", keyFile.absolutePath,
                 "root-exec", "--",
                 DEPLOYED_DAEMON, "--superkey-file", DEPLOYED_KEY, "daemon",

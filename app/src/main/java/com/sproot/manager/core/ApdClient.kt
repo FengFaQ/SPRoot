@@ -37,6 +37,9 @@ object ApdClient {
     const val EXIT_NOT_EXECUTABLE = 126
     const val EXIT_NOT_FOUND = 127
 
+    /** 部署目标（app 域不可 exec，只作为 root 的目标命令参数） */
+    const val DEPLOYED_APD_PATH = "/data/adb/apd"
+
     /** 管理器侧串行化 root 操作（§8.1-4：AP 不保证并发安全） */
     private val rootLock = ReentrantLock(true)
 
@@ -63,24 +66,42 @@ object ApdClient {
         }
     }
 
-    /** apd 二进制位置：首装前用 APK 自带副本，部署后用 /data/adb/apd */
+    /**
+     * **引导器**（唯一可作为"被执行文件"的路径）：永远 `nativeLibraryDir/libapd.so`。
+     *
+     * SELinux 域约束（真机事故，人类 2026-11-10 指出）：`untrusted_app` 域只对
+     * `nativeLibraryDir`（apk_data_file）有 execute 权限；`/data/adb/*`（adb_data_file/apk_data_file
+     * 的其它标签）**不可由 app 域 exec**。若把 `/data/adb/apd` 当引导器 → 部署完成后
+     * root-exec 全线 SELinux 拒绝（"部署前能用，部署后反而不能用"）。
+     * 因此引导器固定为 nativeLibraryDir；部署目标只作为**参数**交给 root 去执行。
+     */
+    fun apdBootstrap(context: Context): File =
+        File(context.applicationInfo.nativeLibraryDir, "libapd.so")
+
+    /** 部署目标（daemon 真实路径）：只能作为 root-exec 的目标命令参数，不得由 app 域直接 exec。 */
+    fun deployedApd(): File = File(DEPLOYED_APD_PATH)
+
+    /** 命令路径：部署后用 `/data/adb/apd`（由 root 执行），首装前用引导器副本。 */
     fun apdBinary(context: Context): File {
-        val deployed = File("/data/adb/apd")
-        return if (deployed.isFile) deployed else File(context.applicationInfo.nativeLibraryDir, "libapd.so")
+        val deployed = deployedApd()
+        return if (deployed.isFile) deployed else apdBootstrap(context)
     }
 
     fun status(context: Context): CapabilityItem {
-        val bin = apdBinary(context)
+        // 可执行性按**引导器**判定（app 域只允许 exec nativeLibraryDir）
+        val bin = apdBootstrap(context)
         val present = bin.isFile
         val aarch64 = present && Elf.isAarch64(bin.absolutePath)
         val exec = present && bin.canExecute()
+        val deployed = deployedApd()
         return CapabilityItem(
             key = "apd",
             label = "AP 守护二进制（root-exec 唯一入口）",
             ok = present && aarch64 && exec,
             detail = buildString {
-                append("路径=${bin.absolutePath}；存在=$present；可执行=$exec；架构=")
+                append("引导器=${bin.absolutePath}；存在=$present；可执行=$exec；架构=")
                 append(if (present) (Elf.readHeader(bin.absolutePath)?.machineName ?: "非 ELF") else "—")
+                append("\n部署目标=").append(deployed.absolutePath).append("（存在=").append(deployed.isFile).append("）")
                 if (!present) append("\n首次使用前需完成部署（设置 → 部署 AP）")
             },
             // 骨架阶段不阻断修补（修补本身是用户态纯文件操作）；部署完成后再置 true
@@ -109,7 +130,8 @@ object ApdClient {
     ): Result {
         require(command.isNotEmpty()) { "root-exec 需要目标命令" }
         return rootLock.withLockCompat {
-            val bin = apdBinary(context)
+            // 引导器永远是 nativeLibraryDir/libapd.so（SELinux：app 域不得 exec /data/adb/*）
+            val bin = apdBootstrap(context)
             val keyFile = writeKeyFile(context, superKey)
             try {
                 // --superkey-file 是 apd 顶层参数（clap）：必须放在子命令 root-exec 之前，
@@ -181,7 +203,21 @@ object ApdClient {
         }
     }
 
-    /** 便捷：root-exec 包裹 `apd <subcommand...>` */
+    /**
+     * 首次部署 / 重新部署：引导器提权后执行**引导器自身**的 `deploy`。
+     *
+     * 自举链（人类 2026-11-10 要求校验）：
+     * `libapd.so --superkey-file <keyfile> root-exec -- libapd.so deploy --source <nativeLib>`
+     * —— 此时 `/data/adb/apd` 还不存在（或不应作为引导器），deploy 成功后写入 `/data/adb/apd`。
+     */
+    fun deployApd(context: Context, superKey: String, sourceDir: String): Result = rootExec(
+        context = context,
+        superKey = superKey,
+        command = listOf(apdBootstrap(context).absolutePath, "deploy", "--source", sourceDir),
+        timeoutSec = 120,
+    )
+
+    /** 便捷：root-exec 包裹 `apd <subcommand...>`（命令路径部署后优先 /data/adb/apd，由 root 执行） */
     fun apd(
         context: Context,
         superKey: String,
@@ -232,7 +268,8 @@ object ApdClient {
 
     /** 直接 exec（非 root；仅用于只读探测，如 version/selftest） */
     fun runDirect(context: Context, args: List<String>, timeoutSec: Int = 30): Result {
-        val bin = apdBinary(context)
+        // 直接 exec 由 app 域发起 → 只能用引导器（/data/adb/* 会被 SELinux 拒绝）
+        val bin = apdBootstrap(context)
         val argv = listOf(bin.absolutePath) + args
         if (!bin.isFile) {
             return Result(
@@ -282,8 +319,9 @@ object ApdClient {
         }
     }
 
-    /** 非 root 探测：`apd version --json`（§8.3，任意身份） */    fun versionProbe(context: Context): Result {
-        val bin = apdBinary(context)
+    /** 非 root 探测：`apd version --json`（§8.3，任意身份）；app 域直接 exec → 用引导器。 */
+    fun versionProbe(context: Context): Result {
+        val bin = apdBootstrap(context)
         if (!bin.isFile) {
             return Result(
                 exitCode = EXIT_NOT_FOUND,

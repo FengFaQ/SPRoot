@@ -113,8 +113,15 @@ android.newDsl=false
 ```
 App 冷启动 / 收到 BOOT_COMPLETED（新增 RECEIVE_BOOT_COMPLETED + BootReceiver）
   → apd selftest --json 探测（stage=daemon_ready 即在跑，幂等，不重复启动）
-  → 未运行且已部署 → apd root-exec -- /data/adb/apd --superkey-file /data/adb/sproot/key daemon
+  → 未运行且已部署 → **libapd.so（引导器，nativeLibraryDir）** root-exec --
+    `/data/adb/apd --superkey-file /data/adb/sproot/key daemon`（部署目标，由 root 执行）
     （daemon 常驻；确认就绪后销毁 root-exec 父进程，daemon 在独立进程组存活）
+
+**SELinux 域约束（人类 2026-11-10 指出，踩坑 #7）**：app 域（`untrusted_app`）只对
+`nativeLibraryDir`（apk_data_file）有 execute 权限，`/data/adb/*` 一律**只能作为参数**交给 root 执行。
+因此 `ApdClient` 明确拆分：`apdBootstrap()` = nativeLibraryDir/libapd.so（root-exec 引导器，永远不变）、
+`apdBinary()/deployedApd()` = `/data/adb/apd`（部署目标/命令参数）；`status()` 按引导器判定可执行性；
+部署链固定 `libapd.so root-exec -- libapd.so deploy --source <nativeLib>`（首装 `/data/adb/apd` 尚不存在）。
   → 未部署（undeployed/escalation_failed）= 正常初始态，不标红 → App 不重试拉起
   → 拉起失败 → 结果落 SharedPreferences，主页以**错误卡显示原因**（不静默，下次启动/开机重试）
 ```
@@ -605,6 +612,7 @@ python3 quality/static/check_kt_imports.py
 | 2 | 42637756697 | 跨包用 Composable 漏 import；函数形参改名后调用点未同步 + 漏必填参数 | ✅ `check_kt_imports` A / `check_kt_signatures` 覆盖 |
 | 3 | 42722204812 | Compose 扩展函数 `drawIntoCanvas` 漏 import（扩展函数写在别的包） | ✅ `check_kt_imports` B 覆盖（扩展名白名单） |
 | 4 | 42721703071 | `Icons.Rounded.*` / miuix 图标名不存在或依赖已移除 | ✅ `check_kt_imports` C 全面禁用 material `Icons.*`；miuix 图标名仍需编译校验（白名单暂不含图标名） |
+| 7 | （真机必炸，未进 CI） | **SELinux 域**：`untrusted_app` 只能 exec `nativeLibraryDir`；把部署后的 `/data/adb/apd` 当 root-exec 引导器 → 部署完成后 root-exec 全被拒（"越装越坏"） | ✅ 代码已拆分：`apdBootstrap()`=nativeLibraryDir（唯一引导器）、`apdBinary()/deployedApd()`=部署目标（只作 root 目标命令参数）；`status()` 按引导器判定；部署链固定 `libapd.so → root-exec -- libapd.so deploy`。属静态检查器边界（同 #6），靠契约+真机验证 |
 | 6 | 42807799287 | Android 平台 API 存在性（`ProcessBuilder.Redirect.DISCARD` 在目标 bootClasspath 上不可用）——静态文本检查器无法判断"某个 Java/Android API 在当前 compileSdk 是否存在" | ⚠️ 边界：编译器/lint 是唯一防线；已记入 §10 边界（本次改为 `Redirect.to(/dev/null)`） |
 | 5 | 42805281686 | **本项目自有扩展函数**跨包使用却删掉了 import（`context.copyToClipboard(...)`；旧检查器只查"定义在别的包的大写类型/Composable"，漏了小写扩展） | ✅ `check_kt_imports` 新增规则 D（自动收集 `fun Receiver.name(...)`，非 private 的跨包使用必须 import）；负样本已验证 FAIL |
 
