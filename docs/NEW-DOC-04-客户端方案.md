@@ -626,6 +626,7 @@ python3 quality/static/check_kt_imports.py
 | 2 | 42637756697 | 跨包用 Composable 漏 import；函数形参改名后调用点未同步 + 漏必填参数 | ✅ `check_kt_imports` A / `check_kt_signatures` 覆盖 |
 | 3 | 42722204812 | Compose 扩展函数 `drawIntoCanvas` 漏 import（扩展函数写在别的包） | ✅ `check_kt_imports` B 覆盖（扩展名白名单） |
 | 4 | 42721703071 | `Icons.Rounded.*` / miuix 图标名不存在或依赖已移除 | ✅ `check_kt_imports` C 全面禁用 material `Icons.*`；miuix 图标名仍需编译校验（白名单暂不含图标名） |
+| 9 | 42815365839 | 同一文件重复 import（脚本替换 `import ...Card` 前缀时命中 `CardDefaults`，插入两次）→ `Conflicting import` | ✅ `check_kt_imports` 新增规则 E（重复 import 直接失败）；负样本验证 FAIL |
 | 8 | 42809437255 | KDoc 里写 `/data/adb/*`：Kotlin 块注释**可嵌套**，其中的 `/*` 再开一层 → 注释吞到文件尾（`Unclosed comment`） | ✅ `check_kt_syntax` 规则 3 改为按嵌套深度计数，EOF 未闭合即报错；负样本验证 FAIL |
 | 7 | （真机必炸，未进 CI） | **SELinux 域**：`untrusted_app` 只能 exec `nativeLibraryDir`；把部署后的 `/data/adb/apd` 当 root-exec 引导器 → 部署完成后 root-exec 全被拒（"越装越坏"） | ✅ 代码已拆分：`apdBootstrap()`=nativeLibraryDir（唯一引导器）、`apdBinary()/deployedApd()`=部署目标（只作 root 目标命令参数）；`status()` 按引导器判定；部署链固定 `libapd.so → root-exec -- libapd.so deploy`。属静态检查器边界（同 #6），靠契约+真机验证 |
 | 6 | 42807799287 | Android 平台 API 存在性（`ProcessBuilder.Redirect.DISCARD` 在目标 bootClasspath 上不可用）——静态文本检查器无法判断"某个 Java/Android API 在当前 compileSdk 是否存在" | ⚠️ 边界：编译器/lint 是唯一防线；已记入 §10 边界（本次改为 `Redirect.to(/dev/null)`） |

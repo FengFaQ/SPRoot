@@ -13,6 +13,7 @@
   B. 已知库扩展函数（KNOWN_EXTENSION_IMPORTS）被使用但缺对应 import；
   D. **本项目自有扩展函数**（`fun Context.xxx(...)` 等）跨包使用必须 import
      （真实事故：ModulesPage 用 `context.copyToClipboard(...)` 却删掉了 import）；
+  E. **重复 import**（同一文件里同一 import 出现两次 → `Conflicting import`，真实事故 run 42815365839）；
   C. 源码出现 `Icons.Rounded|Filled|Outlined|Default|AutoMirrored` 或 import
      `androidx.compose.material.icons.*` → 直接失败（改用 `MiuixIcons.*`）。
 字符串/注释内容不参与匹配（避免文档示例误报）。
@@ -221,6 +222,17 @@ def main():
         imports = set()
         for m2 in re.finditer(r"^\s*import\s+([\w.]+)(?:\s+as\s+(\w+))?", s, re.M):
             imports.add(m2.group(2) or m2.group(1).split(".")[-1])
+
+        # E) 重复 import（脚本拼接/替换时的高频事故）
+        seen_imports = []
+        for m2 in re.finditer(r"^\s*import\s+([\w.]+)(?:\s+as\s+(\w+))?\s*$", s, re.M):
+            full = m2.group(1) + ((" as " + m2.group(2)) if m2.group(2) else "")
+            if full in seen_imports:
+                line = s[:m2.start()].count("\n") + 1
+                bad += 1
+                print("%s:%d: duplicate import '%s'（Conflicting import）" % (path, line, full))
+                break
+            seen_imports.append(full)
 
         # A) 跨包缺 import
         for name, pkgs in defs.items():
