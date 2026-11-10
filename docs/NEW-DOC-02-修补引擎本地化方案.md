@@ -22,6 +22,7 @@
 | **密钥 ABI 契约（P0，提权链）** | CLI `--key` **严格 48 字符**（47/49/非 alnum → E101）；内核只写 **`key[0:47]` + NUL = 48 字节**（`embed_key_bytes()`，内联断言）；`report.key_spec` 输出 `abi="47+nul"/bytes=48/last_byte_is_nul=true/input_len=48`（§7.5）。行为证据：A10 `--self-test-keyabi` 17 例（CI 必跑）+ Tier B B7。**用户态提权串必须 47 字符**。 |
 | **用户态 daemon 启动方式（2026-11-10 评估）** | SK 引擎**无任何内核态拉起用户态的能力**（`call_usermodehelper`/`kernel_thread`/`kthread_run`/`init_task` 全零命中）；KSU 亦需改 ramdisk/init_boot，APatch 靠常驻内核运行时做 init.rc 虚拟化才不需要。**选型：A（App 自引导）先落地 → B（提权时内核顺带拉起）作兜底 → C（init hook + umh）不建议**。详见 §9。 |
 | **模块卸载 umount modules（2026-11-10 评估）** | 符号可用（`path_umount`/`kern_path`/`path_put` 实测在 kallsyms），setuid hook 结构可行；但静态 shellcode 无运行时数据 → 只能「固定挂载点 + 全局」，**做不出 per-app 开关**；且模块挂载由 metamodule 决定 → 覆盖率不可控。**建议方案 ③（不做，UI 不出该开关）**；`filldir64` 只挡列目录、挡不住 `mountinfo`/`statfs`/已知路径 `open`。**⚠️ 本评估只完成了符号级与代码级验证，真机 `path_umount` 调用未验证**（见 §10「验证边界」）。详见 §10。 |
+| **rc 虚拟化（APatch 路线，2026-11-10 复核）** | hook `__arm64_sys_openat` → 把 init 的 rc 打开重定向到 `/dev/user_init.rc`（原 rc + 追加模板）→ **init 自己在正确时机 `exec` apd**，可**彻底免 init_boot**；空间实测 `.text` 零洞 7 处共 **63.8 KB**（单洞 53.6 KB）→ 判据通过；所需符号真机全部可解析；比 APatch 少一个 `su -Z` 依赖。**结论：可立项（默认 off 可选组）**。详见 §11。 |
 | 推荐集成 | **主形态 JNI（`libskrootpatch.so` + `System.loadLibrary("skrootpatch")`）**，次形态静态 exec（`skroot-patch` 从 `nativeLibraryDir` 真实路径 exec，**禁止** symlink 到 `filesDir`；该可执行件默认不进 APK）。 |
 | 实测编译耗时 | 全量 100+ TU，12 核并行 **18 秒**（`make objs`，见 §3.4）。 |
 | 打包工具 | **magiskboot v31.1 ARM64**（SKRoot 官方路径；988,984 B，静态 AArch64，sha256 `97e9ec75…bb54`），CI 内固定版本+哈希校验并随 artifact 分发；自研 bootimg 保留为交叉校验/回退（§7）。**禁止 AIK**。 |
@@ -134,7 +135,7 @@ $NDKB/aarch64-linux-android29-clang++ -shared -static-libstdc++ -Wl,-soname,libs
 llvm-strip --strip-all <build>/jni/libskrootpatch.so
 ```
 
-**asmjit / capstone 如何编**：两者都是**源码内编**（非预编译库），asmjit 只编 `asmjit/arm/*` + `asmjit/core/*`（**裁掉 x86 后端可省 ~200 KB**，当前 Makefile 仍包含 x86 源，见 §12-R3），capstone 只编 `arch/AArch64` + 公共 `cs.c/MC*.c/SStream.c/utils.c/Mapping.c`。两者与目标架构无关（asmjit 是「生成 arm64 机器码」，capstone 是「反汇编 arm64」），可在任意宿主上交叉编译，实测 0 报错（仅 263 处 `-Wunused-function` 类告警）。
+**asmjit / capstone 如何编**：两者都是**源码内编**（非预编译库），asmjit 只编 `asmjit/arm/*` + `asmjit/core/*`（**裁掉 x86 后端可省 ~200 KB**，当前 Makefile 仍包含 x86 源，见 §13-R3），capstone 只编 `arch/AArch64` + 公共 `cs.c/MC*.c/SStream.c/utils.c/Mapping.c`。两者与目标架构无关（asmjit 是「生成 arm64 机器码」，capstone 是「反汇编 arm64」），可在任意宿主上交叉编译，实测 0 报错（仅 263 处 `-Wunused-function` 类告警）。
 
 ### 3.3 产物与校验（实测）
 
@@ -633,12 +634,12 @@ magiskboot 来自 Magisk（**GPL-3.0**），我们以**独立可执行程序**�
 
 证据：A6g/A6h（长度守卫）、A10（`--self-test-keyabi` 17 例，CI 必跑）、Tier B B4/B7（真内核产物字节）。
 
-## 9. 用户态守护进程的启动方式：三种方案对比与选型（2026-11-10 评估）
+## 9. 用户态守护进程的启动方式：四种方案对比与选型（A/B/C/C′，2026-11-10 评估）
 
 > **本节结论先行**：
 > 1. **“KSU/APatch 都不需要修补 init_boot”这个前提只对 APatch 成立，对 KSU 不成立** —— KSU 同样要改 ramdisk（`/init` → ksuinit → 加载 ko → exec `init.real`），在 GKI+init_boot 机型上改的就是 **init_boot**（见 §9.2 证据）。
 > 2. 我们**确实没有**任何“从内核态拉起用户态进程”的能力（§9.1 代码级核对），这是 SK 上游「零常驻内核运行时」模型的直接推论，不是实现遗漏。
-> 3. **建议**：**A（App 自引导）先落地验证**；**B（提权时顺带拉起）作为 A 的兜底，待 A 真机结果再决定**；**C（init hook + `call_usermodehelper`）不建议做**，C′（init.rc 虚拟化，APatch 路线）超出 SK 静态 patch 模型，且只能 clean-room。**本轮不动代码。**
+> 3. **建议**：**A（App 自引导）先落地验证**；**B（提权时顺带拉起）作为兜底**；**C（init hook + `call_usermodehelper`）不建议做**；**C′（rc 虚拟化，APatch 路线）已在 2026-11-10 复核中推翻本节原否决**（代码洞 63.8 KB 实测、无需可写标志、时机由 rc 语义解决）→ 见 **§11**，它是"彻底免 init_boot"的正解，需 clean-room 实现。**本轮不动代码。**
 
 ### 9.1 现状核对：SK 引擎有没有“拉起用户态”的能力？
 
@@ -707,7 +708,7 @@ init_boot.img: ramdisk=2,131,370 B     ← rc 只能注进这里
 
 → **结论**：SKRoot 的“零 ramdisk 改动”来自它是**纯提权方案**，不是因为它解决了启动问题；一旦我们选择“常驻 daemon 提供模块管理/授权/root-exec”，就必然产生“自启”这一新问题，而 SK 模型没有提供任何内核侧解法。若想砍掉这条复杂度，等价于砍掉模块管理与授权服务（回到 KSU 式“无 daemon + on-demand”）——那是产品决策，不是引擎优化。
 
-### 9.3 三方案对比
+### 9.3 四方案对比（含 C′）
 
 | | **A：App 自引导** | **B：提权时顺带拉起** | **C：init hook + `call_usermodehelper`** |
 |---|---|---|---|
@@ -720,7 +721,9 @@ init_boot.img: ramdisk=2,131,370 B     ← rc 只能注进这里
 **A 的真实定位（必须说清，避免误判）**：A **不是 rc 注入的替代方案**，而是**首版降低刷机面/验证成本的路径**：
 - 现状链路本来就存在“首次部署必须有一次用户态 root”的鸡生蛋（`apd deploy` 要写 `/data/adb/sproot/key`，`/data/adb` 仅 root 可写）——这一步**任何方案都躲不掉**，rc 注入解决的是**之后每次开机**的自动拉起；
 - A 能让“首版不注入 rc 也能跑通全链”（App 打开即可用），代价是**第三方 App 的 root 依赖用户先打开 SPRoot Manager**（daemon 未起时无 socket 授权），且模块开机挂载/`bootloop` 计数时机会后移；
-- 因此 A/B 都是“**免 init_boot 但放弃开机自启**”；要在免 init_boot 的同时保留开机自启，只有 C 或 C′（APatch 路线），二者都要求常驻内核运行时。
+- 因此 A/B 都是“**免 init_boot 但放弃开机自启**”；要在免 init_boot 的同时保留开机自启，只有 **C′（rc 虚拟化）**——它**不需要常驻内核运行时**（静态 shellcode + 文件 IO 即可，与 APatch 的实现形态不同但机制等价，见 §11）；C（init exec + umh）不可行。
+
+**C′（rc 虚拟化）补充（2026-11-10 复核）**：机制 = hook `__arm64_sys_openat`，把 init 对 `/system/etc/init/hw/init.rc` 的打开重定向到 `/dev/user_init.rc`（内容 = 原 rc + `apd/assets/init.sproot.rc` 的等价模板）→ **init 自己在 `post-fs-data`/`boot_completed` 时机 exec apd**；我们比 APatch 少一个 `su -Z` 依赖（init 本身 uid0+满cap，`avc_denied` 会放行）。空间与符号均已实测通过（§11.1/§11.3），**结论：可立项，是"彻底免 init_boot"的正解**（详见 §11.7）。
 
 **我们的 avc 绕过使 A 在技术上可行**（关键前提）：`avc_check` 的放行判据是「uid=0 + 满 cap + securebits=0」，而提权后进程恰好满足 → 其后续 `exec /data/adb/apd`、写 `/data/adb` 的 AVC 拒绝会被改为放行（`patch_current_avc_check.cpp:20-50` + `patch_avc_denied.cpp:25-41`）。**残留风险**：进程 SELinux **域**仍是 `untrusted_app`（改的是 cred 不是 sid），apd 在该域下的 socket/模块/setcon 行为与 init 拉起时不同，**必须真机实测**。
 
@@ -835,13 +838,20 @@ init_boot.img: ramdisk=2,131,370 B     ← rc 只能注进这里
 
 ### 9.5 为什么不建议 C（init hook + `call_usermodehelper`）
 
+> **⚠️ 适用范围（2026-11-10 复核更正）**：以下 4 条**只针对 C（init exec + `call_usermodehelper`）**；**不适用于 C′（rc 虚拟化）**——rc 虚拟化把时机交回 init 的 rc 语义、且无需内核可写状态，故这些否决**不成立**。C′ 见 **§11**（结论：可行、已具备立项条件）。
+
 > **与 B 的分水岭**：C 的触发点不受调用方控制（且无口令可区分）→ 只能靠**内核可写状态**去重，因此必然踩上“需要可写段 + 运行期基址（KASLR）”这条本引擎刻意回避的线；B 由调用方持密钥显式触发 → 去重全在用户态。
 
 1. **触发时机不成立（硬事实）**：init 由 `kernel_init` exec，`/data` 由 init 自己在其后的阶段挂载 → “hook init 首次 exec 就拉 daemon”时 `/data/adb/apd` **还不存在**，UMH 必然失败。要可用必须“等 /data 就绪” → 需要轮询/延迟/重试逻辑。
 2. **“只拉一次”需要可写内存**：一次性标志必须放在可写段（`.data`/`.bss`），而 shellcode 取该地址同样需要运行期基址（KASLR）推导；当前引擎刻意只用 PC 相对寻址（零 KASLR 依赖），引入绝对地址即新增一类机型风险。
 3. **SID 不对（APatch 用实证避开了这一点）**：UMH 的 helper 继承 kernel 上下文（`kthreadd` → `init_cred`），exec 后**不是** `u:r:magisk:s0` / `init` 域。APatch 特意走“由 init 自己 exec（`su -Z u:r:magisk:s0 exec /data/adb/apd`）”，就是为了拿对域。我们走 UMH 会得到一个“root 但域不对”的 daemon，apd 的后续能力（模块挂载、域转换、socket 授权）都可能静默失效。
 4. **风险-收益倒挂**：C 的唯一收益是“省掉 init_boot 修补”，但 §9.2 表明 KSU 也修 ramdisk/init_boot → 该收益并不构成架构优势；而 C 失败即“无法开机”，代价是最高等级。
-5. **C′（APatch 的 init.rc 虚拟化）为什么也不现实**：它需要**常驻运行时**（syscall hook 框架、`vmalloc`、运行时 kallsyms、`/dev` 写入、`copy_to_user` 路径改写），本质是 KernelPatch 级子系统；SK 引擎是“一次性静态 patch”，无分配器、无运行时符号解析 → 要做等于重写一套 KernelPatch，且 KernelPatch 为 GPL-2.0-or-later，**不能混入 proprietary 的 SK 引擎**（只能 clean-room，工期以周计）。
+5. **C′（APatch 的 init.rc 虚拟化）不在此列 —— 本节对它的否决已作废**（2026-11-10 复核更正，见 §11）：
+   - **不需要常驻运行时**：静态 shellcode 即可完成「openat 入口过滤 → 读原 rc → 写 `/dev/user_init.rc` → 原地覆写用户 path」，所需函数（`strncpy_from_user`/`filp_open`/`vfs_llseek`/`kernel_read`/`kernel_write`/`filp_close`/`vmalloc`/`vfree`/`__arch_copy_to_user`）在真机 kallsyms 中**全部可解析**（§11.3），不需要运行时符号解析、不需要 hook 框架；
+   - **不需要内核可写状态**：重写 `/dev/user_init.rc` 是幂等的，无需 `replaced` 标志 → 不踩「可写段 + KASLR 基址」这条线；
+   - **解决了时机问题**：时机由 rc 语义交回 init（`post-fs-data` / `boot_completed`），不在 init exec 时拉起；
+   - **空间判据已过**：`.text` 零洞实测 **63.8 KB（单洞 53.6 KB）**（§11.1）；
+   - 遗留成本 = clean-room 实现 + 5 项真机验证（§11.4），**是"需要一轮真机"，不是"不可行"**。
 
 ### 9.6 上游与许可约束（对本议题的直接结论）
 
@@ -857,6 +867,7 @@ init_boot.img: ramdisk=2,131,370 B     ← rc 只能注进这里
 2. **B 暂不排期，等 A 的真机结论**：若 A 的失败点正是“提权进程 exec/写 `/data/adb` 被拒”，则 B 的价值成立（由内核代为拉起），再按 §9.4 实施；若 A 顺利，**B 无必要**（A 已能拉起 daemon）。
 3. **C 不做**；若未来确实要实现“免 ramdisk 且开机自启”，应单独立项评估 **C′（rc 虚拟化）**——需明确“引入常驻内核运行时”这一架构变更，并做许可与真机风险双重评审，**不要**以“加个 hook”的名义低估工程量。
 4. **对外口径**：「我们要修 init_boot」的准确表述是——**本机 ramdisk 在 init_boot（GKI 布局），而我们的守护自启走 ramdisk rc（KSU 走 ramdisk `/init`，同一层级）**；APatch 不需要 ramdisk 是因为它有常驻内核运行时做 rc 虚拟化，不是因为我们漏了什么。
+5. **C′（rc 虚拟化）已具备立项条件**（2026-11-10 复核）：`.text` 零洞 **63.8 KB（单洞 53.6 KB）**；§9.5 对 C 的两条硬否决（时机 / 可写标志）**都不适用于 C′** → "彻底免 init_boot"的正解是 C′（见 §11.7）；B 降为 C′ 真机失败时的兜底。
 
 ## 10. 模块卸载（umount modules）可行性评估（2026-11-10）
 
@@ -1047,7 +1058,184 @@ zygote fork → unshare(CLONE_NEWNS) → mount 私有化(/storage,/mnt 等)
 - 接受“全局开关”（授权页不做 per-app umount 开关，或明确标注 per-app 仅为记录、不影响内核行为——**不推荐**）；
 - 单列一轮真机验证（S3-umount），未过真机前不进入发布门禁。
 
-## 11. 包体与体积
+## 11. rc 虚拟化（APatch 路线）：可行性与最小设计（2026-11-10 复核）
+
+> **结论先行**：
+> 1. **推翻 §9.5 的否决前提**：APatch 不是"在 init exec 时拉起进程"，而是**把 init 对 rc 文件的 `openat` 重定向到 `/dev/user_init.rc`**（内容 = 原 rc 全文 + 追加模板），于是 **init 自己在 `post-fs-data` / `boot_completed` 等正确时机 `exec` apd**。§9.5 第 1 条（"时机不成立"）**不适用于本方案** —— 时机正是由 rc 语义推迟到正确位置的。
+> 2. **代码空间实测：够，且富余**。`.text` 内零填充空洞 **7 处、合计 63.8 KB**，最大一处 **54,936 B**（0x00fb2968–0x00fc0000）—— 满足"≥2 KB"判据，rc 虚拟化在空间上成立（§11.1）。
+> 3. **我们比 APatch 少一个依赖**：APatch 追加的 rc 行用 `supercmd su -Z <magisk 域> exec /data/adb/apd` 来拿正确 SELinux 域；**我们不需要 `su`** —— init 本身就是 uid 0 + 满 cap，且我们的 `current_avc_check`/`avc_denied` 恰对「uid0 + 满 cap + securebits=0」的进程把 AVC 拒绝改为放行（`patch_current_avc_check.cpp:20-50`）。rc 行可直接写 `exec -- /data/adb/apd --superkey-file /data/adb/sproot/key daemon`。
+> 4. **仍须 clean-room**：KernelPatch 为 GPL-2.0-or-later，**不得复制代码进我们的 proprietary 引擎**；本节只记录"理解机制后的自研设计"。
+> 5. **代价与风险**：引擎新增 1 个可选组（默认 off，`hook_groups_expected` 契约需扩参）+ ≈800 B 新 shellcode（放新代码洞）+ **真机验证窗口**（openat 时机 / PAN-uaccess / SELinux / init 解析 / 开机稳定性 5 项，静态断言覆盖不到）。
+
+### 11.1 代码空间实测（决定性前提）
+
+**段边界**（真机 Image `samples/meizu21` 抽出的 33,892,864 B，符号来自引擎 `--dump-symbols`，地址 = 文件偏移 = 运行期偏移）：
+
+| 区域 | 范围 | 大小 | 运行期属性 | 能否放 shellcode |
+|---|---|---|---|---|
+| `.head.text`（含 arm64 Image 头） | `0x000000–0x010000` | 64 KB | RX，**启动早期代码**（0x1000 之后 100% 非零） | ❌ 覆盖会破坏启动路径（上游 `<6.1` 分支用 `{0x200,0x300}` 属历史遗留 hack，不建议跟随） |
+| **`.text`** | `0x010000–0xfc0000` | **16.6 MB** | **RX、常驻、不释放** | ✅ **唯一合法区**（见零洞清单） |
+| `.rodata` | `0xfc0000–0x1a58000` | 10.9 MB | RO + **NX**（GKI `CONFIG_STRICT_KERNEL_RWX=y`；真机需复核） | ❌ 执行即 fault |
+| `.init.text` / `.init.data` | `0x1a70000–0x1e70000` | **4.0 MB** | **启动后 `free_initmem()` 归还 buddy** | ❌ 之后可能被任意分配复用 |
+| `.data` / `.bss` | `0x1e70000–0x2100000` | 2.6 MB | RW + NX；且 Image 文件只到 `_edata=0x2052a00`（bss 不落盘） | ❌ NX，且 bss 不在文件里 |
+
+**`.text` 内零填充空洞实测（连续 0x00 且 ≥1 KB，共 7 处 / 63.8 KB）**：
+
+| # | 地址范围 | 大小 | 备注 |
+|---|---|---|---|
+| **1** | `0x00fb2968–0x00fc0000` | **54,936 B（53.6 KB）** | `__idmap_text_end`（0xfb2904）之后约 0x64 起，直到 `_etext` 的**对齐填充**（`_etext=0xfc0000` 为 256 KB 对齐）→ **首选** |
+| 2 | `0x00fb1618–0x00fb2000` | 2,536 B | |
+| 3 | `0x00f937d4–0x00f94000` | 2,092 B | |
+| 4 | `0x00faa8ac–0x00fab001` | 1,877 B | |
+| 5 | `0x00f95a54–0x00f96000` | 1,452 B | |
+| 6 | `0x00f982f0–0x00f98800` | 1,296 B | |
+| 7 | `0x00f94ba4–0x00f95000` | 1,116 B | |
+
+补充实测：这些区间在镜像文件中**逐字节为 0x00**（例：`0xfb2904–0xfc0000` 区间非零字节仅 88/55,036 ≈ 0.2%），且位于 `[_text,_etext)` 之内 → 属于 RX 文本映射、**常驻不释放**、**永不被执行**（0x00000000 在 AArch64 上是 `udf`，但这是填充区，没有任何分支指向它）。
+
+> **设计原则（必须写进实现）**：**不得硬编码上述地址** —— 不同机型/内核的洞位置与大小都不同。正确做法是 **patch 时扫描 `.text` 找"连续零 ≥ 需求字节"的洞**，取第一个满足者，并把 `cave_offset/cave_size` 写进 report；找不到 → 整组不织入（见 §11.4 失败行为）。同时断言"该区间在输入镜像内逐字节为 0"（负样本：把洞内填一个非零字节 → 断言必须红）。
+
+### 11.2 机制对照（clean-room 理解，不复制实现）
+
+| 步骤 | APatch（KernelPatch `userd.c`） | 我们的等价做法（自研） |
+|---|---|---|
+| hook 点 | 他们的 syscall hook 框架拦 `openat` | **静态 shellcode 替换 `__arm64_sys_openat` 首指令**（本引擎既有模式） |
+| 触发前置 | `current_uid()==0` | 同：`current->cred->uid == 0`（cred/uid 偏移引擎已推导：`cred_offset` / `cred_uid_offset`）。**再加一条稀疏过滤**：`flags & O_ACCMODE == O_RDONLY`（rc 只读打开）→ 非 root 进程的每次 openat 只多 5~6 条指令 |
+| 路径匹配 | 与 3 条 `ORIGIN_RC_FILES` 做 `strcmp` | 同（字符串内联进 cave）：`/system/etc/init/hw/init.rc`(28)、`/vendor/etc/init/hw/init.target.rc`(34)、`/init.rc`(9) |
+| 拼内容 | 读原 rc + 追加模板 → 写 `/dev/user_init.rc` | `filp_open`+`vfs_llseek`+`vmalloc`+`kernel_read` 读原 rc → `filp_open(O_WRONLY\|O_CREAT\|O_TRUNC)` + `kernel_write` 写"原文+模板" |
+| 让 init 读到 | **把用户栈上的 filename 指针改成 `/dev/user_init.rc`**（因 `/init.rc` 比替换串短，不能原地覆写） | **原地覆写用户路径串**：`__arch_copy_to_user(regs[1], "/dev/user_init.rc\0", 20)` —— 目标串 28/34 B ≥ 19 B，**无需计算用户栈/无需改指针**，比 APatch 少一个 `pt_regs->sp` 推导与 compat 分支 |
+| 一次性 | 静态 `replaced` 标志 | **不需要**：重写 `/dev/user_init.rc` 幂等；init 在启动期对上述路径的打开次数极少（≤3 次），代价可忽略（这避免了"可写内核状态"这条本引擎刻意回避的线） |
+| 域处理 | `supercmd su -Z u:r:magisk:s0` | **不用 su**：init 自身 uid0+满cap，`exec --` 直接跑 apd；SELinux 拒绝由 `avc_denied` 放行（§11 引言第 3 条），真机需验证 |
+| 32 位 compat | 有 compat 分支 | **不需要**：Android init 是 64 位（arm64），只处理 `__arm64_sys_openat` |
+
+> 注：APatch 对 `/init.rc`（9 B）改用"改指针"而非"原地覆写"，因为替换串更长。我们的策略是**跳过长度不足的目标**：GKI 机型没有 `/init.rc`（本机实测 `ramdisk_size=0`、rc 在 `/system`），可直接不处理该条；`/vendor/.../init.target.rc`(34 B) 与 `/system/.../init.rc`(28 B) 均够长。
+
+### 11.3 符号清单（真机 kallsyms 实测）
+
+| 符号 | 实测地址 | 用途 | 必需 |
+|---|---|---|---|
+| `__arm64_sys_openat` | 0x00381584 | **hook 点**（`x0=pt_regs*`，`regs[1]`=用户 path） | ✅ |
+| `strncpy_from_user` | 0x00737d44 | 把用户 path 拷入内核栈缓冲（自带 uaccess） | ✅ |
+| `strcmp` | 0x00f4c7b0 | 与 3 条目标 rc 路径比对 | ✅ |
+| `filp_open` | 0x00380e58 | 打开原 rc / 创建 `/dev/user_init.rc` | ✅ |
+| `vfs_llseek` | 0x0038230c | 取原 rc 长度（`SEEK_END`） | ✅ |
+| `kernel_read` | 0x003829f8 | 读原 rc | ✅ |
+| `kernel_write` | 0x00382fc4 | 写"原文+模板" | ✅ |
+| `filp_close` | 0x003810b0 | 关闭两个 file | ✅ |
+| `vmalloc` | 0x00323180 | 原 rc 缓冲（不占内核栈） | ✅ |
+| `vfree` | 0x00322340 | 释放缓冲 | ✅ |
+| `__arch_copy_to_user` | 0x00f49e40 | 原地覆写用户路径串（arm64 uaccess 原语，内部自带 PAN/UAO 处理） | ✅ |
+| `current` 取法 + `cred_offset`/`cred_uid_offset` | — | 引擎已有（`emit_get_current` + `parser_cred_offset`/`parse_cred_uid_offset`） | ✅ |
+| `__arm64_sys_openat2` | 0x00381620 | 备选（`open_how` 结构，Android init 不用） | 可选 |
+
+> **不可用但看似可用**：`copy_to_user` / `_copy_to_user` / `compat_copy_to_user` **都不在 kallsyms**（inline 或未导出）→ 必须用 `__arch_copy_to_user`；`kernel_read_file` 虽在（0x003d922c）但签名含 `kernel_read_file_id`，跨版本差异大，**改用 `filp_open`+`vfs_llseek`+`kernel_read` 更稳**。
+
+### 11.4 最小可行设计（自研，clean-room）
+
+**流程**（在 `__arm64_sys_openat` 入口 shellcode 内）：
+
+```
+1. 保存 x0（pt_regs*）与需要恢复的寄存器；取 current->cred，判 uid != 0 → 直接恢复并跳回（热路径出口）
+2. 读 regs[2] (flags)，若 (flags & O_ACCMODE) != O_RDONLY → 跳回
+3. strncpy_from_user(栈上 256B 缓冲, regs[1], 256)；若失败 → 跳回
+4. 与 3 条目标路径 strcmp；不匹配 → 跳回
+5. filp_open(origin, O_RDONLY, 0) → 失败：跳回（静默降级）
+6. vfs_llseek(SEEK_END) 取 len；vmalloc(len + 模板长 + 1) → 失败：关 file、跳回
+7. kernel_read 原文 → kernel_write 到 /dev/user_init.rc（先关旧 file）
+   → 再 kernel_write 模板 → filp_close ×2 → vfree
+8. __arch_copy_to_user(regs[1], "/dev/user_init.rc\0", 20)（覆盖用户侧 path 串）
+9. 恢复寄存器，跳回 __arm64_sys_openat+4（原首指令执行后）
+```
+
+**追加模板**（与现有 `apd/assets/init.sproot.rc` 语义**完全相同**，只是投递方式从 ramdisk 改为 rc 虚拟化）：
+
+```
+on post-fs-data
+    mkdir /data/adb/sproot 0700 root root
+service sproot-apd /data/adb/apd --superkey-file /data/adb/sproot/key daemon
+    class late_start
+    user root
+    group root
+    oneshot
+    disabled
+    override
+on property:sys.boot_completed=1
+    start sproot-apd
+```
+
+→ **优点**：自启链契约（`docs/NEW-DOC-05 §3.1.3`）不变，RcInject 的 ramdisk 注入可整体退役（连 magiskboot unpack/repack、T-12 回读、ramdisk AVB 那一整条风险链一起消失）。
+
+**体积预算**：
+
+| 模块 | 字节 |
+|---|---|
+| 入口/寄存器保存/uid+flags 过滤 | ≈ 60 B |
+| path 拷贝 + 3×strcmp（含 3 条路径串 73 B） | ≈ 130 B |
+| 读原 rc（filp_open/vfs_llseek/vmalloc/kernel_read/filp_close） | ≈ 120 B |
+| 写 `/dev/user_init.rc`（filp_open/kernel_write×2/filp_close/vfree + 路径串 20 B） | ≈ 110 B |
+| 原地覆写用户路径（`__arch_copy_to_user`） | ≈ 30 B |
+| 模板串（≈ 230 B，rc 语法含空格换行**不可压缩**） | ≈ 230 B |
+| 恢复/跳回/错误分支 | ≈ 80 B |
+| **合计** | **≈ 760–900 B** |
+| 需求洞大小（含余量） | **≥ 2 KB**（首选洞 53.6 KB，余量充足） |
+
+**组数契约**：新增**可选独立组** `rc_virtualize`：
+- `--launcher rc`（`off|rc|umh`，**默认 off**）；`rc` 时才织入
+- `hook_groups_expected_count(ge61, huawei, launcher_on)` 扩三参：off 仍 14/15、11/12；on 为 **15/16、12/13**
+- A8 矩阵由 6 例扩到 ≤8 例（加 `on` 维度）；`quality/static/verify_patch.py` 的期望组数同步
+- 与 B（`--launcher umh`）互斥（同一 flag 取值域）
+
+**失败行为（铁律）**：
+- 符号缺失 / 找不到 ≥2 KB 零洞 / 洞内非零 → **整组不织入**，report 写 `launcher {mode:"rc", enabled:false, reason}`；**其它 patch 照常**（绝不因 launcher 失败而丢修补）
+- 用户显式 `--launcher rc` 且前置条件不满足 → **E202 且不产出 `--out`**（显式开启绝不静默降级）
+- 运行期失败（`filp_open` 失败、rc 过长、uaccess 失败）→ **静默跳过**，不 printk、不 panic、不影响 init 正常打开 rc（init 读到原始文件，等价于"没启用"）
+- 长度安全：`__arch_copy_to_user` 只在 `strlen(replacement) < strlen(matched_path)` 时执行（28/34 > 19 已成立），**先比较再写**
+
+**真机必须验证的 5 项（静态断言无法覆盖）**：
+1. init 解析到 rc 时 `/dev` 已挂载且 devtmpfs 可写（否则 `filp_open` 失败 → 静默失效）；
+2. `strncpy_from_user` / `__arch_copy_to_user` 在 syscall 入口上下文的 PAN/UAO 行为正确（错用即 fault/panic）；
+3. SELinux：init 域打开/写入 `/dev/user_init.rc`、以及 `exec /data/adb/apd` 是否被我们的 `avc_check` 放行；
+4. init 是否能解析"原文+追加"拼接（rc 语法、`override` 关键字、service 重名）；
+5. 开机稳定性：多次开关机、safe mode、`sys.boot_completed` 触发时序。
+
+### 11.5 断言与负样本（先证伪再入库）
+
+| 断言 | 判据 | 负样本（必须打红） |
+|---|---|---|
+| `--self-test-rcvirtual`：洞合法性 | 选定区间在输入镜像内**逐字节为 0**、位于 `[_text,_etext)`、大小 ≥2 KB | 洞内填 1 个非零字节 / 洞跨出 `_etext` → FAIL |
+| 路径匹配 | 3 条内联路径串逐字节正确；长度 > 替换串（28/34 > 19） | 改 1 字节 / 把 `/init.rc` 也加入白名单（比替换串短）→ FAIL |
+| 模板 | 模板逐字节 == `apd/assets/init.sproot.rc` 的最小化等价版（含 `--superkey-file` 在 `daemon` 前的顺序断言） | 交换参数序 / 漏 `disabled`/`oneshot` → FAIL |
+| 符号地址 | report 中 11 个符号偏移 == kallsyms 实测；`bl` 目标解算正确 | 拼错符号名 + `--launcher rc` → 期望 E202 且无产物 |
+| 无绝对地址 | blob 内不存在绝对地址常量（沿用 §9.4 约束） | 引入绝对地址 → FAIL |
+| 非法路径写回保护 | 覆写前有长度比较 | 删掉长度比较 → FAIL |
+| Tier B | report `launcher{cave_offset,cave_size,symbols{},shellcode_bytes,template_bytes}` 自洽；`cave_offset` 落在 .text 且区内全零 | 篡改 cave 地址到 rodata → FAIL |
+| 真机 S3 | 开机后 `ps -A \| grep apd` 存在且 `startup_source=init-rc`；`/data/adb/sproot/boot_count` 正常；无 panic/avc 风暴 | 不实现 `startup_source` → 视为未验收 |
+
+### 11.6 顺带纠正一个前提：APatch **没有**「umount modules」
+
+查 `/tmp/APatch` + `/tmp/KernelPatch` 全仓（`.rs/.c/.h/.sh`）：
+
+- `umount` 命中只有两类：①安装脚本 `app/src/main/assets/util_functions.sh`、`apd/assets/installer.sh` 里安装期临时 `umount /system`；②`user_deprecated/su.c` 里给 root shell 做 `unshare(CLONE_NEWNS)`（拿私有挂载命名空间，**不是**对 app 隐藏模块）。
+- **没有任何** kernel_umount / denylist / hidelist / 按 uid 卸载模块挂载的实现（grep `denylist|hidelist|hide_path` 零命中）。
+- APatch 的反检测走的是**另一条路**：`KernelPatch/kernel/patch/common/selinux_hide.c` —— 在 SELinux 侧（`sel_write_context`/`selinux_setprocattr` 等 hook）做上下文伪装/隐藏，**不处理模块挂载可见性**。
+
+→ **结论**：KSU 的 umount modules 是 KSU 独有；不存在"APatch 在用户态做了、我们照做即可"的捷径。用户态唯一可行路线是 **Magisk Zygisk 式 zygote 注入**（在 app 进程内 unshare + umount），那是另一套子系统（我们没有 zygote 注入能力），且 apd 无法替别的进程卸载（`setns` 只能让自身进入某 ns，而共享 ns 上的 umount 会波及全体）。**§10 的结论（方案 ③ 不做）不变。**
+
+### 11.7 新结论：要不要改 init_boot
+
+| 方案 | 免 init_boot | 开机自启 | 引擎改动 | 真机风险 | 备注 |
+|---|---|---|---|---|---|
+| 现状：ramdisk rc 注入 | ❌ | ✅ | 0（客户端已实现） | 低 | 还需 ramdisk unpack/repack + T-12/AVB 一整套 |
+| **C′：rc 虚拟化（本节）** | ✅ **彻底** | ✅ | +1 可选组、≈800 B、新代码洞 | **中高**（5 项真机验证） | 需 clean-room；同时消掉 ramdisk 链 |
+| B：内核 launcher（§9.4） | ✅ | ❌（需先提权一次） | +≈422 B、并入 do_execve 组 | 中 | 作为 A 的兜底 |
+| C：init exec + umh（§9.5） | ❌ 不可行 | — | — | — | 时机不成立（已否决） |
+
+**建议（供 Lead 拍板）**：
+1. **空间判据已过**（实测 53.6 KB 单洞 + 6.3 KB 其它洞）→ 若人类接受"引擎新增一个默认 off 的可选组 + 一轮真机验证"，**C′ 是"彻底免 init_boot"的正解**，且顺带把 ramdisk 侧整条风险链（unpack/repack/T-12/AVB/rc 文件冲突）一起消掉。
+2. 实施顺序建议：**A 真机验证照旧先做**（成本最低、能先打通"App 自引导"这条最短链）→ **C′ 立项**（先按 §11.5 造负样本，再实现 `--launcher rc`，默认 off）→ B 降为 C′ 的兜底层。
+3. **不变量**：无论 C′ 是否落地，`--workdir` 所有权、密钥 47+NUL、组数严格等值这三条既有契约都不能破；C′ 必须作为"默认 off 的可选组"接入，**默认产物与当前逐字节一致**（用组数断言 + Tier B 字节比对兜住）。
+
+## 12. 包体与体积
 
 | 组合 | 增量 | 评价 |
 |---|---|---|
@@ -1055,11 +1243,11 @@ zygote fork → unshare(CLONE_NEWNS) → mount 私有化(/storage,/mnt 等)
 | 仅 exec 形态 | 2.81 MB（2,950,880 B） | 需 legacy packaging + 路径规范 |
 | 两形态都带 | 5.69 MB | 仅调试期（排障时 exec 形态可直接抓 stderr） |
 
-优化空间（未实施，列入 §12-R3）：裁掉 asmjit x86 后端（~200 KB）、`-ffunction-sections -Wl,--gc-sections`、`-flto`（预估可降到 ~2.0–2.3 MB）；`capstone` 仅 A64 已裁，`cJSON` 不可省（report）。
+优化空间（未实施，列入 §13-R3）：裁掉 asmjit x86 后端（~200 KB）、`-ffunction-sections -Wl,--gc-sections`、`-flto`（预估可降到 ~2.0–2.3 MB）；`capstone` 仅 A64 已裁，`cJSON` 不可省（report）。
 
 ---
 
-## 12. 风险与待决
+## 13. 风险与待决
 
 | # | 风险/待决 | 影响 | 建议 |
 |---|---|---|---|
@@ -1073,7 +1261,7 @@ zygote fork → unshare(CLONE_NEWNS) → mount 私有化(/storage,/mnt 等)
 
 ---
 
-## 13. 验收门禁映射（lead 的 10 条 → 本文证据）
+## 14. 验收门禁映射（lead 的 10 条 → 本文证据）
 
 | 门禁 | 本文落点 |
 |---|---|
@@ -1125,7 +1313,7 @@ bash engine/android/verify_artifact.sh
 KERNEL_IMAGE=samples/gki-kernel-arm64.Image bash engine/android/verify_artifact.sh
 ```
 
-## 14. 许可证与合规（D-3）
+## 15. 许可证与合规（D-3）
 
 | 组件 | 位置 | 许可证 | 结论 |
 |---|---|---|---|
