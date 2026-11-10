@@ -8,6 +8,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
@@ -37,6 +38,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
@@ -62,7 +64,9 @@ import com.sproot.manager.ui.theme.AppSettings
 import com.sproot.manager.ui.theme.ColorMode
 import com.sproot.manager.ui.theme.LocalEnableBlur
 import com.sproot.manager.ui.theme.keyColorOptions
+import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
+import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.CardDefaults
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
@@ -484,9 +488,9 @@ private fun RootKeyCard(
                 )
             }
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                TextButton(text = if (showKey) "隐藏" else "显示", onClick = onToggleShow)
-                TextButton(text = "复制", onClick = onCopy, enabled = key != null)
-                TextButton(text = "重新生成", onClick = onRotate)
+                CompactTextButton(text = if (showKey) "隐藏" else "显示", onClick = onToggleShow)
+                CompactTextButton(text = "复制", onClick = onCopy, enabled = key != null)
+                CompactTextButton(text = "重新生成", onClick = onRotate)
             }
             Text(
                 text = "⚠️ 重新生成后，已刷入的旧内核将无法提权，必须重新走一遍「修补 → 刷入」。",
@@ -539,8 +543,8 @@ private fun LogCard(onCopy: () -> Unit) {
                 color = colorScheme.onSurfaceVariantSummary,
             )
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                TextButton(text = "复制全部日志", onClick = onCopy)
-                TextButton(
+                CompactTextButton(text = "复制全部日志", onClick = onCopy)
+                CompactTextButton(
                     text = "清空内存日志",
                     onClick = { AppLog.clearMemory() },
                 )
@@ -611,12 +615,12 @@ private fun BackupCard(
                         color = colorScheme.onSurfaceVariantSummary,
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        TextButton(text = "还原到 Downloads", onClick = { onRestore(backup) })
-                        TextButton(text = "删除", onClick = { onDelete(backup) })
+                        CompactTextButton(text = "还原到 Downloads", onClick = { onRestore(backup) })
+                        CompactTextButton(text = "删除", onClick = { onDelete(backup) })
                     }
                 }
             }
-            TextButton(text = "刷新备份列表", onClick = onRefresh)
+            CompactTextButton(text = "刷新备份列表", onClick = onRefresh)
         }
     }
 }
@@ -693,13 +697,13 @@ private fun ApdDeployCard(
                 }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                TextButton(
+                CompactTextButton(
                     text = if (deploying) "部署中…" else "部署 / 更新 AP",
                     onClick = onDeploy,
                     enabled = !deploying,
-                    colors = top.yukonga.miuix.kmp.basic.ButtonDefaults.textButtonColorsPrimary(),
+                    primary = true,
                 )
-                TextButton(
+                CompactTextButton(
                     text = if (selfTestRunning) "自检中…" else "重跑 AP 自检",
                     onClick = onSelfTest,
                     enabled = !selfTestRunning,
@@ -753,10 +757,10 @@ private fun EngineSelfCheckCard(report: String?, onRun: () -> Unit) {
                     color = colorScheme.onSurface,
                 )
             }
-            TextButton(
+            CompactTextButton(
                 text = "运行引擎自检",
                 onClick = onRun,
-                colors = top.yukonga.miuix.kmp.basic.ButtonDefaults.textButtonColorsPrimary(),
+                primary = true,
             )
         }
     }
@@ -811,10 +815,10 @@ private fun WorkdirCard(message: String?, onClean: () -> Unit) {
             message?.let {
                 Text(text = it, fontSize = 12.sp, color = colorScheme.onSurface)
             }
-            TextButton(
+            CompactTextButton(
                 text = "清理工作目录",
                 onClick = onClean,
-                colors = top.yukonga.miuix.kmp.basic.ButtonDefaults.textButtonColorsPrimary(),
+                primary = true,
             )
         }
     }
@@ -822,3 +826,28 @@ private fun WorkdirCard(message: String?, onClean: () -> Unit) {
 
 private fun dirSize(dir: java.io.File): Long =
     if (!dir.exists()) 0L else dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+
+/**
+ * 紧凑文字按钮（人类真机反馈 ④：设置页按钮"整行大按钮"太多，按文字实际尺寸收缩）。
+ * miuix TextButton 默认 minHeight=40dp、insideMargin=16/13dp，视觉过大；
+ * 这里统一 30dp 高、10/3dp 内边距、13sp 字号，多个相关操作横向排一行。
+ */
+@Composable
+private fun CompactTextButton(
+    text: String,
+    onClick: () -> Unit,
+    enabled: Boolean = true,
+    primary: Boolean = false,
+) {
+    TextButton(
+        text = text,
+        onClick = onClick,
+        enabled = enabled,
+        minWidth = 0.dp,
+        minHeight = 30.dp,
+        cornerRadius = 10.dp,
+        insideMargin = PaddingValues(horizontal = 10.dp, vertical = 3.dp),
+        textStyle = TextStyle(fontSize = 13.sp),
+        colors = if (primary) ButtonDefaults.textButtonColorsPrimary() else ButtonDefaults.textButtonColors(),
+    )
+}
