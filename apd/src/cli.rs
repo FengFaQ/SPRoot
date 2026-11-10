@@ -12,7 +12,12 @@ use std::path::PathBuf;
 
 /// APatch cli
 #[derive(Parser, Debug)]
-#[command(name = "apd", author, version = defs::VERSION_CODE, about = "SPRoot AP binary (module manager + resident daemon)", long_about = None)]
+// `version` is the **APatch-compatible** number, not ours: `apd -V` must print
+// `apd <i32 >= 10762>` so NeoZygisk/OnyxZygisk recognise the host as APatch
+// (they parse the second whitespace token as i32). Deliberate compatibility
+// layer — see `defs::APATCH_COMPAT_VERSION`. Our own version is reported by the
+// `version` subcommand (`VERSION_NAME` / `VERSION_CODE`, also `--json`).
+#[command(name = "apd", author, version = defs::APATCH_COMPAT_VERSION_STR, about = "SPRoot AP binary (module manager + resident daemon)", long_about = None)]
 struct Args {
     #[arg(
         short,
@@ -130,12 +135,22 @@ enum AuthCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Set the tri-state of <uid>: allow | deny | ask
+    /// Set the tri-state and/or the module-exclusion flag of <uid>
     Set {
         #[arg(long)]
         uid: i32,
+        /// allow | deny | ask (omit to change only --exclude)
         #[arg(long, value_enum)]
-        state: AuthStateArg,
+        state: Option<AuthStateArg>,
+        /// Exclude from module effects (Zygisk `exclude` column / umount signal).
+        /// Bare `--exclude` means true; `--exclude false` clears it.
+        #[arg(
+            long,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            value_name = "BOOL"
+        )]
+        exclude: Option<bool>,
         #[arg(long)]
         json: bool,
     },
@@ -636,8 +651,13 @@ fn run_auth(command: AuthCmd) -> Result<()> {
     }
     match command {
         AuthCmd::List { .. } => println!("{}", auth_list::list_json()?),
-        AuthCmd::Set { uid, state, json } => {
-            let change = auth_list::set_state(uid, state.into())?;
+        AuthCmd::Set {
+            uid,
+            state,
+            exclude,
+            json,
+        } => {
+            let change = auth_list::set_auth(uid, state.map(Into::into), exclude)?;
             print_change(&change, json);
         }
         AuthCmd::Log { json, limit } => {
@@ -685,7 +705,8 @@ fn run_auth(command: AuthCmd) -> Result<()> {
     Ok(())
 }
 
-/// `auth set/revoke --json` payload (stable ABI for the manager UI).
+/// `auth set/revoke --json` payload (stable ABI for the manager UI; the
+/// `exclude` field is new in the Zygisk-compat round — additive).
 fn print_change(change: &auth_list::Change, json: bool) {
     if json {
         let payload = serde_json::json!({
@@ -693,16 +714,20 @@ fn print_change(change: &auth_list::Change, json: bool) {
             "uid": change.uid,
             "state": change.state,
             "previous": change.previous,
+            "exclude": change.exclude,
+            "previous_exclude": change.previous_exclude,
             "package": change.package,
             "changed": change.changed,
         });
         println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
     } else {
         println!(
-            "uid {}: {} -> {} ({})",
+            "uid {}: {} -> {}, exclude {} -> {} ({})",
             change.uid,
             change.previous,
             change.state,
+            change.previous_exclude,
+            change.exclude,
             change.package.as_deref().unwrap_or("unknown package")
         );
     }

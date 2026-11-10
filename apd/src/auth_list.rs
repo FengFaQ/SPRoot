@@ -239,6 +239,12 @@ pub struct Change {
     pub state: String,
     #[serde(default)]
     pub previous: String,
+    /// Module-exclusion flag after the change (`auth set --exclude`); it is the
+    /// value written to the derived `package_config` (`exclude` column) that
+    /// Zygisk reads as "exclude from modifications".
+    pub exclude: bool,
+    #[serde(default)]
+    pub previous_exclude: bool,
     #[serde(default)]
     pub package: Option<String>,
     #[serde(default)]
@@ -454,7 +460,7 @@ fn load_store() -> Loaded {
 }
 
 /// Atomic write: same-directory tmp (0600 from creation) → fsync → rename.
-fn write_atomic(path: &str, tmp: &str, bytes: &[u8]) -> Result<()> {
+fn write_atomic(path: &str, tmp: &str, bytes: &[u8], mode: u32) -> Result<()> {
     if let Some(dir) = Path::new(path).parent() {
         fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
@@ -462,14 +468,75 @@ fn write_atomic(path: &str, tmp: &str, bytes: &[u8]) -> Result<()> {
         .write(true)
         .create(true)
         .truncate(true)
-        .mode(0o600)
+        .mode(mode)
         .open(tmp)
         .with_context(|| format!("create {tmp}"))?;
     file.write_all(bytes)?;
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.set_permissions(fs::Permissions::from_mode(mode))?;
     file.sync_all()?;
     fs::rename(tmp, path).with_context(|| format!("rename into {path}"))?;
     Ok(())
+}
+
+/// Serialise the **derived APatch-compatible csv**
+/// (`/data/adb/ap/package_config`) from the authoritative table.
+///
+/// Column contract (positional — external parsers such as NeoZygisk read
+/// `parts[1]` as exclude, `parts[2]` as allow, `parts[3]` as uid):
+/// `pkg,exclude,allow,uid,to_uid,sctx`.
+///
+/// * `allow` = 1 iff `state == allow` (so `deny`/`ask` are both 0);
+/// * `exclude` = 1 iff the module-exclusion flag is set (this is the signal
+///   Zygisk uses to umount an app's modules);
+/// * values are sanitised so the file can never contain a stray comma: the
+///   package/SELinux columns are `[A-Za-z0-9._:]`-only in practice, anything
+///   else is replaced with `_` (a malformed row would shift columns for the
+///   external parser — the exact failure mode we must not produce).
+fn package_config_csv(entries: &BTreeMap<i32, AuthEntry>) -> String {
+    fn sanitize(value: &str) -> String {
+        value
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+    let mut csv = String::with_capacity(64 + entries.len() * 48);
+    csv.push_str(defs::APATCH_PACKAGE_CONFIG_HEADER);
+    csv.push('\n');
+    for entry in entries.values() {
+        csv.push_str(&sanitize(entry.package.as_deref().unwrap_or("")));
+        csv.push(',');
+        csv.push(if entry.exclude { '1' } else { '0' });
+        csv.push(',');
+        csv.push(if entry.state == AuthState::Allow { '1' } else { '0' });
+        csv.push(',');
+        csv.push_str(&entry.uid.to_string());
+        csv.push(',');
+        csv.push_str(&entry.to_uid.to_string());
+        csv.push(',');
+        csv.push_str(&sanitize(&entry.sctx));
+        csv.push('\n');
+    }
+    csv
+}
+
+/// Write the derived csv atomically (0644, apd is the only writer).
+///
+/// 0644 (not 0600): the Zygisk side may run as a non-root helper, and the file
+/// carries only package names/uids — no key material and no command history.
+fn sync_package_config(entries: &BTreeMap<i32, AuthEntry>) -> Result<()> {
+    let body = package_config_csv(entries);
+    write_atomic(
+        defs::APATCH_PACKAGE_CONFIG,
+        defs::APATCH_PACKAGE_CONFIG_TMP,
+        body.as_bytes(),
+        0o644,
+    )
 }
 
 fn save(entries: &BTreeMap<i32, AuthEntry>) -> Result<()> {
@@ -478,7 +545,19 @@ fn save(entries: &BTreeMap<i32, AuthEntry>) -> Result<()> {
         entries: entries.values().cloned().collect(),
     };
     let text = serde_json::to_string_pretty(&store)?;
-    write_atomic(defs::AUTH_LIST_FILE, defs::AUTH_LIST_TMP_FILE, text.as_bytes())
+    write_atomic(
+        defs::AUTH_LIST_FILE,
+        defs::AUTH_LIST_TMP_FILE,
+        text.as_bytes(),
+        0o600,
+    )?;
+    // Derived APatch/Zygisk signal: refreshed on every commit so an external
+    // parser never reads a stale table. The authoritative JSON is already
+    // durable; a failed sync is logged, not fatal.
+    if let Err(e) = sync_package_config(entries) {
+        warn!("[auth] package_config sync failed: {e:#}");
+    }
+    Ok(())
 }
 
 /// Package name for a uid, resolved from `/data/system/packages.list`.
@@ -577,7 +656,12 @@ fn trim_log_if_needed() {
         trimmed.push_str(line);
         trimmed.push('\n');
     }
-    match write_atomic(defs::AUTH_LOG_FILE, defs::AUTH_LOG_TMP_FILE, trimmed.as_bytes()) {
+    match write_atomic(
+        defs::AUTH_LOG_FILE,
+        defs::AUTH_LOG_TMP_FILE,
+        trimmed.as_bytes(),
+        0o600,
+    ) {
         Ok(()) => info!(
             "[auth] log trimmed: {} kept of {} event(s)",
             lines.len() - start,
@@ -762,93 +846,121 @@ pub fn stats() -> AuthStats {
 // Public API — mutations (single writer, flock protected)
 // ---------------------------------------------------------------------------
 
-/// Mutate the state under the write lock and persist — **no audit event**.
+/// Mutate state and/or module-exclusion under the write lock and persist —
+/// **no audit event** (callers emit exactly one).
 ///
-/// Kept separate so `set_state` and `revoke` each emit exactly one event
-/// (`revoke` must not look like `set_state` + `revoke` in the UI history).
-fn apply_state(uid: i32, state: AuthState) -> Result<Change> {
+/// This is the single writer behind `set_auth` (CLI `auth set`), `set_state`,
+/// `revoke`, `set_exclude` and `grant`. At least one of `state`/`exclude` must
+/// be given: "neither" would be a silent no-op write.
+fn apply_change(uid: i32, state: Option<AuthState>, exclude: Option<bool>) -> Result<Change> {
     ensure!(uid >= 0, "uid must be >= 0 (got {uid})");
+    require_any_change(state, exclude)?;
     let package = package_for_uid(uid);
     let _lock = ConfigLock::acquire();
     let mut entries = reload_entries()?;
     let now = now_secs();
     let existed = entries.contains_key(&uid);
-    let previous;
-    match entries.get_mut(&uid) {
-        Some(entry) => {
-            previous = entry.state;
-            entry.state = state;
-            if entry.package.is_none() {
-                entry.package = package.clone();
-            }
-            if state == AuthState::Allow {
-                entry.touch_grant(now);
-            }
-        }
-        None => {
-            previous = AuthState::Ask;
-            let mut entry = AuthEntry::new(uid);
-            entry.package = package.clone();
-            entry.state = state;
-            if state == AuthState::Allow {
-                entry.touch_grant(now);
-            }
-            entries.insert(uid, entry);
+    let entry = entries.entry(uid).or_insert_with(|| {
+        let mut fresh = AuthEntry::new(uid);
+        fresh.package = package.clone();
+        fresh
+    });
+    let previous = entry.state;
+    let previous_exclude = entry.exclude;
+    if entry.package.is_none() {
+        entry.package = package;
+    }
+    if let Some(state) = state {
+        entry.state = state;
+        if state == AuthState::Allow {
+            entry.touch_grant(now);
         }
     }
+    if let Some(exclude) = exclude {
+        entry.exclude = exclude;
+    }
+    let new_state = entry.state;
+    let new_exclude = entry.exclude;
+    let package = entry.package.clone();
     save(&entries)?;
-    let package = entries.get(&uid).and_then(|entry| entry.package.clone());
     Ok(Change {
         uid,
-        state: state.as_str().to_string(),
+        state: new_state.as_str().to_string(),
         previous: previous.as_str().to_string(),
+        exclude: new_exclude,
+        previous_exclude,
         package,
-        // Creating a row is a change even when the new state equals the default.
-        changed: !existed || previous != state,
+        // Creating a row is a change even when the values equal the defaults.
+        changed: !existed || previous != new_state || previous_exclude != new_exclude,
     })
 }
 
-/// Set the tri-state of `uid` (creates the row with default `ask` + resolved
-/// package when it does not exist yet) and record one `set_state` event.
-pub fn set_state(uid: i32, state: AuthState) -> Result<Change> {
-    let change = apply_state(uid, state)?;
+/// `--state` and `--exclude` are both optional, but at least one is required.
+fn require_any_change(state: Option<AuthState>, exclude: Option<bool>) -> Result<()> {
+    ensure!(
+        state.is_some() || exclude.is_some(),
+        "nothing to change: pass --state <allow|deny|ask> and/or --exclude <true|false>"
+    );
+    Ok(())
+}
+
+/// Set state and/or the module-exclusion flag in **one atomic write** (CLI
+/// `auth set`), emitting a single `set_state` event (exclude change recorded in
+/// `detail`). Both given → both are applied together (no partial state).
+pub fn set_auth(uid: i32, state: Option<AuthState>, exclude: Option<bool>) -> Result<Change> {
+    let change = apply_change(uid, state, exclude)?;
+    let detail = (change.previous_exclude != change.exclude)
+        .then(|| format!("exclude={}", change.exclude));
     record_event(
         uid,
         change.package.clone(),
         "set_state",
-        Some(state),
+        state.or_else(|| AuthState::parse(&change.state).ok()),
         None,
         AuthState::parse(&change.previous).ok(),
-        None,
+        detail,
     );
     info!(
-        "[auth] uid {uid}: {} -> {}",
-        change.previous, change.state
+        "[auth] uid {uid}: state {} -> {}, exclude {} -> {}",
+        change.previous, change.state, change.previous_exclude, change.exclude
     );
     Ok(change)
 }
 
+/// Set the tri-state only (creates the row with default `ask` + resolved
+/// package when it does not exist yet) and records one `set_state` event.
+///
+/// Thin wrapper kept for API symmetry with [`set_auth`]; the CLI always goes
+/// through `set_auth` (it may also carry `--exclude`).
+#[allow(dead_code)]
+pub fn set_state(uid: i32, state: AuthState) -> Result<Change> {
+    set_auth(uid, Some(state), None)
+}
+
 /// Legacy CLI: grant root (equivalent to `set --state allow`, keeping the
-/// root-mapping options).
+/// root-mapping options). Always also clears the module-exclusion flag, which
+/// is what the legacy `grant` meant for the derived `package_config`.
 pub fn grant(uid: i32, pkg: &str, to_uid: i32, sctx: &str) -> Result<Change> {
     ensure!(uid >= 0, "uid must be >= 0 (got {uid})");
     ensure!(to_uid >= 0, "to_uid must be >= 0 (got {to_uid})");
+    let package = package_for_uid(uid);
     let _lock = ConfigLock::acquire();
     let mut entries = reload_entries()?;
     let now = now_secs();
-    let previous;
+    let existed = entries.contains_key(&uid);
     let entry = entries.entry(uid).or_insert_with(|| {
         let mut fresh = AuthEntry::new(uid);
-        fresh.package = package_for_uid(uid);
+        fresh.package = package.clone();
         fresh
     });
-    previous = entry.state;
+    let previous = entry.state;
+    let previous_exclude = entry.exclude;
     entry.state = AuthState::Allow;
     entry.exclude = false;
     if !pkg.is_empty() {
         entry.package = Some(pkg.to_string());
     } else if entry.package.is_none() {
-        entry.package = package_for_uid(uid);
+        entry.package = package;
     }
     entry.to_uid = to_uid;
     if !sctx.is_empty() {
@@ -871,15 +983,17 @@ pub fn grant(uid: i32, pkg: &str, to_uid: i32, sctx: &str) -> Result<Change> {
         uid,
         state: AuthState::Allow.as_str().to_string(),
         previous: previous.as_str().to_string(),
+        exclude: false,
+        previous_exclude,
         package,
-        changed: previous != AuthState::Allow,
+        changed: !existed || previous != AuthState::Allow || previous_exclude,
     })
 }
 
 /// Revoke root for `uid` (equals `set --state deny`; the row is kept so the
 /// manager can still show the app). Emits a single `revoke` event.
 pub fn revoke(uid: i32) -> Result<Change> {
-    let change = apply_state(uid, AuthState::Deny)?;
+    let change = apply_change(uid, Some(AuthState::Deny), None)?;
     record_event(
         uid,
         change.package.clone(),
@@ -893,28 +1007,10 @@ pub fn revoke(uid: i32) -> Result<Change> {
     Ok(change)
 }
 
-/// Set the per-uid module-exclusion bit (replaces the removed kernel kstorage).
+/// Set the per-uid module-exclusion bit (replaces the removed kernel kstorage;
+/// also the `exclude` column Zygisk reads from `package_config`).
 pub fn set_exclude(uid: i32, excluded: bool) -> Result<()> {
-    ensure!(uid >= 0, "uid must be >= 0 (got {uid})");
-    let _lock = ConfigLock::acquire();
-    let mut entries = reload_entries()?;
-    let package = package_for_uid(uid);
-    match entries.get_mut(&uid) {
-        Some(entry) => {
-            entry.exclude = excluded;
-            if entry.package.is_none() {
-                entry.package = package;
-            }
-        }
-        None => {
-            let mut entry = AuthEntry::new(uid);
-            entry.exclude = excluded;
-            entry.package = package;
-            entries.insert(uid, entry);
-        }
-    }
-    save(&entries)?;
-    info!("[auth] uid {uid} exclude={excluded}");
+    set_auth(uid, None, Some(excluded))?;
     Ok(())
 }
 
@@ -1018,9 +1114,12 @@ pub fn prepare_storage() -> Result<()> {
             );
         }
     }
+    // Always refresh the derived APatch/Zygisk signal: an upgrade from a build
+    // that predates the compat layer has auth_list.json but no package_config.
+    sync_package_config(&loaded.entries)?;
     let log = Path::new(defs::AUTH_LOG_FILE);
     if !log.exists() {
-        write_atomic(defs::AUTH_LOG_FILE, defs::AUTH_LOG_TMP_FILE, b"")?;
+        write_atomic(defs::AUTH_LOG_FILE, defs::AUTH_LOG_TMP_FILE, b"", 0o600)?;
     }
     fs::set_permissions(log, fs::Permissions::from_mode(0o600)).ok();
     trim_log_if_needed();
@@ -1155,5 +1254,124 @@ mod tests {
         assert_eq!(iso8601(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso8601(1_700_000_000), "2023-11-14T22:13:20Z");
         assert_eq!(iso8601(1_762_670_000), "2025-11-09T06:33:20Z");
+    }
+
+    /// Reference parser with the exact semantics an external Zygisk
+    /// implementation uses (`zygiskd/src/root_impl/apatch.rs`): split on ',',
+    /// `parts[1]` = exclude (u8), `parts[2]` = allow (u8), `parts[3]` = uid
+    /// (i32); unparsable lines (the header, blanks) are skipped.
+    fn external_parse(text: &str) -> Vec<(u8, u8, i32)> {
+        text.lines()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.split(',').collect();
+                if parts.len() < 4 {
+                    return None;
+                }
+                let exclude = parts[1].trim().parse::<u8>().ok()?;
+                let allow = parts[2].trim().parse::<u8>().ok()?;
+                let uid = parts[3].trim().parse::<i32>().ok()?;
+                (exclude <= 1 && allow <= 1).then_some((exclude, allow, uid))
+            })
+            .collect()
+    }
+
+    fn entry(uid: i32, state: AuthState, exclude: bool, pkg: Option<&str>) -> AuthEntry {
+        let mut entry = AuthEntry::new(uid);
+        entry.state = state;
+        entry.exclude = exclude;
+        entry.package = pkg.map(str::to_string);
+        entry
+    }
+
+    /// The derived csv must mirror the authoritative table exactly (this is
+    /// the file Zygisk reads): header byte-identical, positional columns
+    /// correct, `allow` = state==allow, `exclude` = flag.
+    #[test]
+    fn package_config_matches_auth_table() {
+        let mut entries = BTreeMap::new();
+        for entry in [
+            entry(10100, AuthState::Allow, false, Some("com.a")),
+            entry(10101, AuthState::Deny, false, Some("com.b")),
+            entry(10102, AuthState::Ask, true, None),
+            entry(10103, AuthState::Allow, true, Some("com.d")),
+        ] {
+            entries.insert(entry.uid, entry);
+        }
+        let csv = package_config_csv(&entries);
+        assert_eq!(
+            csv.lines().next(),
+            Some(defs::APATCH_PACKAGE_CONFIG_HEADER),
+            "header must stay the positional APatch layout"
+        );
+        let parsed = external_parse(&csv);
+        assert_eq!(
+            parsed,
+            vec![(0, 1, 10100), (0, 0, 10101), (1, 0, 10102), (1, 1, 10103)]
+        );
+        // Both directions: every table row appears once with the mapped values.
+        assert_eq!(parsed.len(), entries.len());
+        for row in &entries {
+            let (exclude, allow, uid) = *parsed
+                .iter()
+                .find(|(_, _, candidate)| *candidate == row.1.uid)
+                .expect("every entry must appear in package_config");
+            assert_eq!(exclude, u8::from(row.1.exclude));
+            assert_eq!(allow, u8::from(row.1.state == AuthState::Allow));
+            assert_eq!(uid, row.1.uid);
+        }
+    }
+
+    /// Negative samples: shapes we must never emit are rejected by the external
+    /// parser (missing header is tolerated by design, malformed columns are not).
+    #[test]
+    fn package_config_rejects_malformed_rows_externally() {
+        // header alone / blank lines → no data rows
+        assert!(external_parse("pkg,exclude,allow,uid,to_uid,sctx\n\n").is_empty());
+        // allow=2 is out of range
+        assert!(external_parse("com.a,1,2,10100,0,\n").is_empty());
+        // negative exclude cannot parse as u8
+        assert!(external_parse("com.a,-1,1,10100,0,\n").is_empty());
+        // non-numeric uid
+        assert!(external_parse("com.a,1,1,abc,0,\n").is_empty());
+        // truncated row (column loss)
+        assert!(external_parse("com.a,1\n").is_empty());
+        // our writer never produces any of those shapes
+        let mut entries = BTreeMap::new();
+        entries.insert(10100, entry(10100, AuthState::Deny, true, None));
+        let csv = package_config_csv(&entries);
+        assert_eq!(external_parse(&csv), vec![(1, 0, 10100)]);
+        // a package name containing a comma can never shift columns.
+        let mut evil = BTreeMap::new();
+        evil.insert(10101, entry(10101, AuthState::Allow, false, Some("com,a")));
+        let csv = package_config_csv(&evil);
+        assert_eq!(external_parse(&csv), vec![(0, 1, 10101)]);
+    }
+
+    /// `--state`/`--exclude` validation: at least one is required.
+    #[test]
+    fn require_any_change_rejects_empty_request() {
+        assert!(require_any_change(None, None).is_err());
+        assert!(require_any_change(Some(AuthState::Allow), None).is_ok());
+        assert!(require_any_change(None, Some(true)).is_ok());
+        assert!(require_any_change(Some(AuthState::Ask), Some(false)).is_ok());
+    }
+
+    /// `auth set/revoke --json` must expose the exclusion flag (and its
+    /// previous value) for the UI switch.
+    #[test]
+    fn change_serialises_exclude() {
+        let change = Change {
+            uid: 10100,
+            state: "allow".to_string(),
+            previous: "ask".to_string(),
+            exclude: true,
+            previous_exclude: false,
+            package: None,
+            changed: true,
+        };
+        let json = serde_json::to_string(&change).unwrap();
+        assert!(json.contains("\"exclude\":true"));
+        assert!(json.contains("\"previous_exclude\":false"));
+        assert!(json.contains("\"state\":\"allow\""));
     }
 }

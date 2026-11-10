@@ -829,13 +829,104 @@ UI 兜底（推荐）：拿 `uid` 直接调 `PackageManager.getPackagesForUid(ui
 1. **交互式 `ask` 弹窗（Phase 2）**：需要 App 常驻监听 + daemon↔App 双向事件（daemon 现只有请求侧 socket）。本轮明确以 `ask_pending` 拒绝收尾，已记入本节而非静默放行。
 2. `ui-client`：按 13.3 渲染三态列表/日志/搜索；`label`/`app_icon_path` 由 UI 用 `PackageManager` 解析（本侧恒 `null`）。
 
+## 14. APatch / Zygisk 兼容层（外部生态信号，2026-11-10，apd-dev 落实）
+
+> 背景：NeoZygisk（GPL-3.0）与 OnyxZygisk（AGPL-3.0）对接 APatch 只有两条路径（`zygiskd/src/root_impl/apatch.rs`）：① `apd -V` 的第二 token 解析为 `i32` 且 ≥ `minAPatchVersion = 10762`；② 读 `/data/adb/ap/package_config` 的 csv，`exclude==1` 即「排除修改（umount）」。SPRoot 因此**主动伪装成 APatch 血统**，以被现有 Zygisk 生态识别——**这是兼容层，不是 bug**（人类 2026-11-10 已同意方向；代码注释同步说明，避免后人"修掉"它）。真实存储仍是 `auth_list.json`（§13），csv 只是派生信号。
+
+### 14.1 `apd -V`（生态识别信号）
+
+| 项 | 值 |
+|---|---|
+| 输出 | **`apd 10762`**（首行，clap `<name> <version>` 格式） |
+| 常量 | `defs::APATCH_COMPAT_VERSION = 10762` / `APATCH_COMPAT_VERSION_STR = "10762"` |
+| 解析契约 | `-V` / `--version` 输出 `split_whitespace().nth(1).parse::<i32>()` 必须成功且 `>= 10762`（低于即被判定 `TooOld`） |
+| 真实版本 | 走 **`apd version` / `apd version --json`**（`VERSION_NAME`/`VERSION_CODE`，由 `build.rs` 从 git 生成），不要期望 `-V` 反映它 |
+
+> ⚠️ 修改 `APATCH_COMPAT_VERSION` 必须同时评估上游 `minAPatchVersion`；把 `-V` 改回真实语义版本号会让所有 Zygisk 实现判定「不是 APatch / 太旧」。
+
+### 14.2 派生 `/data/adb/ap/package_config`
+
+- **权威源**：`/data/adb/sproot/auth_list.json`（§13）。`package_config` 是**派生产物**，`apd` 唯一写者（App/ui-client 不直写）。
+- **格式**（位置列，外部解析器依赖 `parts[1/2/3]`，逐字节严格）：
+
+```csv
+pkg,exclude,allow,uid,to_uid,sctx
+com.example.granted,0,0,10123,0,
+com.example.excluded,1,0,10125,0,
+```
+
+| 列 | 取值 |
+|---|---|
+| `pkg` | 包名（解析不到时为空串；外部按 uid 匹配，空串合法） |
+| `exclude` | `1` = 排除修改（Zygisk umount 信号），`0` = 不排除 |
+| `allow` | `state == allow` → `1`；`deny`/`ask` → `0` |
+| `uid` / `to_uid` / `sctx` | 原样（`to_uid` 缺省 0，`sctx` 可为空） |
+
+- **写入时机**：每次 auth 提交（`save()` 内，含迁移/请求计数/状态变更）+ `prepare_storage()`（deploy step 8、daemon 启动时全量同步，覆盖「从旧版升级、JSON 已有但 csv 尚未生成」的路径）+ `refresh_allow_list()`（uid 刷新/裁剪后）。
+- **原子性/权限**：tmp+rename、**0644**（允许非 root 的 Zygisk helper 读取；只含包名/uid，**不含密钥、不含命令**；可写性为 0）。目录 `/data/adb/ap/` 缺失则创建。
+- **一致性**：与 `auth_list.json` 同一次写事务内更新（先权威后派生，两者均 tmp+rename），因此 `exclude` 与 `auth list --json` 的 `exclude` 字段恒一致（单测 `package_config_matches_auth_table` 双向校验）。
+
+### 14.3 `auth set --exclude`（App 开关）
+
+| 命令 | 效果 |
+|---|---|
+| `apd auth set --uid 10123 --exclude true --json` | 只改 exclude（state 不动） |
+| `apd auth set --uid 10123 --state allow --json` | 只改 state（现状） |
+| `apd auth set --uid 10123 --state allow --exclude false --json` | 两者一次原子写 |
+| `apd auth set --uid 10123` | **报错**（`--state` 与 `--exclude` 至少给一个） |
+
+JSON 返回新增 `exclude` / `previous_exclude`（加法字段）：
+
+```json
+{
+  "ok": true,
+  "uid": 10123,
+  "state": "allow",
+  "previous": "ask",
+  "exclude": true,
+  "previous_exclude": false,
+  "package": "com.example.granted",
+  "changed": true
+}
+```
+
+裸 `--exclude` 等价 `--exclude true`；`--exclude false` 清除。审计事件仍是单条 `set_state`（`detail` 记 `exclude=<bool>`）。
+
+### 14.4 `selftest --json` 的 `zygisk` 检查（Phase 1 占位）
+
+新增 check `zygisk`（`critical=false`，不阻断）：
+
+- `zygiskd` 是否在运行（扫描 `/proc/*/cmdline` 中 basename 含 `zygiskd` 的进程）；
+- 内置组件版本（读 `/data/adb/modules/*zygisk*/module.prop` 的 `version=`；**本轮 SPRoot 尚未内置 Zygisk 组件 → 通常 `version=-`/installed=false**）；
+- `/data/adb/ap/package_config` 是否存在、权限是否正确（0644 可读不可写）。
+
+detail 示例：`apatch_compat_version=10762 zygiskd_pid=None running=false module=- version=- package_config=/data/adb/ap/package_config exists=true mode=644 readable=true (Phase 1 placeholder: built-in Zygisk packaging pending)`。真正的 Zygisk 组件内置方案待 Lead 决定后再接，本轮只保证「未安装/未运行」可见。
+
+### 14.5 断言（`cargo test`，全仓 21 条）
+
+| 测试 | 钉住 |
+|---|---|
+| `tests/version_flag.rs::version_flag_is_apatch_compatible` | **真实二进制**执行 `-V`，按 NeoZygisk 的 `split_whitespace().nth(1).parse::<i32>()` 解析且 ≥ 10762、首行为 `apd <int>` |
+| `auth_list::tests::package_config_matches_auth_table` | 派生 csv 与 `auth_list.json` 双向一致（header 逐字节、列位置、allow/exclude 映射） |
+| `auth_list::tests::package_config_rejects_malformed_rows_externally` | 外部解析器负样本：少列/列错位/`exclude` 非 0-1/uid 非数字 → 拒绝；含逗号包名不破坏列 |
+| `auth_list::tests::require_any_change_rejects_empty_request` | `--state`/`--exclude` 至少给一个 |
+| `auth_list::tests::change_serialises_exclude` | JSON 暴露 `exclude` / `previous_exclude` |
+| `selftest::tests::module_prop_version_parsing` | 组件版本解析（无版本→None） |
+
+### 14.6 风险与待办
+
+1. **内置 Zygisk 组件方案**（zygiskd 二进制、`module.prop`、启动方式）由 Lead 后续决定；本轮只做信号源 + selftest 占位。
+2. `package_config` 为 0644：任何 App 可读「已授权/排除的应用包名列表」。这是与生态兼容的**显式取舍**（APatch 生态自身也依赖该文件），不含密钥与命令；若后续收紧，需先确认 Zygisk helper 的 uid。
+3. 上游若提高 `minAPatchVersion`，只改 `defs::APATCH_COMPAT_VERSION` 一处即可（常量 + `-V` 输出 + selftest detail 共用）。
+
 ## 附录 A · 证据索引（本文所有结论的源码/文档出处）
 
 | 结论 | 出处 |
 |---|---|
 | 提权=execve(47 字符)，成功看 getuid()==0 | `engine/src/patch_do_execve.cpp:76-98,113-135`；`engine/src/skroot_patch_main.cpp:312-317`；`docs/SPROOT-DOC-A1` §4.1/§4.3 |
 | **密钥 ABI 全链（AP 文件 47 / 内核 47+NUL / 引擎 48→47+NUL / execve 必须 47）** | **§12**；`apd/src/deploy.rs::{abi_key,key_material}`；`apd/src/secret.rs::read_key_file`；`apd/src/supercall.rs::escalation_token`；`engine/src/skroot_patch_main.cpp:61-64,105-107,434-447,618-623` |
-| **授权三态 + 日志（ABI/CLI/判定）** | **§13**；`apd/src/auth_list.rs`（`authorize/decide/set_state/log_events/migrate_legacy`）；`apd/src/cli.rs::AuthCmd`；`apd/src/daemon.rs::handle_client`；`apd/src/defs.rs::{AUTH_LIST_FILE,AUTH_LOG_FILE}` |
+| **授权三态 + 日志（ABI/CLI/判定）** | **§13**；`apd/src/auth_list.rs`（`authorize/decide/set_auth/log_events/migrate_legacy`）；`apd/src/cli.rs::AuthCmd`；`apd/src/daemon.rs::handle_client`；`apd/src/defs.rs::{AUTH_LIST_FILE,AUTH_LOG_FILE}` |
+| **APatch/Zygisk 兼容层（`-V`=10762 + 派生 package_config + `--exclude` + `zygisk` selftest）** | **§14**；`apd/src/defs.rs::{APATCH_COMPAT_VERSION,APATCH_PACKAGE_CONFIG*}`；`apd/src/cli.rs`（version/clap `-V`、`auth set --exclude`）；`apd/src/auth_list.rs::package_config_csv`；`apd/src/selftest.rs::{zygiskd_pid,zygisk_module_prop}`；`apd/tests/version_flag.rs` |
 | 隐藏目录名=key[0:16]、filldir 双路隐藏 | `engine/src/patch_filldir64.cpp:52-62`；A1 §4.2/§4.4 |
 | AP 侧提权实现已就位 | `app/apd/src/supercall.rs:42-83` |
 | 授权表用户态化（flock/单写者/tmp+rename/保护 uid） | `app/apd/src/auth_list.rs:27-149`；`app/apd/src/package.rs:13-21,127-185,241-330` |
@@ -873,3 +964,4 @@ UI 兜底（推荐）：拿 `uid` 直接调 `PackageManager.getPackagesForUid(ui
 *版本：v1.2（2026-11-08 夜间自主令，sys-guard）。v1.1 → v1.2：① `module list --json` / `selftest --json` schema 定稿（与 app-client 对齐）；② 新增 §11 发布门禁（release.yml）；③ P2 收尾记录（AGPL/许可清单/实测体积）。历史：v1.1（2026-11-08，sys-guard）。v1.0 草案 → v1.1：① 契约 v1.1 已三方会签并**冻结（2026-11-08 21:23 +08，TBD-10 关闭）**；② 补入 §2.2「修补链 ≠ 特权链」边界铁律；③ §7 backlog P0 进入实施（交叉编译链依赖 CI）。下一交付：P0 代码落地 + host `cargo check` 通过记录。*
 *版本补充：v1.3（2026-11-09，apd-dev）：新增 §12「密钥 ABI 全链一致性」（五处口径静态核对 + 6 条新断言，逐条以负样本证伪）；`supercall::escalation_token()` 改为返回 `Result`（<47 / >48 / 非 ASCII 硬报错，不再静默透传；48 归一到 47 并告警）。*
 *版本补充：v1.4（2026-11-10，apd-dev）：新增 §13「授权模型（三态 + 日志）」——`auth_list.json` 三态存储（`allow|deny|ask`，默认 ask）+ 一次性 csv 迁移（升级不丢授权）+ `auth list/set/log/revoke --json` CLI ABI + daemon `ask_pending` 显式拒绝 + 脱敏审计日志；勘误 **E6**（决策源 csv → JSON，待会签）；§4.4 标注 csv 已降级为迁移源。*
+*版本补充：v1.5（2026-11-10，apd-dev）：新增 §14「APatch / Zygisk 兼容层」——`apd -V` 输出 `apd 10762`（NeoZygisk `minAPatchVersion`）、派生写出 `/data/adb/ap/package_config`（0644、位置列、单写者 apd、与 §13 同事务一致）、`auth set --exclude`（含 `--state` 组合与 at-least-one 校验）、`selftest` 新增非 critical 的 `zygisk` 占位检查；新增真实二进制集成测试 `tests/version_flag.rs`。*

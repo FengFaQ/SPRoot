@@ -510,6 +510,8 @@ fn smoke_check() -> Result<()> {
         // Tri-state authorisation store + audit log (NEW-DOC-05 §13).
         PathBuf::from(defs::AUTH_LIST_FILE),
         PathBuf::from(defs::AUTH_LOG_FILE),
+        // Derived APatch/Zygisk signal (NEW-DOC-05 §14).
+        PathBuf::from(defs::APATCH_PACKAGE_CONFIG),
         concat_path(defs::BINARY_DIR, "su"),
     ];
     for path in &paths {
@@ -525,6 +527,25 @@ fn smoke_check() -> Result<()> {
         let mode = fs::metadata(path)?.permissions().mode() & 0o777;
         ensure!(mode == 0o600, "{path} mode {mode:o} != 600");
     }
+    // The Zygisk side may be a non-root helper: the derived csv must be
+    // readable (0644) but never writable, and its first line must be the exact
+    // positional header external parsers rely on.
+    let package_config = defs::APATCH_PACKAGE_CONFIG;
+    let mode = fs::metadata(package_config)?.permissions().mode() & 0o777;
+    ensure!(
+        mode == 0o644,
+        "{package_config} mode {mode:o} != 644 (Zygisk helper must be able to read it)"
+    );
+    let header = fs::read_to_string(package_config)?
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    ensure!(
+        header == defs::APATCH_PACKAGE_CONFIG_HEADER,
+        "{package_config} header '{header}' != '{}' (positional columns break external parsers)",
+        defs::APATCH_PACKAGE_CONFIG_HEADER
+    );
 
     // Start-chain contract (NEW-DOC-05 §3.1.3): exact ABI + fixed path.
     let mut key_bytes = fs::read(defs::SPROOT_KEY_FILE)?;

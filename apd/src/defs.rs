@@ -90,6 +90,34 @@ pub const AUTH_LOG_TMP_FILE: &str = concatcp!(SPROOT_DIR, "auth_log.jsonl.tmp");
 /// Over this size the log is rewritten down to the newest 500 events.
 pub const AUTH_LOG_MAX_BYTES: u64 = 256 * 1024;
 
+// ---------------------------------------------------------------------------
+// APatch / Zygisk compatibility layer (external ecosystem signal source).
+//
+// NeoZygisk (GPL-3.0) and OnyxZygisk (AGPL-3.0) integrate with APatch through
+// exactly two signals (`zygiskd/src/root_impl/apatch.rs`):
+//   1. `apd -V` → the **second whitespace token** is parsed as `i32` and must be
+//      >= `minAPatchVersion = 10762` (NeoZygisk build.gradle.kts:21);
+//   2. `/data/adb/ap/package_config` → csv `pkg,exclude,allow,uid,to_uid,sctx`;
+//      a row with `exclude == 1` means "exclude from modifications" (umount).
+//
+// SPRoot therefore deliberately advertises APatch lineage for that ecosystem.
+// **This is a compatibility layer, not a bug** (Lead 2026-11-10, human-approved
+// direction): the authoritative authorisation store remains
+// `auth_list.json`; the csv below is a derived, apd-written artifact only.
+// ---------------------------------------------------------------------------
+/// Numeric APatch version advertised to Zygisk implementations. Must stay
+/// >= `minAPatchVersion` (10762) or NeoZygisk reports `TooOld` and aborts.
+pub const APATCH_COMPAT_VERSION: i32 = 10762;
+/// `-V` version string: clap prints `<name> <version>` → `apd 10762`.
+pub const APATCH_COMPAT_VERSION_STR: &str = "10762";
+/// Derived APatch-compatible signal file read by NeoZygisk/OnyxZygisk.
+pub const APATCH_PACKAGE_CONFIG: &str = concatcp!(WORKING_DIR, "package_config");
+pub const APATCH_PACKAGE_CONFIG_TMP: &str = concatcp!(WORKING_DIR, "package_config.tmp");
+/// Header must match the APatch csv layout byte for byte: external parsers rely
+/// on positional columns (`parts[1]` = exclude, `parts[2]` = allow,
+/// `parts[3]` = uid), so a missing/renamed column silently breaks them.
+pub const APATCH_PACKAGE_CONFIG_HEADER: &str = "pkg,exclude,allow,uid,to_uid,sctx";
+
 /// File holding the abstract unix socket name used by the su authorisation
 /// channel (`@sproot-<12 hex>`). World readable so the client library can find
 /// the daemon; the name itself carries no key material (contract v1.1 §0.4).

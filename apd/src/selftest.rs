@@ -59,6 +59,74 @@ fn mode_of(path: &Path) -> Option<u32> {
     fs::metadata(path).ok().map(|m| m.permissions().mode() & 0o777)
 }
 
+/// `zygiskd` PID, or `None` when it is not running / not observable.
+///
+/// NeoZygisk and OnyxZygisk both name the helper process `zygiskd`; the check
+/// must never turn a missing component into a false failure (this round is a
+/// placeholder — see `defs::APATCH_PACKAGE_CONFIG` docs).
+fn zygiskd_pid() -> Option<u32> {
+    for entry in fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(raw) = fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        let cmdline = String::from_utf8_lossy(&raw);
+        let argv0 = cmdline.split('\0').next().unwrap_or("");
+        let base = argv0.rsplit('/').next().unwrap_or(argv0);
+        if base.contains("zygiskd") {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// `version=` from a Magisk/APatch `module.prop` body (first match).
+fn parse_module_prop_version(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("version=")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+/// Bundled Zygisk module version, if one is installed.
+///
+/// Phase 1: SPRoot does not ship/own a Zygisk module yet, so this normally
+/// returns `None`; the selftest reports "not installed" instead of failing.
+fn zygisk_module_prop() -> Option<(String, String)> {
+    let mut candidates: Vec<PathBuf> = fs::read_dir(defs::MODULE_DIR)
+        .ok()?
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("zygisk")
+        })
+        .map(|entry| entry.path().join("module.prop"))
+        .collect();
+    candidates.sort();
+    for prop in candidates {
+        if let Ok(text) = fs::read_to_string(&prop)
+            && let Some(version) = parse_module_prop_version(&text)
+        {
+            return Some((prop.display().to_string(), version));
+        }
+    }
+    None
+}
+
 /// Verdict for the raw bytes behind `--superkey-file` (NEW-DOC-05 §12).
 ///
 /// * `len == 47 && nul_free` — canonical AP-side ABI → pass, no warning;
@@ -365,6 +433,35 @@ pub fn run(json: bool) -> Result<()> {
     };
     checks.push(acl_check);
 
+    // ---- Zygisk / APatch compatibility signal (Phase 1 placeholder) ------
+    // NeoZygisk/OnyxZygisk identify the host as APatch via `apd -V` (10762) and
+    // read `/data/adb/ap/package_config`; this check surfaces whether a Zygisk
+    // helper is present/readable. Deliberately **not critical** this round: the
+    // built-in Zygisk packaging decision is still pending (Lead 2026-11-10).
+    let package_config = Path::new(defs::APATCH_PACKAGE_CONFIG);
+    let package_config_exists = package_config.is_file();
+    let package_config_mode = mode_of(package_config).unwrap_or(0);
+    // We write 0644: readable by a non-root Zygisk helper (group/other read),
+    // and never writable by anyone but root.
+    let package_config_readable = package_config_exists
+        && (package_config_mode & 0o044) != 0
+        && (package_config_mode & 0o022) == 0;
+    let zygiskd = zygiskd_pid();
+    let module_prop = zygisk_module_prop();
+    checks.push(Check::new(
+        "zygisk",
+        zygiskd.is_some() && package_config_readable,
+        false,
+        format!(
+            "apatch_compat_version={} zygiskd_pid={zygiskd:?} running={} module={} version={} package_config={} exists={package_config_exists} mode={package_config_mode:o} readable={package_config_readable} (Phase 1 placeholder: built-in Zygisk packaging pending)",
+            defs::APATCH_COMPAT_VERSION,
+            zygiskd.is_some(),
+            module_prop.as_ref().map(|(path, _)| path.as_str()).unwrap_or("-"),
+            module_prop.as_ref().map(|(_, version)| version.as_str()).unwrap_or("-"),
+            defs::APATCH_PACKAGE_CONFIG,
+        ),
+    ));
+
     // ---- hidden su -------------------------------------------------------
     let su_link = format!("{}su", defs::BINARY_DIR);
     let su_check = if deployed {
@@ -544,12 +641,26 @@ pub fn run(json: bool) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// `module.prop` parsing used by the `zygisk` selftest check.
+    #[test]
+    fn module_prop_version_parsing() {
+        assert_eq!(
+            parse_module_prop_version("id=zygisksu\nversion=v3.1\n"),
+            Some("v3.1".to_string())
+        );
+        assert_eq!(
+            parse_module_prop_version("# no version here\nid=x\n"),
+            None
+        );
+        assert_eq!(parse_module_prop_version("version=   \n"), None);
+        assert_eq!(parse_module_prop_version(""), None);
+    }
+
     /// `superkey_file` verdict must not fail an upgraded install: a legacy
     /// 48-byte file passes with the `legacy48` flag (warn + detail), while a
     /// truly broken file (length/mode/NUL) still fails.
     #[test]
-    fn superkey_verdict_accepts_47_and_legacy_48() {
-        // canonical 47 plain bytes
+    fn superkey_verdict_accepts_47_and_legacy_48() {        // canonical 47 plain bytes
         assert_eq!(superkey_abi_verdict(0o600, 47, true), (true, false));
         // legacy 48: pass (so summary stays daemon_ready/deployed), flagged
         assert_eq!(superkey_abi_verdict(0o600, 48, true), (true, true));
