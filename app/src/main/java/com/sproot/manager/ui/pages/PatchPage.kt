@@ -3,8 +3,10 @@ package com.sproot.manager.ui.pages
 import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,13 +22,11 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBars
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -38,25 +38,21 @@ import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.sproot.manager.core.AppLog
-import com.sproot.manager.core.BackupStore
 import com.sproot.manager.core.Capabilities
 import com.sproot.manager.core.EnginePhase
-import com.sproot.manager.core.InstallState
-import com.sproot.manager.core.PatchMode
+import com.sproot.manager.core.Exporter
 import com.sproot.manager.core.PatchPipeline
 import com.sproot.manager.core.PatchStage
 import com.sproot.manager.core.PatchUiState
 import com.sproot.manager.ui.components.BlurredBar
 import com.sproot.manager.ui.components.ConfirmDialog
-import com.sproot.manager.ui.components.LogPanel
 import com.sproot.manager.ui.components.copyToClipboard
 import com.sproot.manager.ui.components.maskSecret
-import com.sproot.manager.ui.components.WarningCard
-import com.sproot.manager.ui.components.WarningLevel
 import com.sproot.manager.ui.components.rememberBlurBackdrop
 import com.sproot.manager.ui.theme.LocalEnableBlur
 import top.yukonga.miuix.kmp.basic.BasicComponent
@@ -74,39 +70,28 @@ import top.yukonga.miuix.kmp.basic.TopAppBar
 import top.yukonga.miuix.kmp.blur.layerBackdrop
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Back
-import top.yukonga.miuix.kmp.icon.extended.Copy
-import top.yukonga.miuix.kmp.icon.extended.ExpandLess
-import top.yukonga.miuix.kmp.icon.extended.ExpandMore
 import top.yukonga.miuix.kmp.icon.extended.Folder
 import top.yukonga.miuix.kmp.icon.extended.Report
-import top.yukonga.miuix.kmp.icon.extended.Reset
-import top.yukonga.miuix.kmp.icon.extended.Update
-import top.yukonga.miuix.kmp.preference.CheckboxPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.MiuixTheme.colorScheme
 import top.yukonga.miuix.kmp.utils.overScrollVertical
 import top.yukonga.miuix.kmp.utils.scrollEndHaptic
 
 /**
- * 修补页 —— 版式照抄 KernelSU 的 `InstallMiuix + FlashMiuix` 组合：
+ * 修补页（主页触发的二级页）—— 人类指令 2026-11-10 C「大幅精简」后的形态：
  *
  * ```
- * Scaffold(BlurredBar(TopAppBar("修补")))
- *  └─ LazyColumn(12dp 横距, 12dp 卡片间距)
- *      ├─ Card 选择镜像        BasicComponent(File 图标 + 文件名 + 右侧箭头)
- *      ├─ Card 修补模式        CheckboxPreference × N（KSU 的选择项样式）
- *      ├─ Card 修补进度        百分比 + LinearProgressIndicator + 引擎 phase/pct + 开始按钮
- *      ├─ Card 错误（常驻）    WarningCard 配色 + 可展开详情 + 复制全部
- *      ├─ Card 产物            sha256/等长/AVB/rc/密钥
- *      ├─ Card 刷入指引        FlashMiuix 命令卡（等宽命令 + 复制）
- *      ├─ Card 两级状态        我已刷入 → 已重启生效
- *      └─ LogPanel             常驻日志（缺陷 ⑤ 的修复点，不随失败卸载）
+ * Scaffold(BlurredBar(TopAppBar("修补内核" + 返回)))
+ *  └─ LazyColumn(12dp 横距, 12dp 卡距)
+ *      ├─ 选择 boot.img（必选）/ init_boot.img（可选·高级）
+ *      ├─ 进度（百分比 + 进度条 + 当前阶段 + 引擎阶段 + 开始修补）
+ *      ├─ 错误卡（失败时常驻，可展开详情/复制）
+ *      ├─ 结果卡（本次产物路径/sha256/等长/AVB/密钥）
+ *      └─ 底部一行小字：点击导出 TXT 日志到 Downloads/SPRoot/
  * ```
  *
- * 三条不可妥协的 UI 约定（对应旧版"点击修补一闪即退"）：
- *  1) 错误一旦发生，errorTitle/errorDetail **常驻**，只有用户点"重置"才消失；
- *  2) 日志面板始终在页面底部，且日志已同步落盘（设置页可见路径）；
- *  3) 进度 = 阶段百分比 + 引擎 NDJSON 的 pct/phase（引擎事件单调递增，绝不回退）。
+ * 已删除：所有说明性小字、修补模式选择（导出并给出刷入指引）、日志面板、
+ * 已修补产物区块、刷入指引、两级状态标记（刷入状态改由主页「未安装/已安装」表达）。
  */
 @Composable
 fun PatchPager(
@@ -117,20 +102,12 @@ fun PatchPager(
     val context = LocalContext.current
     val state = PatchPipeline.uiState.value
     val scrollBehavior = MiuixScrollBehavior()
-    val enableBlur = LocalEnableBlur.current
-    val backdrop = rememberBlurBackdrop(enableBlur)
+    val backdrop = rememberBlurBackdrop(LocalEnableBlur.current)
     val barColor = if (backdrop != null) Color.Transparent else colorScheme.surface
 
     var showKey by remember { mutableStateOf(false) }
     var showErrorDetail by remember { mutableStateOf(true) }
     var showResetConfirm by remember { mutableStateOf(false) }
-    // 上次成功的产物（来自 InstallState）：用于「已修补 → 查看产物/刷入指引」入口
-    var installSnap by remember { mutableStateOf(InstallState.load(context)) }
-    LaunchedEffect(isCurrentPage, state.stage) {
-        if (isCurrentPage || state.stage == PatchStage.DONE) {
-            installSnap = InstallState.load(context)
-        }
-    }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         if (uri == null) {
@@ -145,7 +122,6 @@ fun PatchPager(
         }
         PatchPipeline.selectInput(uri, queryDisplayName(context, uri))
     }
-    // P2 双镜像：init_boot.img（可选；ramdisk 的权威落点）
     val initBootPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         if (uri == null) {
             AppLog.warn("PatchUI", "用户取消了 init_boot 文件选择")
@@ -163,7 +139,7 @@ fun PatchPager(
     ConfirmDialog(
         show = showResetConfirm,
         title = "重置修补页状态",
-        message = "将清除当前错误与进度（日志与备份保留）。修补进行中无法重置。",
+        message = null,
         confirmText = "重置",
         onConfirm = {
             PatchPipeline.reset()
@@ -177,7 +153,7 @@ fun PatchPager(
             BlurredBar(backdrop) {
                 TopAppBar(
                     color = barColor,
-                    title = "修补内核 / 自启注入",
+                    title = "修补内核",
                     navigationIcon = {
                         IconButton(onClick = onBack) {
                             Icon(
@@ -217,23 +193,7 @@ fun PatchPager(
                             onPickInitBoot = { initBootPicker.launch(arrayOf("*/*")) },
                             onReset = { showResetConfirm = true },
                         )
-                        if (state.sourceUri != null && state.initBootSourceUri == null) {
-                            WarningCard(
-                                message = "未选择 init_boot.img：无法注入自启脚本" +
-                                    "（本机 ramdisk 可能位于 init_boot，例如魅族 21；不影响内核修补产物）",
-                                level = WarningLevel.Notice,
-                            )
-                        }
-                        ModeCard(state = state)
                         ProgressCard(state = state, onStart = { PatchPipeline.start(context) })
-                        if (state.stage != PatchStage.DONE && installSnap.artifacts.isNotEmpty()) {
-                            PreviousProductsCard(
-                                snapshot = installSnap,
-                                onCopyCommand = { cmd ->
-                                    context.copyToClipboard("刷入命令", cmd)
-                                },
-                            )
-                        }
                         if (state.hasError) {
                             ErrorCard(
                                 state = state,
@@ -242,9 +202,7 @@ fun PatchPager(
                                 onCopyAll = {
                                     context.copyToClipboard(
                                         "错误详情",
-                                        (state.errorTitle ?: "") + "\n\n" + (state.errorDetail ?: "") +
-                                            "\n\n---- 日志 ----\n" + AppLog.dumpText() +
-                                            "\n\n日志文件：" + (state.logPath ?: "无"),
+                                        (state.errorTitle ?: "") + "\n\n" + (state.errorDetail ?: ""),
                                     )
                                 },
                             )
@@ -255,10 +213,9 @@ fun PatchPager(
                                 showKey = showKey,
                                 onToggleKey = { showKey = !showKey },
                                 onCopyKey = { key -> context.copyToClipboard("Root 密钥", key) },
-                                onCopyCommand = { cmd -> context.copyToClipboard("刷入命令", cmd) },
                             )
                         }
-                        LogPanel()
+                        LogExportLine()
                         Spacer(Modifier.height(bottomInnerPadding))
                     }
                 }
@@ -278,9 +235,8 @@ private fun SelectImageCard(
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
         BasicComponent(
-            title = "1 · 选择 boot.img（修补内核）",
-            summary = state.sourceName
-                ?: "为内核打提权补丁（kallsyms → hook → shellcode → 密钥）；必选，kernel 本体/压缩包会被拒绝",
+            title = "boot.img",
+            summary = state.sourceName ?: "未选择",
             onClick = onPick,
             startAction = {
                 Icon(
@@ -292,10 +248,8 @@ private fun SelectImageCard(
             },
         )
         BasicComponent(
-            title = "2 · 选择 init_boot.img（可选 · 注入自启脚本）",
-            summary = state.initBootSourceName
-                ?: "init_boot 里只有 generic ramdisk、没有 kernel，不做内核修补；这里只注入 init.sproot.rc，" +
-                "让 AP daemon 开机自启（ramdisk 在 init_boot 的机型如魅族 21 必须选）",
+            title = "init_boot.img（可选 · 高级）",
+            summary = state.initBootSourceName ?: "未选择",
             onClick = onPickInitBoot,
             startAction = {
                 Icon(
@@ -306,44 +260,11 @@ private fun SelectImageCard(
                 )
             },
         )
-        state.sourceUri?.let { uri ->
-            BasicComponent(
-                title = "已选镜像 URI",
-                summary = uri,
-                onClick = onPick,
-            )
-        }
         BasicComponent(
-            title = "重置修补页状态",
-            summary = "清除进度与错误（日志/备份保留）",
+            title = "重置",
+            summary = "",
             onClick = onReset,
-            startAction = {
-                Icon(
-                    imageVector = MiuixIcons.Reset,
-                    contentDescription = null,
-                    tint = colorScheme.onSurfaceVariantActions,
-                    modifier = Modifier.padding(end = 12.dp),
-                )
-            },
         )
-    }
-}
-
-// ---------------------------------------------------------------- 修补模式
-
-@Composable
-private fun ModeCard(state: PatchUiState) {
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Column {
-            PatchMode.entries.filter { it.enabled }.forEach { mode ->
-                CheckboxPreference(
-                    title = mode.label,
-                    summary = mode.description,
-                    checked = state.mode == mode,
-                    onCheckedChange = { PatchPipeline.selectMode(mode) },
-                )
-            }
-        }
     }
 }
 
@@ -358,7 +279,7 @@ private fun ProgressCard(state: PatchUiState, onStart: () -> Unit) {
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = "修补进度",
+                    text = "进度",
                     fontSize = MiuixTheme.textStyles.headline1.fontSize,
                     fontWeight = FontWeight.Medium,
                     color = colorScheme.onSurface,
@@ -378,27 +299,14 @@ private fun ProgressCard(state: PatchUiState, onStart: () -> Unit) {
             )
             Spacer(Modifier.height(10.dp))
             Text(
-                text = "当前阶段：${state.stage.title}",
+                text = state.stage.title,
                 fontSize = 14.sp,
                 color = colorScheme.onSurface,
             )
             if (state.enginePct >= 0) {
                 Text(
-                    text = "引擎：${EnginePhase.label(state.enginePhase)}（${state.enginePct}%）",
+                    text = EnginePhase.label(state.enginePhase) + "（" + state.enginePct + "%）",
                     fontSize = 13.sp,
-                    color = colorScheme.onSurfaceVariantSummary,
-                )
-            } else if (state.phase.isNotBlank()) {
-                Text(
-                    text = state.phase,
-                    fontSize = 13.sp,
-                    color = colorScheme.onSurfaceVariantSummary,
-                )
-            }
-            state.backupSha1?.let {
-                Text(
-                    text = "原镜像备份：sha1=$it（设置 → 备份可还原）",
-                    fontSize = 12.sp,
                     color = colorScheme.onSurfaceVariantSummary,
                 )
             }
@@ -409,18 +317,11 @@ private fun ProgressCard(state: PatchUiState, onStart: () -> Unit) {
                 enabled = !state.running && state.sourceUri != null,
                 colors = ButtonDefaults.textButtonColorsPrimary(),
             )
-            if (state.running) {
-                Text(
-                    text = "修补进行中：请保持 App 在前台。中断不会产生可刷产物。",
-                    fontSize = 13.sp,
-                    color = colorScheme.onSurfaceVariantSummary,
-                )
-            }
         }
     }
 }
 
-// ---------------------------------------------------------------- 错误（常驻）
+// ---------------------------------------------------------------- 错误
 
 @Composable
 private fun ErrorCard(
@@ -442,41 +343,31 @@ private fun ErrorCard(
                     imageVector = MiuixIcons.Report,
                     contentDescription = null,
                     tint = colorScheme.onErrorContainer,
-                    modifier = Modifier
-                        .padding(end = 8.dp)
-                        .size(20.dp),
+                    modifier = Modifier.padding(end = 8.dp),
                 )
                 Text(
-                    text = "修补失败（详情常驻，可复制上报）",
+                    text = state.errorTitle ?: "未知错误",
                     fontSize = 15.sp,
                     fontWeight = FontWeight.Medium,
                     color = colorScheme.onErrorContainer,
                 )
             }
-            Spacer(Modifier.height(6.dp))
-            Text(
-                text = state.errorTitle ?: "未知错误",
-                fontSize = 14.sp,
-                color = colorScheme.onErrorContainer,
-            )
             state.errorCode?.let {
                 Text(
-                    text = "错误码：$it",
+                    text = it,
                     fontSize = 12.sp,
                     fontFamily = FontFamily.Monospace,
                     color = colorScheme.onErrorContainer,
                 )
             }
-            Spacer(Modifier.height(4.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 TextButton(
-                    text = if (showDetail) "收起详情" else "展开详情",
+                    text = if (showDetail) "收起" else "详情",
                     onClick = onToggleDetail,
                 )
-                TextButton(text = "复制全部", onClick = onCopyAll)
+                TextButton(text = "复制", onClick = onCopyAll)
             }
             if (showDetail) {
-                Spacer(Modifier.height(6.dp))
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Text(
                         text = state.errorDetail ?: "（无详情）",
@@ -491,18 +382,11 @@ private fun ErrorCard(
                     )
                 }
             }
-            Spacer(Modifier.height(4.dp))
-            Text(
-                text = "日志文件：${state.logPath ?: "未初始化"}",
-                fontSize = 12.sp,
-                fontFamily = FontFamily.Monospace,
-                color = colorScheme.onErrorContainer,
-            )
         }
     }
 }
 
-// ---------------------------------------------------------------- 成功
+// ---------------------------------------------------------------- 结果
 
 @Composable
 private fun SuccessCard(
@@ -510,289 +394,59 @@ private fun SuccessCard(
     showKey: Boolean,
     onToggleKey: () -> Unit,
     onCopyKey: (String) -> Unit,
-    onCopyCommand: (String) -> Unit,
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp)) {
             Text(
-                text = "内核修补 / 自启注入完成（产物已导出）",
+                text = "完成（产物已导出）",
                 fontSize = MiuixTheme.textStyles.headline1.fontSize,
                 fontWeight = FontWeight.Medium,
                 color = colorScheme.onSurface,
             )
-            Text(
-                text = if (state.initBootOutputPath != null) {
-                    "boot.img 已修补内核（提权能力），init_boot.img 已注入自启脚本（AP 开机自启）；" +
-                        "两个产物都要刷（见下方指引），刷入后回到本页标记状态"
-                } else {
-                    "boot.img 已修补内核（提权能力）；未包含自启注入产物。导出了 ≠ 刷进去了，请按指引手动刷入"
-                },
-                fontSize = 13.sp,
-                color = colorScheme.onSurfaceVariantSummary,
-            )
-            Spacer(Modifier.height(8.dp))
-            KeyValueRow("内核修补产物（boot.img）", state.outputPath!!, monospace = true)
-            KeyValueRow("大小", Capabilities.formatBytes(state.outputBytes), monospace = true)
+            Spacer(Modifier.height(4.dp))
+            KeyValueRow("boot.img", state.outputPath!!, monospace = true)
+            KeyValueRow("size", Capabilities.formatBytes(state.outputBytes), monospace = true)
             KeyValueRow("sha256", state.outputSha256 ?: "—", monospace = true)
             KeyValueRow(
-                label = "内核等长校验",
-                value = if (state.kernelEqualLength) {
-                    "通过（${Capabilities.formatBytes(state.kernelBytes)}，纯字节 patch）"
-                } else {
-                    "未通过（禁止刷入）"
-                },
+                label = "内核等长",
+                value = if (state.kernelEqualLength) "通过" else "未通过",
                 valueColor = if (state.kernelEqualLength) colorScheme.onSurface else colorScheme.error,
             )
             if (state.avbStatus.isNotBlank()) {
-                KeyValueRow("AVB 校验（AVB-1/2/3）", state.avbStatus)
+                KeyValueRow("AVB", state.avbStatus)
             }
             if (state.rcTarget.isNotBlank()) {
                 KeyValueRow(
-                    label = "开机自启（AP daemon）",
+                    label = "自启脚本",
                     value = if (state.rcInjected) {
-                        "已注入开机自启模板（target=${state.rcTarget}，来源=${state.rcSource}）—— " +
-                            "待 AP 部署完成后生效：AP 部署需写入 /data/adb/sproot/key（0600，47 字符）；" +
-                            "在此之前自启不会工作（可手动启动 AP）"
+                        "已注入（" + state.rcTarget + "）"
                     } else {
-                        "未注入（target=${state.rcTarget}，原因=${state.rcReason}）—— 产物仍合规，可手动启动 AP"
+                        "未注入（" + state.rcReason + "）"
                     },
-                    valueColor = colorScheme.onSurfaceVariantSummary,
                 )
             }
             state.initBootOutputPath?.let { initPath ->
-                Spacer(Modifier.height(6.dp))
-                KeyValueRow("自启注入产物（init_boot.img）", initPath, monospace = true)
-                KeyValueRow("自启注入产物大小", Capabilities.formatBytes(state.initBootBytes), monospace = true)
-                KeyValueRow("自启注入产物 sha256", state.initBootOutputSha256 ?: "—", monospace = true)
+                KeyValueRow("init_boot.img", initPath, monospace = true)
+                KeyValueRow("size", Capabilities.formatBytes(state.initBootBytes), monospace = true)
+                KeyValueRow("sha256", state.initBootOutputSha256 ?: "—", monospace = true)
             }
-            state.reportPath?.let { KeyValueRow("引擎报告", it, monospace = true) }
-            state.backupSha1?.let { KeyValueRow("原镜像备份", "sha1=$it", monospace = true) }
-
             val key = state.rootKey
             if (key != null) {
-                Spacer(Modifier.height(6.dp))
                 KeyValueRow(
-                    label = "Root 密钥（47 字符 + NUL，内核 ABI）",
+                    label = "密钥",
                     value = if (showKey) key else maskSecret(key),
                     monospace = true,
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    TextButton(text = if (showKey) "隐藏密钥" else "显示密钥", onClick = onToggleKey)
-                    TextButton(text = "复制密钥", onClick = { onCopyKey(key) })
+                    TextButton(text = if (showKey) "隐藏" else "显示", onClick = onToggleKey)
+                    TextButton(text = "复制", onClick = { onCopyKey(key) })
                 }
             }
-
-            if (state.mode == PatchMode.EXPORT_AND_GUIDE) {
-                Spacer(Modifier.height(8.dp))
-                FlashGuide(
-                    bootPath = state.outputPath!!,
-                    initBootPath = state.initBootOutputPath,
-                    onCopy = onCopyCommand,
-                )
-            }
-            Spacer(Modifier.height(8.dp))
-            TwoLevelStatus()
         }
     }
 }
 
-/**
- * 上次成功的产物（从 [InstallState] 读取）。
- *
- * 人类指令（2026-11-10）：修补页不再独立成 Tab，而是从主页进入。
- * 已修补/已刷入的用户进来后应直接看到**产物 + 刷入指引**（KSU 的 Home→Flash 模型），
- * 而不是空白的选择镜像页。
- */
-@Composable
-private fun PreviousProductsCard(
-    snapshot: InstallState.Snapshot,
-    onCopyCommand: (String) -> Unit,
-) {
-    val bootArtifact = snapshot.artifacts.firstOrNull { it.label == "boot" }
-    val initBootArtifact = snapshot.artifacts.firstOrNull { it.label == "init_boot" }
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text(
-                text = "已修补产物（上次成功）",
-                fontSize = MiuixTheme.textStyles.headline1.fontSize,
-                fontWeight = FontWeight.Medium,
-                color = colorScheme.onSurface,
-            )
-            Text(
-                text = "当前状态：${snapshot.status.label} · ${snapshot.updatedAtText}",
-                fontSize = 12.sp,
-                color = colorScheme.onSurfaceVariantSummary,
-            )
-            snapshot.artifacts.forEach { artifact ->
-                KeyValueRow(
-                    label = if (artifact.label == "init_boot") {
-                        "自启注入产物（init_boot.img）"
-                    } else {
-                        "内核修补产物（boot.img）"
-                    },
-                    value = artifact.displayPath,
-                    monospace = true,
-                )
-                KeyValueRow("sha256", artifact.sha256, monospace = true)
-            }
-            snapshot.note?.let {
-                Text(
-                    text = "备注：$it",
-                    fontSize = 12.sp,
-                    color = colorScheme.onSurfaceVariantSummary,
-                )
-            }
-            val bootPath = bootArtifact?.displayPath ?: snapshot.artifactDisplayPath
-            if (bootPath != null) {
-                Spacer(Modifier.height(8.dp))
-                FlashGuide(
-                    bootPath = bootPath,
-                    initBootPath = initBootArtifact?.displayPath,
-                    onCopy = onCopyCommand,
-                )
-            }
-            Spacer(Modifier.height(8.dp))
-            TwoLevelStatus()
-        }
-    }
-}
-
-/**
- * 刷入指引 —— 版式照抄 FlashMiuix 的命令卡：等宽命令 + 复制按钮。
- * AVB 结论（NEW-DOC-04 §4.4）：三家实现都不碰 AVB 密码学，只刷 boot、不碰 vbmeta。
- */
-@Composable
-private fun FlashGuide(bootPath: String, initBootPath: String?, onCopy: (String) -> Unit) {
-    val bootName = bootPath.substringAfterLast('/')
-    val initBootName = initBootPath?.substringAfterLast('/')
-    val commands = buildList {
-        add("进入 bootloader" to "adb reboot bootloader")
-        add("查看当前槽位（A/B 机型）" to "fastboot getvar current-slot")
-        add("① 刷入 boot（内核修补，双槽都刷）" to "fastboot flash --slot=all boot $bootName")
-        if (initBootName != null) {
-            add("② 刷入 init_boot（自启脚本注入，双槽都刷）" to "fastboot flash --slot=all init_boot $initBootName")
-        }
-        add("重启" to "fastboot reboot")
-    }
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.defaultColors(
-            color = colorScheme.surfaceContainer,
-            contentColor = colorScheme.onSurface,
-        ),
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text(
-                text = if (initBootPath != null) {
-                    "刷入指引（boot=内核修补、init_boot=自启注入；两个都要刷，按①→②顺序；不碰 vbmeta）"
-                } else {
-                    "刷入指引（只刷 boot 分区 = 内核修补；不碰 vbmeta）"
-                },
-                fontSize = 15.sp,
-                fontWeight = FontWeight.Medium,
-                color = colorScheme.onSurface,
-            )
-            Spacer(Modifier.height(6.dp))
-            commands.forEach { (label, cmd) ->
-                Text(
-                    text = "$label：",
-                    fontSize = 13.sp,
-                    color = colorScheme.onSurfaceVariantSummary,
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        text = cmd,
-                        fontSize = 12.sp,
-                        fontFamily = FontFamily.Monospace,
-                        color = colorScheme.onSurface,
-                        modifier = Modifier.weight(1f),
-                    )
-                    TextButton(text = "复制", onClick = { onCopy(cmd) })
-                }
-            }
-            Spacer(Modifier.height(6.dp))
-            Text(
-                text = if (initBootPath != null) {
-                    "⚠️ 只刷 boot / init_boot 两个分区（按①→②顺序，各自 --slot=all）；" +
-                        "不要刷 vbmeta、不要加 --disable-verity/--disable-verification。\n" +
-                        "若 bootloader 仍锁着，刷入后将无法开机（属预期）——请确认已解锁后再刷。\n" +
-                        "刷前记录本页两个产物的 sha256；刷坏可用本页「原镜像备份」还原。"
-                } else {
-                    "⚠️ 仅刷 boot 分区；不要刷 vbmeta、不要加 --disable-verity/--disable-verification。\n" +
-                        "若 bootloader 仍锁着，刷入后将无法开机（属预期）——请确认已解锁后再刷。\n" +
-                        "刷前记录本页 sha256；刷坏可用本页「原镜像备份」还原。"
-                },
-                fontSize = 12.sp,
-                color = colorScheme.error,
-            )
-        }
-    }
-}
-
-/** 两级状态：产物导出成功 → 用户确认已刷入 → 用户确认已重启生效。 */
-@Composable
-private fun TwoLevelStatus() {
-    val context = LocalContext.current
-    var status by remember { mutableStateOf(InstallState.load(context).status) }
-    val nextLabel = when (status) {
-        InstallState.Status.PATCHED_PENDING_FLASH -> "我已刷入（标记待重启）"
-        InstallState.Status.FLASHED_PENDING_REBOOT -> "已重启并生效（标记激活）"
-        else -> "状态已更新完毕"
-    }
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.defaultColors(
-            color = colorScheme.surfaceContainer,
-            contentColor = colorScheme.onSurface,
-        ),
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text(
-                text = "当前状态：${status.label}",
-                fontSize = 15.sp,
-                fontWeight = FontWeight.Medium,
-                color = colorScheme.onSurface,
-            )
-            Text(
-                text = status.hint,
-                fontSize = 13.sp,
-                color = colorScheme.onSurfaceVariantSummary,
-            )
-            Spacer(Modifier.height(8.dp))
-            TextButton(
-                text = nextLabel,
-                onClick = {
-                    when (status) {
-                        InstallState.Status.PATCHED_PENDING_FLASH -> {
-                            InstallState.markFlashed(context)
-                            status = InstallState.Status.FLASHED_PENDING_REBOOT
-                        }
-
-                        InstallState.Status.FLASHED_PENDING_REBOOT -> {
-                            InstallState.markActive(context)
-                            status = InstallState.Status.ACTIVE
-                        }
-
-                        else -> Unit
-                    }
-                },
-                enabled = status == InstallState.Status.PATCHED_PENDING_FLASH ||
-                    status == InstallState.Status.FLASHED_PENDING_REBOOT,
-                colors = ButtonDefaults.textButtonColorsPrimary(),
-            )
-            Text(
-                text = "刷入成功由你手动回报：无 root 时本 App 读不到 fastboot 侧结果。",
-                fontSize = 12.sp,
-                color = colorScheme.onSurfaceVariantSummary,
-            )
-        }
-    }
-}
-
-/** 键值行（标题 12sp 灰 + 值 14sp；等宽用于 sha256/路径）。 */
+/** 键值行（值用等宽字体；不再带说明性小字）。 */
 @Composable
 private fun KeyValueRow(
     label: String,
@@ -800,7 +454,7 @@ private fun KeyValueRow(
     monospace: Boolean = false,
     valueColor: Color = colorScheme.onSurface,
 ) {
-    Column(modifier = Modifier.padding(vertical = 4.dp)) {
+    Column(modifier = Modifier.padding(vertical = 3.dp)) {
         Text(
             text = label,
             fontSize = 12.sp,
@@ -808,11 +462,42 @@ private fun KeyValueRow(
         )
         Text(
             text = value,
-            fontSize = 14.sp,
+            fontSize = 13.sp,
             color = valueColor,
             fontFamily = if (monospace) FontFamily.Monospace else FontFamily.Default,
         )
     }
+}
+
+// ---------------------------------------------------------------- 日志导出（页面最下方一行）
+
+/** 人类指令（C）：页面最下方一行小字，点击导出 TXT 日志到 Downloads/SPRoot/；失败必须有提示。 */
+@Composable
+private fun LogExportLine() {
+    val context = LocalContext.current
+    Text(
+        text = "导出 TXT 日志到 Downloads/SPRoot/",
+        fontSize = 12.sp,
+        color = colorScheme.primary,
+        textAlign = TextAlign.Center,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp)
+            .clickable {
+                Thread {
+                    runCatching {
+                        val file = AppLog.currentLogFile() ?: error("日志文件尚未初始化")
+                        val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
+                            .format(java.util.Date())
+                        Exporter.exportToDownloads(context, file, "sproot-log-$stamp.txt")
+                    }.onSuccess {
+                        Toast.makeText(context, "日志已导出到 Downloads/SPRoot/", Toast.LENGTH_LONG).show()
+                    }.onFailure {
+                        Toast.makeText(context, "日志导出失败：" + it.message, Toast.LENGTH_LONG).show()
+                    }
+                }.start()
+            },
+    )
 }
 
 private fun queryDisplayName(context: Context, uri: Uri): String? {

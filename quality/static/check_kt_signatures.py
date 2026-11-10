@@ -25,6 +25,14 @@ import sys
 
 DEFAULT_ROOT = "app/src/main/java"
 
+# 与 Kotlin 标准库/常见作用域函数同名的标识符：仓库内同名成员函数（如 AppLog.error(tag,msg)）
+# 会让"裸调用 error(...)"被误判，直接跳过这些名字。
+IGNORE_NAMES = {
+    "error", "require", "requireNotNull", "check", "checkNotNull", "println", "print",
+    "listOf", "mapOf", "setOf", "arrayOf", "mutableListOf", "mutableMapOf", "lazy",
+    "runCatching", "withContext", "with", "apply", "also", "let", "run", "repeat", "TODO",
+}
+
 
 def match_paren(s, open_idx):
     depth = 0
@@ -328,6 +336,8 @@ def main():
     for path, s in sources.items():
         masked = mask_code(s)
         for name, signatures in defs.items():
+            if name in IGNORE_NAMES:
+                continue
             for m in re.finditer(r"(?<![.\w])" + re.escape(name) + r"\s*\(", masked):
                 if s[max(0, m.start() - 4):m.start()] == "fun ":
                     continue

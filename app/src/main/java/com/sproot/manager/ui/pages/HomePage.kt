@@ -37,15 +37,10 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.sproot.manager.BuildConfig
-import com.sproot.manager.core.ApdClient
-import com.sproot.manager.core.ApdSelfTest
-import com.sproot.manager.core.Capabilities
-import com.sproot.manager.core.CapabilityItem
 import com.sproot.manager.core.InstallState
 import com.sproot.manager.core.PatchEngine
 import com.sproot.manager.core.SecretStore
 import com.sproot.manager.ui.components.BlurredBar
-import com.sproot.manager.ui.components.StatusTag
 import com.sproot.manager.ui.components.WarningCard
 import com.sproot.manager.ui.components.WarningLevel
 import com.sproot.manager.ui.components.rememberBlurBackdrop
@@ -57,7 +52,6 @@ import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
 import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.Text
-import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.basic.TopAppBar
 import top.yukonga.miuix.kmp.blur.LayerBackdrop
 import top.yukonga.miuix.kmp.blur.layerBackdrop
@@ -74,7 +68,6 @@ import top.yukonga.miuix.kmp.icon.extended.Store
 import top.yukonga.miuix.kmp.icon.extended.Tasks
 import top.yukonga.miuix.kmp.icon.extended.Tune
 import top.yukonga.miuix.kmp.icon.extended.Update
-import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.MiuixTheme.colorScheme
 import top.yukonga.miuix.kmp.utils.PressFeedbackType
@@ -87,15 +80,13 @@ import top.yukonga.miuix.kmp.utils.scrollEndHaptic
  * ```
  * Scaffold(BlurredBar(TopAppBar))            ← 毛玻璃顶栏
  *  └─ LazyColumn(12dp 横向边距, 12dp 卡片间距)
- *      ├─ WarningCard(引擎/密钥/AP 未部署/上次失败)   ← 正常初始态用 Notice，不红
- *      ├─ StatusCard    大号状态卡（状态 + 引擎版本 + 模式标签 + 右下大图标）
- *      ├─ InfoCard      设备信息（图标 + 标题 + 值 两行式）
- *      ├─ CapabilityCard 环境自检逐项
- *      └─ NextStepCard  去修补页
+ *      ├─ WarningCard(引擎/密钥/上次失败)      ← 正常初始态用 Notice，不红
+ *      ├─ StatusCard    大号状态卡：未安装/已安装 + 引擎 + GKI（点卡进入修补页）
+ *      └─ InfoCard      设备信息（图标 + 标题 + 值 两行式）
  * ```
  *
- * 与 KSU 的差异只在数据源（KSU: Natives/LKM；本项目: PatchEngine/ApdClient/InstallState），
- * 版式、组件、间距、字号全部沿用 KSU miuix 版。
+ * 人类指令（2026-11-10 B）：删除「环境自检」与「查看产物/刷入指引」入口；
+ * 刷入状态板只保留「未安装/已安装 + 引擎 + GKI」。
  */
 @Composable
 fun HomePager(
@@ -172,12 +163,6 @@ fun HomePager(
                         HomeWarnings(snapshot = snapshot)
                         StatusCard(snapshot = snapshot, onClick = onGoPatch)
                         InfoCard(snapshot = snapshot)
-                        CapabilityCard(
-                            snapshot = snapshot,
-                            refreshing = refreshing,
-                            onRefresh = refresh,
-                        )
-                        NextStepCard(snapshot = snapshot, onGoPatch = onGoPatch)
                         Spacer(Modifier.height(bottomInnerPadding))
                     }
                 }
@@ -190,27 +175,17 @@ fun HomePager(
 data class HomeSnapshot(
     val install: InstallState.Snapshot = InstallState.Snapshot(),
     val engine: PatchEngine.EngineStatus? = null,
-    val apdReady: Boolean = false,
-    val apdDetail: String = "",
-    val apdSelfTest: ApdSelfTest.Result? = null,
     val keyReady: Boolean = false,
-    val caps: List<CapabilityItem> = emptyList(),
     val loaded: Boolean = false,
 ) {
     companion object {
         fun load(context: android.content.Context): HomeSnapshot {
             val keyReady = runCatching { SecretStore.get(context).getOrCreateRootKey() }.isSuccess
             val engine = runCatching { PatchEngine.status(context) }.getOrNull()
-            val apd = runCatching { ApdClient.status(context) }.getOrNull()
-            val caps = runCatching { Capabilities.collect(context) }.getOrDefault(emptyList())
             return HomeSnapshot(
                 install = InstallState.load(context),
                 engine = engine,
-                apdReady = apd?.ok == true,
-                apdDetail = apd?.detail.orEmpty(),
-                apdSelfTest = ApdSelfTest.load(context),
                 keyReady = keyReady,
-                caps = caps,
                 loaded = true,
             )
         }
@@ -221,18 +196,7 @@ data class HomeSnapshot(
 @Composable
 private fun HomeWarnings(snapshot: HomeSnapshot) {
     if (snapshot.loaded) {
-        // ① AP 未部署 = 正常初始态（selftest 的 125 也在这一类），不能显示成失败
-        val selfTest = snapshot.apdSelfTest
-        val notDeployed = !snapshot.apdReady ||
-            selfTest == null ||
-            selfTest.isNormalInitialState
-        if (notDeployed) {
-            WarningCard(
-                message = "尚未部署 AP 守护（需先刷入修补后的镜像）",
-                level = WarningLevel.Notice,
-            )
-        }
-        // ② 引擎缺失/未加载（阻断修补）
+        // ① 引擎缺失/未加载（阻断修补）
         val engine = snapshot.engine
         if (engine == null || !engine.loaded) {
             WarningCard(
@@ -271,31 +235,26 @@ private fun HomeWarnings(snapshot: HomeSnapshot) {
 @Composable
 private fun StatusCard(snapshot: HomeSnapshot, onClick: () -> Unit) {
     val status = snapshot.install.status
-    val (container, content) = when (status) {
-        InstallState.Status.ACTIVE -> colorScheme.secondaryContainer to colorScheme.onSecondaryContainer
-        InstallState.Status.PATCHED_PENDING_FLASH,
-        InstallState.Status.FLASHED_PENDING_REBOOT,
-        -> colorScheme.tertiaryContainer to colorScheme.onTertiaryContainer
-
-        InstallState.Status.ERROR -> colorScheme.errorContainer to colorScheme.onErrorContainer
+    val installed = status == InstallState.Status.ACTIVE ||
+        status == InstallState.Status.PATCHED_PENDING_FLASH ||
+        status == InstallState.Status.FLASHED_PENDING_REBOOT
+    val (container, content) = when {
+        installed -> colorScheme.secondaryContainer to colorScheme.onSecondaryContainer
+        status == InstallState.Status.ERROR -> colorScheme.errorContainer to colorScheme.onErrorContainer
         else -> colorScheme.surfaceContainer to colorScheme.onSurface
     }
-    val icon: ImageVector = when (status) {
-        InstallState.Status.ACTIVE -> MiuixIcons.Ok
-        InstallState.Status.ERROR -> MiuixIcons.Report
+    val icon: ImageVector = when {
+        installed -> MiuixIcons.Ok
+        status == InstallState.Status.ERROR -> MiuixIcons.Report
         else -> MiuixIcons.Update
     }
-    val iconTint = when (status) {
-        InstallState.Status.ERROR -> colorScheme.error
-        InstallState.Status.ACTIVE -> colorScheme.primary
+    val iconTint = when {
+        status == InstallState.Status.ERROR -> colorScheme.error
+        installed -> colorScheme.primary
         else -> content
     }
     val engineVersion = snapshot.engine?.version
-    val apdMode = when {
-        snapshot.apdReady && snapshot.apdSelfTest?.isNormalInitialState == false -> "AP 已部署"
-        snapshot.apdReady -> "AP 待部署"
-        else -> "AP 未部署"
-    }
+    val gkiVersion = System.getProperty("os.version")?.takeIf { it.isNotBlank() } ?: "未知"
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -321,66 +280,26 @@ private fun StatusCard(snapshot: HomeSnapshot, onClick: () -> Unit) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(16.dp, 10.dp),
-                contentAlignment = Alignment.BottomStart,
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(text = apdMode, fontSize = 16.sp, fontWeight = FontWeight.Medium)
-                    Spacer(Modifier.size(8.dp))
-                    StatusTag(
-                        label = "SK",
-                        backgroundColor = content.copy(alpha = 0.12f),
-                        contentColor = content,
-                    )
-                }
-            }
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
                     .padding(16.dp, 14.dp),
                 contentAlignment = Alignment.TopStart,
             ) {
                 Column {
                     Text(
-                        text = status.label,
+                        text = if (installed) "已安装" else "未安装",
                         fontSize = 22.sp,
                         fontWeight = FontWeight.SemiBold,
                     )
                     Spacer(Modifier.height(1.dp))
                     Text(
-                        text = buildString {
-                            append("引擎 ")
-                            append(engineVersion ?: "未加载")
-                            append(" · JNI ABI v")
-                            append(PatchEngine.JNI_BINDING_VERSION)
-                        },
+                        text = "引擎 " + (engineVersion ?: "未加载") +
+                            " · JNI ABI v" + PatchEngine.JNI_BINDING_VERSION,
                         fontSize = 15.sp,
                     )
-                    Spacer(Modifier.height(2.dp))
+                    Spacer(Modifier.height(1.dp))
                     Text(
-                        text = status.hint,
-                        fontSize = 13.sp,
-                        maxLines = 2,
+                        text = "GKI " + gkiVersion,
+                        fontSize = 15.sp,
                     )
-                    Spacer(Modifier.height(2.dp))
-                    Text(
-                        text = when (status) {
-                            InstallState.Status.PATCHED_PENDING_FLASH,
-                            InstallState.Status.FLASHED_PENDING_REBOOT,
-                            InstallState.Status.ACTIVE,
-                            -> "点击查看产物与刷入指引"
-                            else -> "点击进入修补内核流程"
-                        },
-                        fontSize = 12.sp,
-                        color = content.copy(alpha = 0.75f),
-                    )
-                    if (snapshot.install.artifacts.size > 1) {
-                        Text(
-                            text = "产物：内核修补（boot）+ 自启注入（init_boot）",
-                            fontSize = 12.sp,
-                            color = content.copy(alpha = 0.75f),
-                        )
-                    }
                 }
             }
         }
@@ -461,112 +380,5 @@ private fun InfoCard(snapshot: HomeSnapshot) {
                 bottomPadding = 0.dp,
             )
         }
-    }
-}
-
-/** 环境自检卡：逐项 ✓/✗（阻断项标红），底部可手动复检。 */
-@Composable
-private fun CapabilityCard(
-    snapshot: HomeSnapshot,
-    refreshing: Boolean,
-    onRefresh: () -> Unit,
-) {
-    val blocking = snapshot.caps.count { !it.ok && it.blocking }
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = "环境自检",
-                    fontSize = MiuixTheme.textStyles.headline1.fontSize,
-                    fontWeight = FontWeight.Medium,
-                    color = colorScheme.onSurface,
-                    modifier = Modifier.weight(1f),
-                )
-                if (snapshot.loaded) {
-                    Text(
-                        text = if (blocking == 0) "全部通过" else "阻断 $blocking 项",
-                        fontSize = 13.sp,
-                        color = if (blocking == 0) colorScheme.primary else colorScheme.error,
-                    )
-                }
-            }
-            Spacer(Modifier.height(10.dp))
-            if (!snapshot.loaded) {
-                Text(
-                    text = "检测中…",
-                    fontSize = 13.sp,
-                    color = colorScheme.onSurfaceVariantSummary,
-                )
-            } else {
-                snapshot.caps.forEach { item ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 5.dp),
-                        verticalAlignment = Alignment.Top,
-                    ) {
-                        Icon(
-                            imageVector = if (item.ok) MiuixIcons.Basic.Check else MiuixIcons.Basic.Close,
-                            contentDescription = null,
-                            modifier = Modifier
-                                .padding(end = 8.dp, top = 2.dp)
-                                .size(16.dp),
-                            tint = when {
-                                item.ok -> colorScheme.primary
-                                item.blocking -> colorScheme.error
-                                else -> colorScheme.onSurfaceVariantActions
-                            },
-                        )
-                        Column {
-                            Text(
-                                text = item.label,
-                                fontSize = 14.sp,
-                                color = if (item.ok || !item.blocking) colorScheme.onSurface else colorScheme.error,
-                            )
-                            Text(
-                                text = item.detail,
-                                fontSize = 12.sp,
-                                color = colorScheme.onSurfaceVariantSummary,
-                            )
-                        }
-                    }
-                }
-                Spacer(Modifier.height(4.dp))
-                TextButton(
-                    text = if (refreshing) "复检中…" else "重新自检",
-                    onClick = onRefresh,
-                    enabled = !refreshing,
-                    colors = top.yukonga.miuix.kmp.basic.ButtonDefaults.textButtonColorsPrimary(),
-                )
-            }
-        }
-    }
-}
-
-/**
- * 下一步引导：照 KSU 的 `ArrowPreference` 入口卡（右侧箭头由组件自带）。
- *
- * 人类指令（2026-11-10）：修补页不独立成 Tab，Home 是唯一入口。
- *  - 未修补 → 「修补内核（boot.img）」
- *  - 已修补 → 「查看产物与刷入指引」
- */
-@Composable
-private fun NextStepCard(snapshot: HomeSnapshot, onGoPatch: () -> Unit) {
-    val hasArtifact = snapshot.install.artifacts.isNotEmpty() ||
-        snapshot.install.artifactDisplayPath != null
-    Card(modifier = Modifier.fillMaxWidth()) {
-        ArrowPreference(
-            title = if (hasArtifact) "查看产物与刷入指引" else "修补内核（boot.img）",
-            summary = if (hasArtifact) {
-                "上次修补的内核补丁产物与 fastboot 刷入指引都在这里；刷入后回到本页标记状态"
-            } else {
-                "选择本机 boot.img → 进程内修补内核（提权）→ 可选注入 init_boot 自启脚本 → " +
-                    "导出可刷产物（全程无需 root）"
-            },
-            onClick = onGoPatch,
-        )
     }
 }

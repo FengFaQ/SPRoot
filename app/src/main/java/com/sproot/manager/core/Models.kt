@@ -64,7 +64,7 @@ data class PatchUiState(
     /** 引擎自报 pct（0..100）；-1=还没收到事件 */
     val enginePct: Int = -1,
     val running: Boolean = false,
-    val mode: PatchMode = PatchMode.EXPORT_AND_GUIDE,
+    val mode: PatchMode = PatchMode.EXPORT_ONLY,
     val sourceUri: String? = null,
     val sourceName: String? = null,
     // P2 双镜像：init_boot.img（可选；ramdisk 的权威落点，D-12）
