@@ -229,10 +229,10 @@ private fun HomeWarnings(snapshot: HomeSnapshot) {
                 level = WarningLevel.Error,
             )
         }
-        // ⑥ 历史 48 字符密钥（仍在用前 47 位，建议重生成重刷）
-        if (SecretStore.legacy48Detected) {
+        // ⑥ 旧格式密钥一次性迁移提示（48 → 自动重新生成 47；只在本进程迁移后提示一次）
+        if (SecretStore.migratedFromLegacy) {
             WarningCard(
-                message = "检测到历史 48 字符密钥，已取前 47 位使用；建议重新生成密钥并重新修补镜像",
+                message = "检测到旧格式密钥，已重新生成（47 字符）；若你已修补过镜像，请重新修补并刷入",
                 level = WarningLevel.Notice,
             )
         }

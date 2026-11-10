@@ -89,7 +89,7 @@ object ApdSelfTest {
      * 执行自检（阻塞，调用方放后台线程）。
      * 有密钥时经 root-exec（完整能力）；无密钥/未部署时回退直接 exec（只读探测）。
      */
-    fun run(context: Context): Result {
+    fun run(context: Context, timeoutSec: Int = 60): Result {
         val key = runCatching { SecretStore.get(context).readRootKey() }.getOrNull()
         val viaRootExec = key != null
         val execResult = if (key != null) {
@@ -97,10 +97,10 @@ object ApdSelfTest {
                 context = context,
                 superKey = key,
                 command = listOf(ApdClient.apdBinary(context).absolutePath, "selftest", "--json"),
-                timeoutSec = 60,
+                timeoutSec = timeoutSec,
             )
         } else {
-            ApdClient.runDirect(context, listOf("selftest", "--json"), timeoutSec = 30)
+            ApdClient.runDirect(context, listOf("selftest", "--json"), timeoutSec = minOf(timeoutSec, 10))
         }
         val interpreted = interpret(execResult, viaRootExec)
         save(context, interpreted)

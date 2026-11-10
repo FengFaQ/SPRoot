@@ -54,9 +54,9 @@ class SecretStore private constructor(private val context: Context) {
 
         private const val KEY_CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
 
-        /** 检测到历史 48 字符密钥（已按前 47 位使用），设置页据此提示重新生成 */
+        /** 本次进程内发生过"旧格式 48 字符密钥 → 自动迁移为 47"（用于一次性提示） */
         @Volatile
-        var legacy48Detected: Boolean = false
+        var migratedFromLegacy: Boolean = false
             private set
 
         @Volatile
@@ -79,28 +79,17 @@ class SecretStore private constructor(private val context: Context) {
             key.length == KEY_LENGTH && key.all { it in KEY_CHARSET }
 
         /**
-         * 归一化为**内核密钥**（47 字符）。
+         * 归一化为**内核密钥**：只接受 47 字符 [A-Za-z0-9]。
          *
-         * 兼容历史数据：读到 48 字符旧密钥时取前 47 位并 warning（旧引擎写内核时也是前 47 位，
-         * 因此大概率仍可提权；但旧镜像里具体嵌了哪 47 位取决于当时写入逻辑，建议重新生成 + 重刷）。
+         * 人类要求（2026-11-10）：**一机一份、固定不变**，不做"历史 48 位兼容"；
+         * 48 字符旧值由 [SecretStore.readRootKey] 一次性迁移（自动重新生成 47 字符）。
          */
         fun kernelKeyOf(raw: String): String {
             val trimmed = raw.trim()
-            return when {
-                trimmed.length == KEY_LENGTH && trimmed.all { it in KEY_CHARSET } -> trimmed
-                trimmed.length == ENGINE_KEY_LENGTH && trimmed.all { it in KEY_CHARSET } -> {
-                    legacy48Detected = true
-                    AppLog.warn(
-                        TAG,
-                        "检测到历史 48 字符 Root 密钥（内核 ABI 只需 47 字符）→ 取前 47 位使用；" +
-                            "建议重新生成密钥并重新修补/刷入镜像，避免旧镜像内嵌密钥与新密钥不一致",
-                    )
-                    trimmed.take(KEY_LENGTH)
-                }
-                else -> throw IllegalArgumentException(
-                    "Root 密钥必须是 47 字符 [A-Za-z0-9]（内核 ABI 47+NUL），实际长度=${trimmed.length}",
-                )
+            require(isValidKey(trimmed)) {
+                "Root 密钥必须是 47 字符 [A-Za-z0-9]（内核 ABI 47+NUL），实际长度=${trimmed.length}"
             }
+            return trimmed
         }
 
         /** 引擎 `--key` 入参：47 字符补到 48（末位填充位被引擎丢弃） */
@@ -110,9 +99,17 @@ class SecretStore private constructor(private val context: Context) {
 
     private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
+    /**
+     * 进程内缓存（人类 2026-11-10 真机反馈：一次启动读了 5 次密钥、warn 5 次）。
+     * 密钥一机一份固定不变，读一次即可；[saveRootKey]/[rotate]/[clear] 会同步更新缓存。
+     */
+    @Volatile
+    private var cachedRootKey: String? = null
+
     /** 返回已有密钥；没有则生成并持久化。任何异常向上抛，由调用方展示完整错误。 */
     @Synchronized
     fun getOrCreateRootKey(): String {
+        cachedRootKey?.let { return it }
         readRootKey()?.let { return it }
         val fresh = generateKey()
         saveRootKey(fresh)
@@ -120,11 +117,20 @@ class SecretStore private constructor(private val context: Context) {
         return fresh
     }
 
+    /**
+     * 读取内核密钥（**只认 47 字符**；进程内缓存）。
+     *
+     * - 合法 47 字符 → 直接返回并缓存；
+     * - 旧格式 48 字符 → **一次性自动迁移**：重新生成 47 字符并标记 [migratedFromLegacy]
+     *   （人类要求"密钥一机一份固定不变"，不再取前 47 位凑合）；
+     * - 其它长度/解密失败 → 清除密文并返回 null（调用方 getOrCreate 会重新生成）。
+     */
     @Synchronized
     fun readRootKey(): String? {
+        cachedRootKey?.let { return it }
         val cipherText = prefs.getString(KEY_CIPHERTEXT, null) ?: return null
         val iv = prefs.getString(KEY_IV, null) ?: return null
-        return runCatching {
+        val raw = runCatching {
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(
                 Cipher.DECRYPT_MODE,
@@ -132,16 +138,39 @@ class SecretStore private constructor(private val context: Context) {
                 GCMParameterSpec(128, Base64.decode(iv, Base64.NO_WRAP)),
             )
             val plain = cipher.doFinal(Base64.decode(cipherText, Base64.NO_WRAP))
-            // 归一化为 47 字符内核密钥（历史 48 字符自动迁移并 warning）
-            kernelKeyOf(String(plain, Charsets.US_ASCII))
+            String(plain, Charsets.US_ASCII).trim()
         }.onFailure {
-            AppLog.error(TAG, "读取本地 Root 密钥失败（将需要重新生成）", it)
-        }.getOrNull()
+            AppLog.error(TAG, "读取本地 Root 密钥失败（将重新生成）", it)
+        }.getOrNull() ?: return null
+
+        return when {
+            isValidKey(raw) -> raw.also { cachedRootKey = it }
+            raw.length == ENGINE_KEY_LENGTH && raw.all { it in KEY_CHARSET } -> migrateLegacy(raw)
+            else -> {
+                AppLog.warn(TAG, "本地密钥格式无效（长度=${raw.length}）→ 清除并重新生成")
+                clearCiphertext()
+                null
+            }
+        }
+    }
+
+    /** 旧格式（48 字符）一次性迁移：重新生成 47 字符、写回、标记（不再每次启动警告）。 */
+    private fun migrateLegacy(old: String): String {
+        val fresh = generateKey()
+        saveRootKey(fresh)
+        migratedFromLegacy = true
+        // 一次性标记：以后启动不再重复提示（人类要求：只提示一次）
+        prefs.edit().putBoolean("key_migrated_v47", true).apply()
+        AppLog.warn(
+            TAG,
+            "检测到旧格式密钥（48 字符），已重新生成 47 字符密钥；" +
+                "若你已修补过镜像，请重新修补并刷入（旧镜像内嵌的是旧密钥）",
+        )
+        return fresh
     }
 
     @Synchronized
     fun saveRootKey(raw: String) {
-        // 49+ 直接硬失败；48 字符旧值 warning 后取前 47（与 apd-dev 的 key_material 策略一致）
         val key = kernelKeyOf(raw)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, secretKey(createIfMissing = true))
@@ -150,6 +179,7 @@ class SecretStore private constructor(private val context: Context) {
             .putString(KEY_CIPHERTEXT, Base64.encodeToString(encrypted, Base64.NO_WRAP))
             .putString(KEY_IV, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
             .apply()
+        cachedRootKey = key
     }
 
     @Synchronized
@@ -162,6 +192,12 @@ class SecretStore private constructor(private val context: Context) {
 
     fun clear() {
         prefs.edit().clear().apply()
+        cachedRootKey = null
+    }
+
+    private fun clearCiphertext() {
+        prefs.edit().remove(KEY_CIPHERTEXT).remove(KEY_IV).apply()
+        cachedRootKey = null
     }
 
     /** 导出为可分享的明文文件（用户显式操作时才调用；UI 默认脱敏展示） */

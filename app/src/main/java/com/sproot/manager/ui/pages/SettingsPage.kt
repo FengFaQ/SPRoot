@@ -105,7 +105,8 @@ fun SettingsPager(
 ) {
     val context = LocalContext.current
     val store = remember { SecretStore.get(context) }
-    var key by remember { mutableStateOf(runCatching { store.readRootKey() }.getOrNull()) }
+    // 密钥读取会碰 Keystore（首次可能慢）→ 绝不在主线程做
+    var key by remember { mutableStateOf<String?>(null) }
     var showKey by remember { mutableStateOf(false) }
     var showRotateConfirm by remember { mutableStateOf(false) }
     var showDeleteBackup by remember { mutableStateOf<BackupStore.Backup?>(null) }
@@ -133,6 +134,11 @@ fun SettingsPager(
 
     LaunchedEffect(isCurrentPage) {
         if (!isCurrentPage) return@LaunchedEffect
+        if (key == null) {
+            Thread {
+                key = runCatching { store.getOrCreateRootKey() }.getOrNull()
+            }.start()
+        }
         if (backups.isEmpty()) reloadBackups()
         // AP 状态/版本探测会起进程（apd version），必须离开主线程
         Thread {
@@ -144,7 +150,7 @@ fun SettingsPager(
     ConfirmDialog(
         show = showRotateConfirm,
         title = "重新生成 Root 密钥",
-        message = "旧密钥修补并已刷入的内核将无法提权，必须重新「修补 → 刷入」。确定继续？",
+        message = "重新生成后，已修补的镜像内嵌的是旧密钥，必须重新修补并刷入，否则提权会失败。确定继续？",
         confirmText = "重新生成",
         onConfirm = {
             showRotateConfirm = false
@@ -470,9 +476,9 @@ private fun RootKeyCard(
                 color = if (key == null) colorScheme.error else colorScheme.onSurface,
                 modifier = Modifier.fillMaxWidth(),
             )
-            if (SecretStore.legacy48Detected) {
+            if (SecretStore.migratedFromLegacy) {
                 Text(
-                    text = "检测到历史 48 字符密钥，已取前 47 位使用；建议重新生成密钥并重新修补/刷入镜像",
+                    text = "检测到旧格式密钥，已重新生成（47 字符）；若你已修补过镜像，请重新修补并刷入",
                     fontSize = 12.sp,
                     color = colorScheme.error,
                 )

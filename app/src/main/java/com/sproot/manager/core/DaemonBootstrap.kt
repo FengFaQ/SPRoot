@@ -77,8 +77,17 @@ object DaemonBootstrap {
      *
      * @param source 触发来源（cold_start / boot_completed / manual），仅用于日志
      */
+    /** 探测/拉起用的 root-exec 超时（只是问一句"daemon 在跑吗"，绝不等 60s） */
+    private const val PROBE_TIMEOUT_SEC = 5
+
     @Synchronized
     fun ensure(context: Context, source: String): Result {
+        // 人类真机反馈：冷启动路径绝不能有同步 root-exec（慢设备会 ANR/被杀 → "首次打开闪退"）。
+        // 调用方已在后台线程；这里再兜一层，误用直接返回失败而不是阻塞主线程。
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            AppLog.error(TAG, "内部错误：DaemonBootstrap.ensure 不允许在主线程执行（已跳过，不阻塞 UI）")
+            return Result(State.FAILED, "自引导被跳过：不允许在主线程执行", "main_thread_guard", System.currentTimeMillis())
+        }
         val now = System.currentTimeMillis()
         val cached = load(context)
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -89,7 +98,8 @@ object DaemonBootstrap {
         }
 
         // ① 探测：apd selftest 的 stage 权威判定（daemon_ready = 在跑）
-        val probe = runCatching { ApdSelfTest.run(context) }.getOrElse { error ->
+        // 首次探测：5s 超时（仅探测 daemon 是否在跑；真正执行用户命令时才用长超时）
+        val probe = runCatching { ApdSelfTest.run(context, timeoutSec = PROBE_TIMEOUT_SEC) }.getOrElse { error ->
             return save(
                 context,
                 Result(
@@ -145,7 +155,7 @@ object DaemonBootstrap {
             // 轮询确认（最多 ~2.4s；daemon 首次启动要做 auth store/事件阶段）
             repeat(6) { index ->
                 Thread.sleep(400)
-                val p = runCatching { ApdSelfTest.run(context) }.getOrNull() ?: return@repeat
+                val p = runCatching { ApdSelfTest.run(context, timeoutSec = PROBE_TIMEOUT_SEC) }.getOrNull() ?: return@repeat
                 lastProbe = p
                 if (p.stage == "daemon_ready") {
                     return save(context, Result(State.STARTED, "已自引导启动 AP 守护（pid 见自检）", p.stage, System.currentTimeMillis()))
