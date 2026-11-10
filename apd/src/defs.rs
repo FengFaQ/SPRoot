@@ -79,6 +79,40 @@ pub const AVB_BOOT_CANDIDATES: [&str; 4] = [
     "/dev/block/by-name/boot_a",
     "/dev/block/bootdevice/by-name/boot_a",
 ];
+/// Directories scanned (one level deep, bounded) for a `boot`/`boot_a` entry
+/// when none of [`AVB_BOOT_CANDIDATES`] opens (2026-11-11 P0-4).
+///
+/// Why a scan on top of a fixed list (and why it is not a wildcard): the
+/// `by-name` directories live at SoC-specific paths (`/dev/block/platform/<soc>/
+/// by-name`, sometimes `<soc>/<bus>/by-name`, occasionally
+/// `/dev/block/mapper`-only under dynamic partitions), so any fixed list is a
+/// guess that fails silently on an unlisted vendor. The scan is deliberately
+/// **not** recursive — Android's real layouts are at most
+/// `/dev/block/platform/<soc>/by-name`, and a recursive walk into `/dev/block`
+/// would be unbounded in theory and expensive on devices with many dm devices.
+/// Each root is read one level deep, entries are capped (see
+/// [`AVB_SCAN_MAX_ENTRIES`]), and every failure is recorded rather than
+/// propagated, because a scan that cannot run must degrade to "did not find it",
+/// never to a panic.
+pub const AVB_SCAN_ROOTS: [&str; 2] = ["/dev/block/by-name", "/dev/block/platform"];
+
+/// Alias names to look for inside a discovered `by-name` directory, in priority
+/// order. `boot` first: on A/B devices both links usually exist and `boot` is
+/// the slot-suffixed one the user actually flashes. `boot_a` is the fallback for
+/// layouts that only publish the slot links.
+pub const AVB_SCAN_ALIASES: [&str; 2] = ["boot", "boot_a"];
+
+/// Cap on directory entries examined per scanned directory. A real `by-name`
+/// holds ~30 partitions; the cap only matters on malformed/mocked layouts, and
+/// it exists so a pathological `/dev/block` can never turn the probe into a
+/// long scan (the probe runs inside `deploy` and `selftest`).
+pub const AVB_SCAN_MAX_ENTRIES: usize = 256;
+
+/// Cap on how many `.../by-name` directories are visited while descending one
+/// level under each of [`AVB_SCAN_ROOTS`]. Guards against a mocked/sparse
+/// `/dev/block/platform` with tens of thousands of entries.
+pub const AVB_SCAN_MAX_DIRS: usize = 32;
+
 /// Diagnostic/test override: point the AVB auditor at a regular file (an
 /// unpacked `boot.img` or a copy of the partition). Written by nobody in
 /// production; when it is in effect the check detail says so, so an overridden

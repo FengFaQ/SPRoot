@@ -95,6 +95,28 @@ class SecretStore private constructor(private val context: Context) {
         /** 引擎 `--key` 入参：47 字符补到 48（末位填充位被引擎丢弃） */
         fun engineKeyOf(raw: String): String =
             kernelKeyOf(raw).padEnd(ENGINE_KEY_LENGTH, ENGINE_PAD)
+
+        /**
+         * 把**引擎侧可能返回的**密钥归一到内核 ABI 的 47 字符。
+         *
+         * 为什么需要它（2026-11-11 真机事故）：引擎 `report.root_key` 回传的是
+         * **调引擎时传入的 48 字符**（47 字符 + 1 位填充）。客户端拿到它再交给
+         * [kernelKeyOf] 会因长度 48 触发 `require(isValidKey)` 抛异常 —— 表现为
+         * 「产物已成功导出，但状态机置 ERROR」的假失败。
+         *
+         * 归一规则（与引擎 `embed_key_bytes()` 逐字节口径一致：内核只存前 47 位）：
+         * - 48 字符且前 47 位合法 → 取前 47（第 48 位是填充位，本就该丢）
+         * - 47 字符合法 → 原样返回
+         * - 其它 → 交给 [kernelKeyOf] 报错（不做静默猜测）
+         */
+        fun normalizeEngineKey(raw: String): String {
+            val trimmed = raw.trim()
+            if (trimmed.length == ENGINE_KEY_LENGTH) {
+                val head47 = trimmed.substring(0, ENGINE_KEY_LENGTH - 1)
+                if (isValidKey(head47)) return head47
+            }
+            return kernelKeyOf(trimmed)
+        }
     }
 
     private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)

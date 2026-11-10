@@ -272,6 +272,109 @@ pub fn handle_updated_modules() -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Module-script PATH (P0, 2026-11-11).
+//
+// The bug: module scripts only got `BINARY_DIR` (`/data/adb/ap/bin`) appended to
+// PATH, but the apd binary lives at `/data/adb/apd` (DAEMON_PATH) — one level
+// up, *not* in `bin/`. So NeoZygisk's `Command::new("apd")` from a module script
+// could not resolve, it fell back to `RootImpl::None`, and the whole Zygisk
+// chain failed **silently** (the failure is a `debug!` line, invisible on a real
+// device). Three things are needed and all three are asserted below:
+//   1. deploy creates `/data/adb/ap/bin/apd` → DAEMON_PATH (the symlink);
+//   2. PATH carries both BINARY_DIR and ADB_DIR;
+//   3. the selftest reports `apd_in_path` from a *measured* lookup.
+// ---------------------------------------------------------------------------
+
+/// File name under [`defs::BINARY_DIR`] that module scripts resolve as `apd`.
+pub const APD_IN_PATH_NAME: &str = "apd";
+
+/// Full path of the symlink created by deploy: `/data/adb/ap/bin/apd`.
+pub fn apd_in_path_symlink() -> String {
+    format!("{}{}", defs::BINARY_DIR, APD_IN_PATH_NAME)
+}
+
+/// The PATH string handed to every module script — **single source of truth**.
+///
+/// Order: the inherited PATH first (unchanged existing behaviour, so a module's
+/// own tools keep priority), then `BINARY_DIR`, then `ADB_DIR`. `BINARY_DIR`
+/// supplies the multicall symlinks (`resetprop`, `magiskpolicy`, `apd`);
+/// `ADB_DIR` supplies `apd` itself, so resolution survives even if the symlink
+/// is missing or a third-party tool clears `bin/`.
+pub fn module_script_path(inherited_path: &str) -> String {
+    format!(
+        "{}:{}:{}",
+        inherited_path,
+        defs::BINARY_DIR.trim_end_matches('/'),
+        defs::ADB_DIR.trim_end_matches('/'),
+    )
+}
+
+/// Outcome of asking "can a module script resolve `apd`?".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApdPathVerdict {
+    /// `apd` resolves, and it resolves to the daemon binary itself.
+    Resolved,
+    /// There is no `apd` on any PATH entry.
+    NotFound,
+    /// `apd` was found but points somewhere other than [`defs::DAEMON_PATH`]
+    /// (stale link, foreign tool, a plain file left by an old install).
+    WrongTarget(String),
+    /// A PATH entry we require is missing from the string entirely.
+    MissingEntry(&'static str),
+}
+
+impl ApdPathVerdict {
+    pub fn is_ok(&self) -> bool {
+        matches!(self, ApdPathVerdict::Resolved)
+    }
+}
+
+/// Pure resolution of `apd` against a PATH string.
+///
+/// `lookup(entry)` returns the path `entry/apd` resolves to (canonicalised), or
+/// `None` when there is nothing there. Pure so the negative samples need no root
+/// and no device: the tests supply a fake filesystem.
+///
+/// The two required entries are checked *structurally* first, because a PATH
+/// that happens to resolve today but no longer carries the documented entries is
+/// a contract drift the check must catch, not paper over.
+pub fn apd_path_verdict<L>(path_env: &str, lookup: L) -> ApdPathVerdict
+where
+    L: Fn(&str) -> Option<std::path::PathBuf>,
+{
+    let entries: Vec<&str> = path_env
+        .split(':')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .collect();
+
+    let want_bin = defs::BINARY_DIR.trim_end_matches('/');
+    let want_adb = defs::ADB_DIR.trim_end_matches('/');
+    if !entries.contains(&want_bin) {
+        return ApdPathVerdict::MissingEntry(want_bin);
+    }
+    if !entries.contains(&want_adb) {
+        return ApdPathVerdict::MissingEntry(want_adb);
+    }
+
+    let expected = defs::DAEMON_PATH;
+    let mut first_found: Option<String> = None;
+    for entry in entries {
+        if let Some(found) = lookup(entry) {
+            let found_str = found.display().to_string();
+            if found_str == expected {
+                return ApdPathVerdict::Resolved;
+            }
+            first_found.get_or_insert(found_str);
+        }
+    }
+    match first_found {
+        Some(other) => ApdPathVerdict::WrongTarget(other),
+        None => ApdPathVerdict::NotFound,
+    }
+}
+
 /// Get common environment variables for script execution
 pub fn get_common_script_envs(module_id: Option<&str>) -> Vec<(&'static str, String)> {
     let mut envs = vec![
@@ -281,11 +384,7 @@ pub fn get_common_script_envs(module_id: Option<&str>) -> Vec<(&'static str, Str
         ("APATCH_VER_CODE", defs::VERSION_CODE.to_string()),
         (
             "PATH",
-            format!(
-                "{}:{}",
-                env_var("PATH").unwrap_or_default(),
-                defs::BINARY_DIR.trim_end_matches('/')
-            ),
+            module_script_path(&env_var("PATH").unwrap_or_default()),
         ),
     ];
 
@@ -1626,5 +1725,162 @@ mod tests {
         assert_eq!(merged["ok"], true, "audit must never flip the operation: {merged}");
         assert_eq!(merged["avb_status"], "unobservable");
         assert_eq!(merged["avb_untouched"], false);
+    }
+
+    // -----------------------------------------------------------------------
+    // Module-script PATH / `apd` resolution (P0, 2026-11-11).
+    //
+    // The production failure was silent: NeoZygisk runs `Command::new("apd")`
+    // in a module script, PATH lacked `/data/adb`, so exec failed with ENOENT
+    // and the Zygisk chain degraded to RootImpl::None without a visible error.
+    // The resolution logic is a pure function, so every branch below is a
+    // deterministic unit test with no root and no device.
+    // -----------------------------------------------------------------------
+
+    /// A fake filesystem: maps PATH entry -> what `entry/apd` "resolves" to.
+    fn fake_lookup(
+        entries: Vec<(&'static str, Option<&'static str>)>,
+    ) -> impl Fn(&str) -> Option<PathBuf> {
+        move |entry: &str| {
+            entries
+                .iter()
+                .find(|(dir, _)| *dir == entry)
+                .and_then(|(_, target)| target.map(PathBuf::from))
+        }
+    }
+
+    #[test]
+    fn module_script_path_contains_both_binary_dir_and_adb_dir() {
+        let path = module_script_path("/usr/bin:/bin");
+        let entries: Vec<&str> = path.split(':').collect();
+        assert!(entries.contains(&"/usr/bin"), "{path}");
+        assert!(entries.contains(&"/bin"), "{path}");
+        assert!(entries.contains(&"/data/adb/ap/bin"), "{path}");
+        // The whole point of the fix: `/data/adb` (where DAEMON_PATH lives).
+        assert!(entries.contains(&"/data/adb"), "{path}");
+        // Trailing slashes from the const_format constants must not leak through.
+        assert!(!path.contains("/data/adb/:"), "{path}");
+        assert!(!path.ends_with('/'), "{path}");
+    }
+
+    #[test]
+    fn apd_path_symlink_names_the_documented_location() {
+        // deploy, undeploy and the selftest all go through this one function, so
+        // a typo here cannot make deploy and undeploy disagree.
+        assert_eq!(apd_in_path_symlink(), "/data/adb/ap/bin/apd");
+        assert_eq!(APD_IN_PATH_NAME, "apd");
+    }
+
+    /// Positive sample: a correct install resolves to the daemon binary.
+    #[test]
+    fn apd_path_resolves_on_a_correct_install() {
+        let path = module_script_path("/usr/bin:/bin");
+        let lookup = fake_lookup(vec![
+            ("/data/adb/ap/bin", Some("/data/adb/apd")),
+            ("/data/adb", Some("/data/adb/apd")),
+        ]);
+        let verdict = apd_path_verdict(&path, lookup);
+        assert!(verdict.is_ok(), "verdict={verdict:?}");
+        assert_eq!(verdict, ApdPathVerdict::Resolved);
+    }
+
+    /// **Negative sample #1 — the exact production bug.**
+    /// PATH carries only BINARY_DIR (the pre-fix string). Even when the symlink
+    /// would resolve, the missing `/data/adb` entry is reported, because that is
+    /// the contract drift that made the failure silent in the first place.
+    #[test]
+    fn apd_path_fails_when_adb_dir_missing_from_path() {
+        // Reproduce the old `format!("{}:{}", inherited, BINARY_DIR)` shape.
+        let pre_fix_path = format!(
+            "{}:{}",
+            "/usr/bin:/bin",
+            defs::BINARY_DIR.trim_end_matches('/')
+        );
+        assert!(
+            !pre_fix_path.split(':').any(|e| e == "/data/adb"),
+            "pre-fix PATH must not contain /data/adb (that is the bug)"
+        );
+        let lookup = fake_lookup(vec![("/data/adb/ap/bin", Some("/data/adb/apd"))]);
+        let verdict = apd_path_verdict(&pre_fix_path, lookup);
+        assert!(!verdict.is_ok(), "the pre-fix PATH must NOT be accepted");
+        assert_eq!(verdict, ApdPathVerdict::MissingEntry("/data/adb"));
+    }
+
+    /// **Negative sample #2 — the symlink is missing.**
+    /// This is the state a real device was in before this fix: `/data/adb/apd`
+    /// exists, but nothing named `apd` is reachable through PATH. Must be
+    /// `NotFound`, never `Resolved`.
+    #[test]
+    fn apd_path_fails_when_symlink_is_absent() {
+        let path = module_script_path("/usr/bin:/bin");
+        // `/data/adb/apd` exists in this fake, but lookups never find it: the
+        // lookup only searches `entry/apd`, exactly like execvp.
+        let lookup = fake_lookup(vec![
+            ("/data/adb/ap/bin", None),
+            ("/data/adb", None),
+        ]);
+        let verdict = apd_path_verdict(&path, lookup);
+        assert!(!verdict.is_ok(), "verdict={verdict:?}");
+        assert_eq!(verdict, ApdPathVerdict::NotFound);
+    }
+
+    /// **Negative sample #3 — a stale link to the wrong binary.**
+    /// `apd` resolves, but to something that is not the daemon: running it would
+    /// do the wrong thing (silently), so this must fail rather than pass.
+    #[test]
+    fn apd_path_fails_when_it_resolves_elsewhere() {
+        let path = module_script_path("/usr/bin:/bin");
+        let lookup = fake_lookup(vec![
+            ("/data/adb/ap/bin", Some("/data/local/tmp/fake-apd")),
+            ("/data/adb", None),
+        ]);
+        let verdict = apd_path_verdict(&path, lookup);
+        assert!(!verdict.is_ok(), "verdict={verdict:?}");
+        assert_eq!(
+            verdict,
+            ApdPathVerdict::WrongTarget("/data/local/tmp/fake-apd".to_string())
+        );
+    }
+
+    /// A PATH that lost BINARY_DIR is also contract drift (the multicall tools
+    /// `resetprop`/`magiskpolicy` live there too).
+    #[test]
+    fn apd_path_fails_when_binary_dir_missing_from_path() {
+        let path = "/usr/bin:/bin:/data/adb";
+        let lookup = fake_lookup(vec![("/data/adb", Some("/data/adb/apd"))]);
+        let verdict = apd_path_verdict(path, lookup);
+        assert!(!verdict.is_ok(), "verdict={verdict:?}");
+        assert_eq!(verdict, ApdPathVerdict::MissingEntry("/data/adb/ap/bin"));
+    }
+
+    /// Empty PATH entries (`::`, trailing `:`) must not be treated as "cwd" and
+    /// must not make the required-entry test pass by accident.
+    #[test]
+    fn apd_path_ignores_empty_path_entries() {
+        let path = "::/usr/bin::";
+        let lookup = fake_lookup(vec![]);
+        let verdict = apd_path_verdict(path, lookup);
+        assert_eq!(verdict, ApdPathVerdict::MissingEntry("/data/adb/ap/bin"));
+    }
+
+    /// The PATH handed to scripts is the one the verdict function validates —
+    /// a test that pins the two together, so they cannot drift apart.
+    #[test]
+    fn script_env_path_is_the_one_validated_by_the_verdict() {
+        let envs = get_common_script_envs(Some("mymod"));
+        let path = envs
+            .iter()
+            .find(|(k, _)| *k == "PATH")
+            .map(|(_, v)| v.as_str())
+            .expect("PATH must be exported to module scripts");
+        let entries: Vec<&str> = path.split(':').collect();
+        assert!(entries.contains(&"/data/adb"), "{path}");
+        assert!(entries.contains(&"/data/adb/ap/bin"), "{path}");
+        assert_eq!(entries.contains(&"mymod"), false);
+        // AP_MODULE still rides along for the scripts.
+        assert!(
+            envs.iter().any(|(k, v)| *k == "AP_MODULE" && v == "mymod"),
+            "{envs:?}"
+        );
     }
 }

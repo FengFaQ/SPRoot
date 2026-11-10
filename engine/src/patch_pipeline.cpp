@@ -210,3 +210,14 @@ bool hook_branch_ge_6_1(const std::vector<char>& file_buf) {
 bool hook_has_huawei_symbols(const KernelSymbolOffset& sym) {
 	return sym.hkip_check_uid_root != 0 || sym.hkip_check_gid_root != 0 || sym.hkip_check_xid_root != 0;
 }
+
+// 实际命中的 huawei 符号名（顺序固定 uid→gid→xid，供 report 的
+// hook_groups_expected_breakdown.huawei_symbols_detected 逐条对账）。
+// 返回空数组 == 一个都没命中 == 该内核无此保护路径 ⇒ huawei_bypass 必须为 0。
+std::vector<std::string> hook_huawei_symbols_detected(const KernelSymbolOffset& sym) {
+	std::vector<std::string> out;
+	if (sym.hkip_check_uid_root) out.push_back("hkip_check_uid_root");
+	if (sym.hkip_check_gid_root) out.push_back("hkip_check_gid_root");
+	if (sym.hkip_check_xid_root) out.push_back("hkip_check_xid_root");
+	return out;
+}

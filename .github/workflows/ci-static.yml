@@ -85,6 +85,19 @@ jobs:
           python3 quality/static/check_builtin_assets.py
           echo "check_builtin_assets.py PASS"
 
+      - name: check_device_crash_regressions.py (真机崩溃回归门禁)
+        run: |
+          set -e
+          # THREAD-1 Toast 跨线程 / KEYABI-1 引擎密钥 48→47 契约错配。
+          # 两者都是编译器与既有静态检查抓不到、只在真机运行期炸的缺陷：
+          #   crash-20261111-065108-576.txt / sproot-log-20261111-065108.txt
+          [ -f quality/static/check_device_crash_regressions.py ] || {
+            echo "::error::check_device_crash_regressions.py 缺失（真机崩溃回归门禁不可缺）"; exit 1; }
+          # 先验门禁自身有效（坏样本必须变红），再验产物
+          python3 quality/static/check_device_crash_regressions.py --self-test
+          python3 quality/static/check_device_crash_regressions.py
+          echo "check_device_crash_regressions.py PASS"
+
       - name: verify_patch.py --help (argparse 契约)
         run: |
           set -e

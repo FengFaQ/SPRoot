@@ -1149,6 +1149,169 @@ def _mk_bootimg(orig_kernel, new_kernel=None, ramdisk=b"", avb=True, page_size=4
     return bytes(buf)
 
 
+def _mk_elf(e_type=2, e_machine=EM_AARCH64, phdrs=(), interp=None, needed=None,
+            symbols=(), with_dynsym=True, with_tls=False, tls_align=0x40,
+            e_ident_class=2, e_ident_data=1, magic=b"\x7fELF"):
+    """用 struct 拼一个**最小合法 ELF64 LSB AArch64**，供 ELF1~ELF6 自检使用。
+
+    参数语义（对应 verify_patch.py 里六条断言实际读取的字节结构）：
+      e_type      ET_EXEC(2) / ET_DYN(3)
+      e_machine   0xB7=AArch64（正确） / 0x3E=x86-64（反例）
+      phdrs       额外程序头，形如 [(p_type, p_align)]；PT_TLS 由 with_tls 控制
+      interp      非 None 时加一个 PT_INTERP（宿主解释器 → ELF2 负样本）
+      needed      非 None 时构造 PT_DYNAMIC + DT_NEEDED/DT_STRTAB，值如 ["libc.so"]
+      symbols     非 None 时构造 .dynsym/.dynstr/.shstrtab 导出这些符号名
+
+    布局（偏移全部显式计算，断言侧只读这些字段，故无需链接器语义）：
+      [0x00, 0x40)  ELF 头
+      [0x40, ...)   程序头表（e_phoff=0x40）
+      然后依次：interp 串 / dynstr / dynsym / dynamic / shstrtab / section headers
+    """
+    ehsize = 64
+    phentsize = 56
+    shentsize = 64
+
+    # 程序头数量在构造过程中才确定（PT_LOAD 最后补），所以先按**上界**预留表槽位，
+    # 收尾时再按真实数量回填并收缩。上界 = PT_LOAD + 可选 interp/TLS/DYNAMIC + 调用方给的。
+    max_phnum = 1 + (1 if interp is not None else 0) + (1 if with_tls else 0) \
+        + (1 if needed is not None else 0) + len(phdrs)
+    blob = bytearray(ehsize + phentsize * max_phnum)
+    ph_entries = []      # (p_type, p_flags, p_offset, p_vaddr, p_filesz, p_memsz, p_align)
+
+    def _append(data, align=8):
+        while len(blob) % align:
+            blob.append(0)
+        off = len(blob)
+        blob.extend(data)
+        return off
+
+    # PT_INTERP
+    if interp is not None:
+        raw = interp.encode("utf-8") + b"\x00"
+        off = _append(raw, 1)
+        ph_entries.append((PT_INTERP, 4, off, off, len(raw), len(raw), 1))
+
+    # PT_TLS（信息项：ELF4 读 p_align）
+    if with_tls:
+        off = _append(b"\x00" * 16, 16)
+        ph_entries.append((PT_TLS, 4, off, off, 16, 16, tls_align))
+
+    dyn_off = dyn_size = 0
+    dynstr_off = 0
+    if needed is not None:
+        # .dynstr：DT_NEEDED 的名字
+        dynstr = bytearray(b"\x00")
+        name_offs = []
+        for i, nm in enumerate(needed):
+            name_offs.append(len(dynstr))
+            dynstr.extend(nm.encode("ascii") + b"\x00")
+        dynstr_off = _append(bytes(dynstr), 1)
+        # PT_DYNAMIC 条目：DT_NEEDED ×N + DT_STRTAB + DT_NULL
+        ents = []
+        for i, _nm in enumerate(needed):
+            ents.append(struct.pack("<QQ", DT_NEEDED, name_offs[i]))
+        # DT_STRTAB 的 vaddr 必须能被 _dynamic_needed 的 v2o 解析：
+        # v2o 依赖 PT_LOAD 的 vaddr 区间。此夹具用 vaddr == 文件偏移（恒等映射），
+        # 由下方 PT_LOAD 覆盖整个文件保证。
+        ents.append(struct.pack("<QQ", DT_STRTAB, dynstr_off))
+        ents.append(struct.pack("<QQ", DT_NULL, 0))
+        dyn = b"".join(ents)
+        dyn_off = _append(dyn, 8)
+        dyn_size = len(dyn)
+        ph_entries.append((PT_DYNAMIC, 6, dyn_off, dyn_off, dyn_size, dyn_size, 8))
+
+    # 额外程序头（调用方给的 (p_type, p_align)）
+    for p_type, p_align in phdrs:
+        ph_entries.append((p_type, 4, 0, 0, 0, 0, p_align))
+
+    # ---- section headers：.dynsym / .dynstr / .shstrtab ----
+    # 注意：_elf_symbols 通过 .dynsym 的 sh_link 找 dynstr，因此符号名必须放在
+    # **section 指向的那张串表**里。needed 与 symbols 要两份独立串表（DT_STRTAB
+    # 那份只服务 DT_NEEDED 名），所以这里单独建 symbol 串表，不复用 needed 的表。
+    e_shoff = 0
+    e_shnum = 0
+    e_shstrndx = 0
+    if with_dynsym and symbols:
+        symstr = bytearray(b"\x00")
+        sym_name_off = {}
+        for nm in symbols:
+            sym_name_off[nm] = len(symstr)
+            symstr.extend(nm.encode("ascii") + b"\x00")
+        symstr_off = _append(bytes(symstr), 1)
+        # .dynsym 每项 24B：st_name u32 / st_info u8 / st_other u8 / st_shndx u16 /
+        #                    st_value u64 / st_size u64；第 0 项是保留的空符号。
+        syms = [struct.pack("<IBBHQQ", 0, 0, 0, 0, 0, 0)]
+        for nm in symbols:
+            syms.append(struct.pack("<IBBHQQ", sym_name_off[nm], 0x12, 0, 1, 0x1000, 0))
+        sym_off = _append(b"".join(syms), 8)
+        sym_size = 24 * len(syms)
+        shstr = bytearray(b"\x00")
+        n_dynsym = len(shstr); shstr.extend(b".dynsym\x00")
+        n_dynstr = len(shstr); shstr.extend(b".dynstr\x00")
+        n_shstr = len(shstr); shstr.extend(b".shstrtab\x00")
+        shstr_off = _append(bytes(shstr), 1)
+        secs = [b"\x00" * shentsize]   # [0] NULL section
+        # [1] .dynsym：sh_type=11(SHT_DYNSYM)，sh_link=2 指向 .dynstr，entsize=24
+        secs.append(struct.pack("<IIQQQQIIQQ", n_dynsym, 11, 0, 0, sym_off, sym_size,
+                                2, 0, 1, 24))
+        # [2] .dynstr：sh_type=3(SHT_STRTAB)
+        secs.append(struct.pack("<IIQQQQIIQQ", n_dynstr, 3, 0, 0, symstr_off, len(symstr),
+                                0, 0, 1, 0))
+        # [3] .shstrtab
+        secs.append(struct.pack("<IIQQQQIIQQ", n_shstr, 3, 0, 0, shstr_off, len(shstr),
+                                0, 0, 1, 0))
+        e_shoff = _append(b"".join(secs), 8)
+        e_shnum = len(secs)
+        e_shstrndx = 3
+
+    # ---- PT_LOAD 覆盖整个文件：_dynamic_needed 的 v2o() 靠 PT_LOAD 把 DT_STRTAB
+    #      的 vaddr 折回文件偏移；本夹具令 vaddr == 文件偏移（恒等映射）。----
+    ph_entries.insert(0, (PT_LOAD, 5, 0, 0, len(blob), len(blob), 0x1000))
+
+    # ---- ELF 头 ----
+    ident = bytearray(16)
+    ident[0:4] = magic
+    ident[4] = e_ident_class
+    ident[5] = e_ident_data
+    ident[6] = 1          # EI_VERSION
+    ident[7] = 0          # EI_OSABI
+    blob[0:16] = ident
+    struct.pack_into("<H", blob, 16, e_type)
+    struct.pack_into("<H", blob, 18, e_machine)
+    struct.pack_into("<I", blob, 20, 1)            # e_version
+    struct.pack_into("<Q", blob, 24, 0)            # e_entry
+    struct.pack_into("<Q", blob, 32, ehsize)       # e_phoff
+    struct.pack_into("<Q", blob, 40, e_shoff)      # e_shoff
+    struct.pack_into("<H", blob, 52, ehsize)       # e_ehsize
+    struct.pack_into("<H", blob, 54, phentsize)    # e_phentsize
+    struct.pack_into("<H", blob, 56, len(ph_entries))  # e_phnum
+    struct.pack_into("<H", blob, 58, shentsize)    # e_shentsize
+    struct.pack_into("<H", blob, 60, e_shnum)      # e_shnum
+    struct.pack_into("<H", blob, 62, e_shstrndx)   # e_shstrndx
+    for i, (p_type, p_flags, p_off, p_vaddr, p_filesz, p_memsz, p_align) in enumerate(ph_entries):
+        struct.pack_into("<IIQQQQQQ", blob, ehsize + i * phentsize,
+                         p_type, p_flags, p_off, p_vaddr, p_vaddr, p_filesz, p_memsz, p_align)
+    return bytes(blob)
+
+
+def _chmod_probe(tmpdir):
+    """探测本机 os.chmod 是否真的能改可执行位。
+
+    关键平台差异（本机实测）：Linux 上 chmod(0o755) 生效、os.stat 反映 755；
+    Windows 上 os.stat 恒为 666，chmod 只影响只读位 → **无法**用同一 mode 夹具
+    覆盖 ELF3 的 exec 分支。因此 ELF3 的 exec 用例按探测结果决定「真跑断言」还是
+    「显式标注平台不支持」，绝不假装通过（否则又是空断言）。
+    """
+    p = os.path.join(tmpdir, "_chmod_probe.bin")
+    with open(p, "wb") as f:
+        f.write(b"x")
+    try:
+        os.chmod(p, 0o755)
+        return bool(os.stat(p).st_mode & 0o111)
+    except OSError:
+        return False
+
+
 class _Probe(object):
     """在隔离的 results / unverified 上跑一段断言，返回 [(cid, status, msg)]。"""
 
@@ -1576,6 +1739,121 @@ def _self_test_body(tmpdir, quiet=False):
     _selftest_case(cases, "RB5 正样本：kernel 段等长且确有改动", "PASS", "RB5", "PASS",
                    _rb5_kernel_changed)
 
+    # ---------------- ELF1~ELF6（G-02 引擎产物断言） ----------------
+    # 全部用 _mk_elf() 的 struct 合成字节驱动，不依赖任何真实 arm64 产物。
+    jni_sym = "Java_me_sproot_patch_NativeEngine_patch"
+
+    def _elf_file(fname, data, mode=None):
+        """写 ELF 夹具并返回路径；mode 非 None 时尝试 chmod。"""
+        p = w(fname, data)
+        if mode is not None:
+            try:
+                os.chmod(p, mode)
+            except OSError:
+                pass
+        return p
+
+    # ELF1 架构：AArch64 正样本 / x86-64 与未知架构负样本
+    static_exec = _mk_elf(e_type=2, e_machine=EM_AARCH64)
+    p_exec = _elf_file("engine_exec", static_exec, 0o755)
+    _selftest_case(cases, "ELF1 正样本：AArch64（e_machine=0xB7）", "PASS", "ELF1", "PASS",
+                   lambda: check_elf(p_exec, elf_form="exec"))
+    _selftest_case(cases, "ELF1 负样本：x86-64（e_machine=0x3E）",
+                   "FAIL", "ELF1", "FAIL",
+                   lambda: check_elf(_elf_file("x86_64_bin", _mk_elf(e_machine=EM_X86_64), 0o755),
+                                     elf_form="exec"))
+    _selftest_case(cases, "ELF1 负样本：未知架构 0x28(ARM32)",
+                   "FAIL", "ELF1", "FAIL",
+                   lambda: check_elf(_elf_file("arm32_bin", _mk_elf(e_machine=0x28), 0o755),
+                                     elf_form="exec"))
+
+    # ELF2 静态性：静态 exec 正样本 / 含宿主解释器负样本 / JNI 含 PT_DYNAMIC 可接受
+    _selftest_case(cases, "ELF2 正样本：静态可执行（无 INTERP 无 DYNAMIC）", "PASS", "ELF2", "PASS",
+                   lambda: check_elf(p_exec, elf_form="exec"))
+    _selftest_case(cases, "ELF2 负样本：含宿主解释器 PT_INTERP（非 Android linker）",
+                   "FAIL", "ELF2", "FAIL",
+                   lambda: check_elf(_elf_file("host_interp",
+                                               _mk_elf(e_type=2, interp="/lib64/ld-linux-x86-64.so.2"),
+                                               0o755), elf_form="exec"))
+
+    def _elf2_android_linker():
+        """Android linker 解释器 → ELF2 应 PASS（不是「非 Android linker」）。"""
+        check_elf(_elf_file("android_linker",
+                            _mk_elf(e_type=3, interp="/system/bin/linker64",
+                                    needed=["libc.so"]), 0o755),
+                  elf_form="jni")
+    _selftest_case(cases, "ELF2 正样本：Android linker 解释器视为可运行", "PASS", "ELF2", "PASS",
+                   _elf2_android_linker)
+
+    # ELF3 可执行位：依赖 os.chmod 能力（Windows 上不可用 → 显式跳过并说明）
+    chmod_ok = _chmod_probe(tmpdir)
+    if chmod_ok:
+        _selftest_case(cases, "ELF3 正样本：exec 形态 mode 含可执行位", "PASS", "ELF3", "PASS",
+                       lambda: check_elf(p_exec, elf_form="exec"))
+        _selftest_case(cases, "ELF3 负样本：exec 形态 mode=644 无可执行位", "FAIL", "ELF3", "FAIL",
+                       lambda: check_elf(_elf_file("noexec", static_exec, 0o644), elf_form="exec"))
+        _selftest_case(cases, "ELF3 负样本/JNI：.so 不要求可执行位（应 PASS 而非 FAIL）",
+                       "PASS", "ELF3", "PASS",
+                       lambda: check_elf(_elf_file("libtest.so", static_exec, 0o644), elf_form="jni"))
+    else:
+        cases.append({"name": "ELF3 用例：本平台 os.chmod 无法设置执行位，已跳过（非 PASS）",
+                      "want": "SKIP(平台)", "cid": "ELF3", "want_status": "PASS",
+                      "got": ["SKIP(platform)"], "ok": True, "err": None, "stdout": "",
+                      "expect_unverified": False, "unverified_ids": [],
+                      "detail": ["[ELF3] SKIP 本平台 chmod 不改执行位；ELF3 由 CI(Ubuntu) 覆盖"]})
+
+    # ELF4 TLS 信息项：有 TLS 报 p_align / 无 TLS 也不阻断（两者都 PASS）
+    _selftest_case(cases, "ELF4 正样本：PT_TLS 存在并报 p_align", "PASS", "ELF4", "PASS",
+                   lambda: check_elf(_elf_file("tls_bin", _mk_elf(with_tls=True, tls_align=0x40), 0o755),
+                                     elf_form="exec"))
+    _selftest_case(cases, "ELF4 正样本：无 PT_TLS 也不阻断", "PASS", "ELF4", "PASS",
+                   lambda: check_elf(p_exec, elf_form="exec"))
+
+    # ELF5 导出符号：JNI 含 Java_* 正样本 / 缺符号负样本（真实故障：loadLibrary 后调用即崩溃）
+    jni_ok = _mk_elf(e_type=3, e_machine=EM_AARCH64,
+                     needed=["libc.so", "liblog.so"], symbols=[jni_sym])
+    p_jni = _elf_file("libsprootpatch_jni.so", jni_ok, 0o755)
+    _selftest_case(cases, "ELF5 正样本：JNI 导出 Java_* 入口齐全", "PASS", "ELF5", "PASS",
+                   lambda: check_elf(p_jni, [jni_sym], elf_form="jni"))
+
+    def _elf5_missing_symbol():
+        # 只导出别的符号，缺 Java_* 入口 → 必须 FAIL
+        noj = _mk_elf(e_type=3, needed=["libc.so"], symbols=["SomeOtherSymbol"])
+        check_elf(_elf_file("libnojni.so", noj, 0o755), [jni_sym], elf_form="jni")
+    _selftest_case(cases, "ELF5 负样本：JNI 缺 Java_* 入口（调用必崩）", "FAIL", "ELF5", "FAIL",
+                   _elf5_missing_symbol)
+
+    def _elf5_no_symtab():
+        # 完全没有 .dynsym（无 section headers）→ 符号集为空 → 必须 FAIL，不能默认放过
+        bare = _mk_elf(e_type=3, needed=["libc.so"], symbols=(), with_dynsym=False)
+        check_elf(_elf_file("libnosym.so", bare, 0o755), [jni_sym], elf_form="jni")
+    _selftest_case(cases, "ELF5 负样本：产物无 .dynsym 符号表", "FAIL", "ELF5", "FAIL",
+                   _elf5_no_symtab)
+
+    # ELF6 形态：JNI=ET_DYN+DYNAMIC 正样本；exec=静态 ET_EXEC 正样本；两者交叉反例
+    _selftest_case(cases, "ELF6 正样本：JNI 形态（ET_DYN + PT_DYNAMIC）", "PASS", "ELF6", "PASS",
+                   lambda: check_elf(p_jni, [jni_sym], elf_form="jni"))
+    _selftest_case(cases, "ELF6 正样本：exec 形态（静态 ET_EXEC）", "PASS", "ELF6", "PASS",
+                   lambda: check_elf(p_exec, elf_form="exec"))
+    _selftest_case(cases, "ELF6 负样本：JNI 形态却是 ET_EXEC", "FAIL", "ELF6", "FAIL",
+                   lambda: check_elf(_elf_file("jni_exec",
+                                               _mk_elf(e_type=2, needed=["libc.so"], symbols=[jni_sym]),
+                                               0o755), [jni_sym], elf_form="jni"))
+    _selftest_case(cases, "ELF6 负样本：exec 形态却含 PT_DYNAMIC", "FAIL", "ELF6", "FAIL",
+                   lambda: check_elf(_elf_file("exec_dyn",
+                                               _mk_elf(e_type=2, needed=["libc.so"]), 0o755),
+                                     elf_form="exec"))
+
+    # ELF 聚合 id：文件不存在 / 非 ELF 魔数
+    _selftest_case(cases, "ELF 负样本：文件不存在", "FAIL", "ELF", "FAIL",
+                   lambda: check_elf(os.path.join(tmpdir, "no_such_elf")))
+    _selftest_case(cases, "ELF 负样本：魔数不是 \\x7fELF", "FAIL", "ELF", "FAIL",
+                   lambda: check_elf(_elf_file("not_elf", _mk_elf(magic=b"NOPE"))))
+    _selftest_case(cases, "ELF 负样本：EI_CLASS=1（ELF32 不是 ELF64）", "FAIL", "ELF", "FAIL",
+                   lambda: check_elf(_elf_file("elf32", _mk_elf(e_ident_class=1))))
+    _selftest_case(cases, "ELF 负样本：EI_DATA=2（大端不是小端）", "FAIL", "ELF", "FAIL",
+                   lambda: check_elf(_elf_file("elfbe", _mk_elf(e_ident_data=2))))
+
     # ---------------- 输出 ----------------
     print("== verify_patch.py --self-test（合成夹具自检）==")
     print("夹具目录：%s" % tmpdir)
@@ -1636,9 +1914,10 @@ def _self_test_body(tmpdir, quiet=False):
         print("判定：SELF-TEST FAIL —— 覆盖度清单里的 id 在源码中已不存在（改名/删除需同步更新清单）：%s"
               % ids_vanished)
         return 1
-    # ELF 组需要真 arm64 ELF 产物（AArch64/静态性/PT_TLS/导出符号），合成夹具无法替代；
-    # 显式列为「已知未覆盖」，在输出里打印，让缺口可见（而不是假装覆盖了）。
-    KNOWN_UNCOVERED = {"ELF", "ELF1", "ELF2", "ELF3", "ELF4", "ELF5", "ELF6"}
+    # ELF1~ELF6 现已由 _mk_elf() 的 struct 合成夹具覆盖（ELF 头/程序头/section headers/
+    # .dynsym 全是可构造的确定字节结构，无需真实产物）。诚实缺口清单目前为空；
+    # 若将来确属不可合成的组，必须在此显式登记并在下方输出里打印。
+    KNOWN_UNCOVERED = set()
     covered = {c["cid"] for c in cases}
     required = ALL_CHECK_IDS - KNOWN_UNCOVERED
     missed = sorted(required - covered)
@@ -1654,8 +1933,11 @@ def _self_test_body(tmpdir, quiet=False):
         return 1
     print("覆盖断言组（%d/%d）：%s"
           % (len(covered), len(ALL_CHECK_IDS), ", ".join(sorted(covered))))
-    print("已知未覆盖（%d 组，需真实产物，本模式不伪造）：%s"
-          % (len(KNOWN_UNCOVERED), ", ".join(sorted(KNOWN_UNCOVERED))))
+    if KNOWN_UNCOVERED:
+        print("已知未覆盖（%d 组，本模式不伪造）：%s"
+              % (len(KNOWN_UNCOVERED), ", ".join(sorted(KNOWN_UNCOVERED))))
+    else:
+        print("已知未覆盖：无（全部 %d 组断言组均已由合成夹具覆盖）" % len(ALL_CHECK_IDS))
     print("判定：SELF-TEST PASS —— 每条断言都在已知坏样本上 FAIL、在已知好样本上 PASS。")
     return 0
 

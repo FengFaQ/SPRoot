@@ -493,15 +493,23 @@ private fun LogExportLine() {
             .padding(vertical = 8.dp)
             .clickable {
                 Thread {
-                    runCatching {
+                    val outcome = runCatching {
                         val file = AppLog.currentLogFile() ?: error("日志文件尚未初始化")
                         val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
                             .format(java.util.Date())
                         Exporter.exportToDownloads(context, file, "sproot-log-$stamp.txt")
-                    }.onSuccess {
-                        Toast.makeText(context, "日志已导出到 Downloads/SPRoot/", Toast.LENGTH_LONG).show()
-                    }.onFailure {
-                        Toast.makeText(context, "日志导出失败：" + it.message, Toast.LENGTH_LONG).show()
+                    }
+                    // ⚠️ Toast 必须在**有 Looper 的线程**上构造。这里是后台 Thread，
+                    // 直接 makeText 会抛 NullPointerException：
+                    //   Can't toast on a thread that has not called Looper.prepare()
+                    // 2026-11-11 真机崩溃依据：crash-20261111-065108-576.txt。
+                    // 文案在后台先拼好（不跨线程持有 Throwable），再 post 到主线程显示。
+                    val message = outcome.fold(
+                        onSuccess = { "日志已导出到 Downloads/SPRoot/" },
+                        onFailure = { "日志导出失败：${it.message ?: it.javaClass.simpleName}" },
+                    )
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        Toast.makeText(context, message, Toast.LENGTH_LONG).show()
                     }
                 }.start()
             },

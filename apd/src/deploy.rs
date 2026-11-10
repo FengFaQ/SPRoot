@@ -69,6 +69,14 @@ pub struct DeployState {
     /// unobservable). Kept so a mismatch is diagnosable instead of just "FAIL".
     #[serde(default)]
     pub avb_source: Option<String>,
+    /// Every path the AVB probe tried, with the reason each was skipped
+    /// (2026-11-11 P0-4). `None` for state files written before this field
+    /// existed. Its purpose is field diagnosis: when a device reports
+    /// `avb_unobservable` this says whether the `by-name` directory was missing,
+    /// which aliases existed, and whether `open` was denied — without it the
+    /// report is a bare "unknown" that cannot be acted on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avb_probe_trace: Option<String>,
     /// Total partition size in bytes at observation time. A later change means
     /// the partition was rewritten (footer is at the *end*, so any resize moves
     /// it) — the selftest re-measures and compares.
@@ -132,6 +140,14 @@ pub fn deploy(source: Option<PathBuf>) -> Result<()> {
         Path::new(defs::DAEMON_PATH),
         &concat_path(defs::BINARY_DIR, "magiskpolicy"),
     )?;
+    // `apd` itself, so module scripts can resolve `Command::new("apd")` (P0,
+    // 2026-11-11). Deliberately folded into step 4 rather than added as step 5:
+    // it is the same operation as the two above, and inserting a step would
+    // renumber 5..10 and desynchronise every log line from the docs/CLI contract.
+    ensure_symlink(
+        Path::new(defs::DAEMON_PATH),
+        Path::new(&crate::module::apd_in_path_symlink()),
+    )?;
 
     // The key file is the start-chain's single point of failure: `?` aborts
     // deploy (non-zero exit, no "pretend success") when it cannot be written.
@@ -191,6 +207,10 @@ pub fn undeploy(keep_modules: bool) -> Result<()> {
     remove_path(&concat_path(defs::BINARY_DIR, "busybox"));
     remove_path(&concat_path(defs::BINARY_DIR, "resetprop"));
     remove_path(&concat_path(defs::BINARY_DIR, "magiskpolicy"));
+    // The apd entry added for module scripts (P0, 2026-11-11). Removed here — and
+    // under its own name, not by removing BINARY_DIR wholesale — so this list
+    // stays the single place that enumerates everything deploy created.
+    remove_path(Path::new(&crate::module::apd_in_path_symlink()));
     if !keep_modules {
         remove_path(defs::MODULE_DIR);
         remove_path(defs::MODULE_UPDATE_DIR);
@@ -831,12 +851,255 @@ fn observe_avb_impl(path: &Path, digest_vbmeta: bool) -> AvbObservation {
     }
 }
 
+/// One path the AVB probe attempted, plus what happened there (2026-11-11 P0-4).
+///
+/// This exists because "the probe returned unobservable" is not actionable on a
+/// real device: without the per-path reasons an integrator cannot tell a vendor
+/// that publishes no `by-name` directory from one where every candidate is
+/// present but SELinux denies `open`. The trace is embedded into
+/// [`AvbObservation::problem`] on failure, so it surfaces in
+/// `selftest --json` (`checks[].detail`) and in the deploy log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvbProbeAttempt {
+    /// The path as it was opened/probed (already resolved to a concrete path; a
+    /// scanned entry is recorded with the real path it came from, not the alias).
+    pub path: String,
+    /// Where the path came from: `"explicit"` (`defs::AVB_BOOT_CANDIDATES`) or
+    /// `"scan"` (discovered by the bounded `by-name` walk).
+    pub origin: &'static str,
+    /// `Some(reason)` when the path was skipped or could not be opened; `None`
+    /// when it was opened and a verdict was reached.
+    pub skip: Option<String>,
+    /// The verdict code when the path *was* observed (see
+    /// [`AvbObservation::code`]); `None` when it was skipped.
+    pub code: Option<&'static str>,
+    /// `true` for the attempt whose observation was returned as the answer.
+    pub selected: bool,
+}
+
+impl AvbProbeAttempt {
+    fn skipped(path: String, origin: &'static str, why: impl Into<String>) -> Self {
+        Self {
+            path,
+            origin,
+            skip: Some(why.into()),
+            code: None,
+            selected: false,
+        }
+    }
+}
+
+/// Everything the AVB probe tried, in order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AvbProbeTrace {
+    pub attempts: Vec<AvbProbeAttempt>,
+    /// `by-name` directories the bounded walk looked at (empty when the walk was
+    /// never needed, i.e. an explicit candidate already answered).
+    pub scanned_dirs: Vec<String>,
+    /// Why the walk itself could not run (stat/read_dir failures, entry caps
+    /// hit). Recorded, never fatal: a scan that cannot run must degrade to
+    /// "did not find it", never to a panic.
+    pub scan_notes: Vec<String>,
+}
+
+impl AvbProbeTrace {
+    /// The attempt whose observation became the answer.
+    pub fn selected(&self) -> Option<&AvbProbeAttempt> {
+        self.attempts.iter().find(|a| a.selected)
+    }
+
+    /// Compact one-line rendering (`path [origin] verdict; …`), capped so a
+    /// pathological layout cannot blow up `state.json` / the selftest detail.
+    pub fn render(&self) -> String {
+        const MAX: usize = 8;
+        if self.attempts.is_empty() && self.scanned_dirs.is_empty() {
+            return "no candidate paths were tried".to_string();
+        }
+        let mut parts: Vec<String> = Vec::with_capacity(MAX + 2);
+        for a in self.attempts.iter().take(MAX) {
+            let verdict = match (&a.skip, a.code) {
+                (Some(why), _) => format!("skipped({why})"),
+                (None, Some(code)) => code.to_string(),
+                (None, None) => "observed".to_string(),
+            };
+            parts.push(format!("{} [{}] {}", a.path, a.origin, verdict));
+        }
+        if self.attempts.len() > MAX {
+            parts.push(format!("... {} more attempt(s)", self.attempts.len() - MAX));
+        }
+        if !self.scanned_dirs.is_empty() {
+            let shown = self.scanned_dirs.iter().take(4).cloned().collect::<Vec<_>>();
+            let mut dirs = shown.join(", ");
+            if self.scanned_dirs.len() > 4 {
+                dirs.push_str(&format!(", ... {} more", self.scanned_dirs.len() - 4));
+            }
+            parts.push(format!("scanned: {dirs}"));
+        }
+        for note in self.scan_notes.iter().take(3) {
+            parts.push(format!("scan: {note}"));
+        }
+        parts.join("; ")
+    }
+}
+
+/// Probe one path and feed the trace. `Some(..)` = stop here (either a hit or a
+/// definitive verdict such as "no footer"); `None` = unreadable, try the next.
+fn probe_attempt(
+    path: &Path,
+    origin: &'static str,
+    digest_vbmeta: bool,
+    trace: &mut AvbProbeTrace,
+) -> Option<AvbObservation> {
+    let shown = path.display().to_string();
+    if !path.exists() {
+        trace
+            .attempts
+            .push(AvbProbeAttempt::skipped(shown, origin, "absent"));
+        return None;
+    }
+    let observed = if digest_vbmeta {
+        observe_avb_from_path(path)
+    } else {
+        observe_avb_footer_only_from_path(path)
+    };
+    match observed.problem.as_deref() {
+        // Opened and fully observed.
+        None => {
+            trace.attempts.push(AvbProbeAttempt {
+                path: shown,
+                origin,
+                skip: None,
+                code: Some(observed.code()),
+                selected: true,
+            });
+            Some(observed)
+        }
+        // Unreadable device (permissions/SELinux/EIO): try the next layout.
+        Some(reason) if reason.starts_with("cannot open") || reason.starts_with("cannot stat") => {
+            trace
+                .attempts
+                .push(AvbProbeAttempt::skipped(shown, origin, reason.to_string()));
+            None
+        }
+        // Device opened and a definite verdict was reached, including
+        // "no footer": that is the answer for this device.
+        Some(_) => {
+            trace.attempts.push(AvbProbeAttempt {
+                path: shown,
+                origin,
+                skip: None,
+                code: Some(observed.code()),
+                selected: true,
+            });
+            Some(observed)
+        }
+    }
+}
+
+/// Bounded discovery of `.../by-name` directories (2026-11-11 P0-4).
+///
+/// Real Android layouts put the alias directory at
+/// `/dev/block/platform/<soc>/<controller>/by-name`, i.e. up to three levels
+/// below [`defs::AVB_SCAN_ROOTS`] — a fixed candidate list cannot express that
+/// without guessing every SoC name, which is why this walk exists. It is
+/// deliberately **not** a general recursive find: the descent is capped at depth
+/// 3, at [`defs::AVB_SCAN_MAX_DIRS`] directories, and at
+/// [`defs::AVB_SCAN_MAX_ENTRIES`] entries per directory. All failures are
+/// returned as notes; nothing here panics or propagates an error.
+/// Bounded discovery of `.../by-name` directories under caller-supplied roots.
+///
+/// Roots are a parameter (rather than read from [`defs::AVB_SCAN_ROOTS`]
+/// directly) so the walk can be tested against a temporary directory tree
+/// instead of `/dev/block` (2026-11-11 P0-4).
+///
+/// Bounds: descent depth 3, [`defs::AVB_SCAN_MAX_DIRS`] directories,
+/// [`defs::AVB_SCAN_MAX_ENTRIES`] entries per directory. Failures become notes.
+pub fn discover_by_name_dirs_in(roots: &[&str]) -> (Vec<PathBuf>, Vec<String>) {
+    const MAX_DEPTH: usize = 3;
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    let mut visited = 0usize;
+
+    for root in roots {
+        let root_path = Path::new(root);
+        match fs::metadata(root_path) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => {
+                notes.push(format!("{root}: not a directory"));
+                continue;
+            }
+            Err(e) => {
+                notes.push(format!("{root}: cannot stat ({e})"));
+                continue;
+            }
+        }
+        // The root may itself already be a by-name directory.
+        if root_path.file_name().and_then(|n| n.to_str()) == Some("by-name") {
+            found.push(root_path.to_path_buf());
+            continue;
+        }
+        let mut frontier: Vec<(PathBuf, usize)> = vec![(root_path.to_path_buf(), 0)];
+        while let Some((dir, depth)) = frontier.pop() {
+            if visited >= defs::AVB_SCAN_MAX_DIRS {
+                notes.push(format!(
+                    "stopped after {} directories (cap {})",
+                    visited,
+                    defs::AVB_SCAN_MAX_DIRS
+                ));
+                break;
+            }
+            visited += 1;
+            let entries = match fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(e) => {
+                    notes.push(format!("{}: cannot read dir ({e})", dir.display()));
+                    continue;
+                }
+            };
+            for (index, entry) in entries.flatten().enumerate() {
+                if index >= defs::AVB_SCAN_MAX_ENTRIES {
+                    notes.push(format!(
+                        "{}: stopped after {} entries (cap)",
+                        dir.display(),
+                        defs::AVB_SCAN_MAX_ENTRIES
+                    ));
+                    break;
+                }
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                // `entry.file_type()` avoids following a symlink loop.
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if !is_dir {
+                    continue;
+                }
+                if name == "by-name" {
+                    found.push(entry.path());
+                } else if depth + 1 < MAX_DEPTH {
+                    frontier.push((entry.path(), depth + 1));
+                }
+            }
+        }
+    }
+    // Deterministic order so a report is reproducible between runs.
+    found.sort();
+    found.dedup();
+    (found, notes)
+}
+
 /// Observe the AVB footer of the device's boot partition.
 ///
-/// Order: `SPROOT_AVB_BOOT_IMAGE` (diagnostics/QA, logged as an override) →
-/// `defs::AVB_BOOT_CANDIDATES` (first that opens). When every candidate is
-/// unreadable the observation is `unobservable` — **not** a pass. Deploy runs as
-/// root, so a failure here is genuine (no partition / no AVB / SELinux denial).
+/// Order (2026-11-11 P0-4): `SPROOT_AVB_BOOT_IMAGE` (diagnostics/QA, logged as
+/// an override) → `defs::AVB_BOOT_CANDIDATES` (first that opens) → a bounded
+/// scan of `defs::AVB_SCAN_ROOTS` for a `by-name/{boot,boot_a}` entry. The scan
+/// is the fallback for vendor layouts the fixed list does not cover; it runs
+/// **only** when no explicit candidate was reachable, so the happy path costs
+/// nothing extra.
+///
+/// When every path fails the observation is `unobservable` — **not** a pass —
+/// and [`AvbObservation::problem`] carries the full [`AvbProbeTrace`] so the
+/// failure is self-explaining on a device we cannot attach a debugger to.
+/// Deploy runs as root, so a failure here is genuine (no partition / no AVB /
+/// SELinux denial).
 pub fn probe_avb() -> AvbObservation {
     probe_avb_impl(true)
 }
@@ -847,60 +1110,123 @@ pub fn probe_avb_footer_only() -> AvbObservation {
     probe_avb_impl(false)
 }
 
-fn probe_avb_impl(digest_vbmeta: bool) -> AvbObservation {
-    let observe = |path: &Path| {
-        if digest_vbmeta {
-            observe_avb_from_path(path)
-        } else {
-            observe_avb_footer_only_from_path(path)
-        }
-    };
+/// Probe **and** return the trace (deploy uses this to log why it picked a
+/// path; the plain [`probe_avb`] callers do not need the extra data).
+pub fn probe_avb_traced(digest_vbmeta: bool) -> (AvbObservation, AvbProbeTrace) {
+    let mut trace = AvbProbeTrace::default();
 
     if let Ok(raw) = std::env::var(defs::AVB_BOOT_OVERRIDE_ENV) {
         let path = PathBuf::from(raw);
         if !path.as_os_str().is_empty() {
-            let mut observed = observe(&path);
+            let mut observed = if digest_vbmeta {
+                observe_avb_from_path(&path)
+            } else {
+                observe_avb_footer_only_from_path(&path)
+            };
             // Make the override self-evident in every downstream report.
-            observed.source = format!("{} (override via {})", observed.source, defs::AVB_BOOT_OVERRIDE_ENV);
+            observed.source = format!(
+                "{} (override via {})",
+                observed.source,
+                defs::AVB_BOOT_OVERRIDE_ENV
+            );
+            trace.attempts.push(AvbProbeAttempt {
+                path: observed.source.clone(),
+                origin: "override",
+                skip: None,
+                code: Some(observed.code()),
+                selected: true,
+            });
             warn!(
                 "[deploy] AVB probe using {} override: {}",
                 defs::AVB_BOOT_OVERRIDE_ENV,
                 observed.source
             );
-            return observed;
+            return (observed, trace);
         }
     }
 
-    let mut problems: Vec<String> = Vec::new();
-    for candidate in defs::AVB_BOOT_CANDIDATES {
-        let path = Path::new(candidate);
-        if !path.exists() {
-            problems.push(format!("{candidate}: absent"));
-            continue;
+    probe_avb_with(
+        digest_vbmeta,
+        &defs::AVB_BOOT_CANDIDATES,
+        &defs::AVB_SCAN_ROOTS,
+    )
+}
+
+/// The device-independent core: explicit candidates first, bounded `by-name`
+/// scan second. Roots/candidates are parameters so the whole discovery strategy
+/// — including the "nothing found" path and its trace — is unit-testable against
+/// a temporary directory tree (2026-11-11 P0-4).
+pub fn probe_avb_with(
+    digest_vbmeta: bool,
+    candidates: &[&str],
+    scan_roots: &[&str],
+) -> (AvbObservation, AvbProbeTrace) {
+    let mut trace = AvbProbeTrace::default();
+
+    // Pass 1: the explicit candidates (unchanged behaviour/order).
+    for candidate in candidates {
+        if let Some(observed) = probe_attempt(Path::new(candidate), "explicit", digest_vbmeta, &mut trace)
+        {
+            return (observed, trace);
         }
-        let observed = observe(path);
-        match observed.problem.as_deref() {
-            // Unreadable device (permissions/SELinux/EIO): try the next layout.
-            None => return observed,
-            Some(reason) if reason.starts_with("cannot open") || reason.starts_with("cannot stat") => {
-                problems.push(format!("{candidate}: {reason}"));
+    }
+
+    // Pass 2: bounded scan. Reached only when no explicit path was reachable.
+    let (dirs, notes) = discover_by_name_dirs_in(scan_roots);
+    trace.scanned_dirs = dirs.iter().map(|d| d.display().to_string()).collect();
+    trace.scan_notes = notes;
+    if dirs.is_empty() {
+        // The single most useful signal on a real device: the walk ran and found
+        // *no* `by-name` directory at all, which is a different problem from
+        // "found the directory but every alias was unreadable". Record it rather
+        // than leaving the trace silent about a phase that did execute.
+        trace.scan_notes.push(format!(
+            "no by-name directory found under: {}",
+            scan_roots.join(", ")
+        ));
+    }
+    for dir in &dirs {
+        for alias in defs::AVB_SCAN_ALIASES {
+            let path = dir.join(alias);
+            if let Some(observed) = probe_attempt(&path, "scan", digest_vbmeta, &mut trace) {
+                // Record where it was found: `avb_source` then says the answer
+                // came from the scan, not from a hard-coded path.
+                warn!(
+                    "[deploy] AVB: boot partition found by by-name scan: {} (scanned {} dir(s))",
+                    observed.source,
+                    trace.scanned_dirs.len()
+                );
+                return (observed, trace);
             }
-            // Device opened and a definite verdict was reached, including
-            // "no footer": that is the answer for this device.
-            Some(_) => return observed,
         }
     }
-    AvbObservation {
-        source: problems.join("; "),
-        partition_bytes: 0,
-        footer_sha256: None,
-        vbmeta_sha256: None,
-        footer_present: false,
-        // No candidate could even be opened: nothing was measured. This is the
-        // case that must stay distinguishable from a measured `NoFooter`.
-        outcome: AvbOutcome::Unobservable,
-        problem: Some("no readable boot partition (AVB state unknown)".to_string()),
-    }
+
+    let rendered = trace.render();
+    warn!("[deploy] AVB: no boot partition could be opened — trace: {rendered}");
+    (
+        AvbObservation {
+            source: rendered.clone(),
+            partition_bytes: 0,
+            footer_sha256: None,
+            vbmeta_sha256: None,
+            footer_present: false,
+            // No path could even be opened: nothing was measured. This is the
+            // case that must stay distinguishable from a measured `NoFooter`.
+            outcome: AvbOutcome::Unobservable,
+            // The trace goes into `problem`, which the selftest renders as the
+            // `avb_untouched` check detail: a real device failure then says
+            // exactly which paths were tried and why each was rejected, instead
+            // of a bare `avb_unobservable`.
+            problem: Some(format!(
+                "no readable boot partition (AVB state unknown); tried: {rendered}"
+            )),
+        },
+        trace,
+    )
+}
+
+fn probe_avb_impl(digest_vbmeta: bool) -> AvbObservation {
+    probe_avb_traced(digest_vbmeta).0
 }
 
 fn write_state(hidden_file: &str, source_dir: &Path) -> Result<()> {
@@ -908,19 +1234,26 @@ fn write_state(hidden_file: &str, source_dir: &Path) -> Result<()> {
     // of `AvbObservation::code()`, and the digests are only populated when the
     // observation actually succeeded (a `None` means "not observed", and the
     // selftest treats that as unknown — never as a pass).
-    let avb = probe_avb();
+    //
+    // Traced variant (2026-11-11 P0-4): the per-path reasons are persisted to
+    // `state.json` so a device that reports `avb_unobservable` carries its own
+    // diagnosis instead of a bare "unknown".
+    let (avb, trace) = probe_avb_traced(true);
+    let trace_text = trace.render();
     match avb.code() {
         "avb_ok" => info!(
-            "[deploy] AVB observed: footer+vbmeta digested from {} ({} B partition)",
-            avb.source, avb.partition_bytes
+            "[deploy] AVB observed: footer+vbmeta digested from {} ({} B partition); trace: {}",
+            avb.source, avb.partition_bytes, trace_text
         ),
         "avb_no_footer" => warn!(
-            "[deploy] AVB: boot partition has no AVB footer ({}) — recorded as avb_no_footer, NOT as a pass",
-            avb.problem.as_deref().unwrap_or("-")
+            "[deploy] AVB: boot partition has no AVB footer ({}) — recorded as avb_no_footer, NOT as a pass; trace: {}",
+            avb.problem.as_deref().unwrap_or("-"),
+            trace_text
         ),
         _ => warn!(
-            "[deploy] AVB: boot partition unobservable ({}) — recorded as avb_unobservable",
-            avb.problem.as_deref().unwrap_or("-")
+            "[deploy] AVB: boot partition unobservable ({}) — recorded as avb_unobservable; trace: {}",
+            avb.problem.as_deref().unwrap_or("-"),
+            trace_text
         ),
     }
     let state = DeployState {
@@ -930,6 +1263,10 @@ fn write_state(hidden_file: &str, source_dir: &Path) -> Result<()> {
         avb_footer_sha256: avb.footer_sha256.clone(),
         avb_vbmeta_sha256: avb.vbmeta_sha256.clone(),
         avb_source: if avb.partition_bytes > 0 { Some(avb.source.clone()) } else { None },
+        // Always recorded, including on success: the happy-path trace is what
+        // proves *which* layout this device used, and it is the baseline a later
+        // "the path changed" regression report is compared against.
+        avb_probe_trace: Some(trace_text),
         avb_partition_bytes: if avb.partition_bytes > 0 { Some(avb.partition_bytes) } else { None },
         deployed_at: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1346,13 +1683,25 @@ mod tests {
         assert_eq!(a.footer_sha256, b.footer_sha256);
     }
 
+    /// Serialises every test that mutates the process-global
+    /// `SPROOT_AVB_BOOT_IMAGE`. `set_var`/`remove_var` are process-wide, so two
+    /// tests racing on it would make each other flaky (observed: the
+    /// `avb_scan_*` tests intermittently seeing an override set by this test).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn avb_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn avb_override_env_is_honoured_and_labelled() {
+        let _guard = avb_env_lock();
         let scratch = Scratch::new("override");
         let path = scratch.path("boot.img");
         fs::write(&path, synth_partition(8192, b"PAYLOAD", b"VBMETA")).unwrap();
-        // SAFETY: single-threaded within this test; the var is removed below.
+        // SAFETY: the mutex above serialises every writer of this variable, and
+        // it is removed before the guard is released.
         unsafe { std::env::set_var(defs::AVB_BOOT_OVERRIDE_ENV, &path) };
         let observed = probe_avb();
         unsafe { std::env::remove_var(defs::AVB_BOOT_OVERRIDE_ENV) };
@@ -1485,5 +1834,282 @@ mod tests {
         // And the helper must survive being called twice (SEEK_END leaves the
         // cursor at EOF; a second call must not return 0).
         assert_eq!(real_len(&mut file).unwrap(), 12345);
+    }
+
+    // -----------------------------------------------------------------------
+    // Boot-partition discovery (2026-11-11 P0-4).
+    //
+    // The tests above all hand `observe_avb_from_path` a path directly, so none
+    // of them exercises *finding* the partition — which is exactly where a real
+    // device fails silently: `defs::AVB_BOOT_CANDIDATES` is a guess at vendor
+    // layout, and when every guess misses the probe returned a bare
+    // `avb_unobservable` with no indication of what it had tried. These tests
+    // pin both halves of the fix: the bounded `by-name` scan finds a layout the
+    // fixed list misses, and the failure path carries a per-path trace.
+    // -----------------------------------------------------------------------
+
+    /// Build `<platform>/<soc>/<bus>/by-name/<alias>` inside the scratch dir and
+    /// return the by-name directory.
+    #[cfg(unix)]
+    fn fake_byname_tree(platform: &Path, soc: &str, bus: &str) -> PathBuf {
+        use std::os::unix::fs::symlink;
+        let by_name = platform.join(format!("{soc}/{bus}/by-name"));
+        fs::create_dir_all(&by_name).unwrap();
+        // A real partition symlink target; contents are irrelevant here, the
+        // scan only has to *locate* the alias (then the observer reads it).
+        let target = by_name.join("..").join("..").join("boot-partition.bin");
+        fs::write(&target, synth_partition(8192, b"PAYLOAD", b"VBMETA")).unwrap();
+        symlink(&target, by_name.join("boot")).unwrap();
+        by_name
+    }
+
+    /// A layout the fixed candidate list cannot express
+    /// (`platform/<soc>/<bus>/by-name`) must still be found by the scan, and the
+    /// observation must say it came from the scan.
+    #[cfg(unix)]
+    #[test]
+    fn avb_scan_finds_boot_under_a_vendor_platform_layout() {
+        let scratch = Scratch::new("scan-find");
+        let platform = scratch.path("platform");
+        fs::create_dir_all(&platform).unwrap();
+        let by_name = fake_byname_tree(&platform, "soc-xyz", "1d84000.ufshc");
+
+        // Explicit list deliberately misses: it points at paths that do not exist.
+        let (observed, trace) = probe_avb_with(
+            true,
+            &["/nonexistent/by-name/boot"],
+            &[platform.to_str().unwrap()],
+        );
+
+        assert_eq!(observed.code(), "avb_ok", "problem={:?}", observed.problem);
+        assert_eq!(observed.outcome, AvbOutcome::Ok);
+        assert!(
+            observed.source.ends_with(by_name.join("boot").to_str().unwrap()),
+            "source must be the discovered path: {}",
+            observed.source
+        );
+        let selected = trace.selected().expect("a selected attempt must be recorded");
+        assert_eq!(selected.origin, "scan", "origin must record that the scan found it");
+        assert_eq!(selected.code, Some("avb_ok"));
+        // The miss on the explicit candidate is recorded, not silently dropped.
+        assert!(
+            trace.attempts.iter().any(|a| a.origin == "explicit"
+                && a.skip.as_deref() == Some("absent")),
+            "the failed explicit candidate must stay in the trace: {:?}",
+            trace.attempts
+        );
+        assert!(!trace.scanned_dirs.is_empty());
+    }
+
+    /// `boot_a` is the fallback alias for A/B layouts that publish only slot
+    /// links; `boot` must win when both exist.
+    #[cfg(unix)]
+    #[test]
+    fn avb_scan_prefers_boot_over_boot_a() {
+        use std::os::unix::fs::symlink;
+        let scratch = Scratch::new("scan-pref");
+        let by_name = scratch.path("platform/soc/by-name");
+        fs::create_dir_all(&by_name).unwrap();
+        let img = scratch.path("part.img");
+        fs::write(&img, synth_partition(8192, b"PAYLOAD", b"VBMETA")).unwrap();
+        symlink(&img, by_name.join("boot")).unwrap();
+        symlink(&img, by_name.join("boot_a")).unwrap();
+
+        let root = scratch.path("platform");
+        let (observed, trace) =
+            probe_avb_with(true, &["/nonexistent"], &[root.to_str().unwrap()]);
+        assert_eq!(observed.code(), "avb_ok");
+        assert!(
+            observed.source.ends_with("by-name/boot"),
+            "`boot` must be preferred over `boot_a`: {}",
+            observed.source
+        );
+        let selected = trace.selected().unwrap();
+        assert_eq!(selected.origin, "scan");
+    }
+
+    /// No layout at all: must be `unobservable` (never a pass), must not panic,
+    /// and the problem string must name every path it tried.
+    #[test]
+    fn avb_probe_without_any_layout_is_unobservable_and_explains_itself() {
+        let scratch = Scratch::new("scan-none");
+        // A root that exists but contains no by-name directory anywhere.
+        let root = scratch.path("platform");
+        fs::create_dir_all(root.join("soc/1d84000.ufshc")).unwrap();
+
+        let (observed, trace) = probe_avb_with(
+            true,
+            &["/definitely/not/here/boot"],
+            &[root.to_str().unwrap()],
+        );
+
+        assert_eq!(observed.code(), "avb_unobservable");
+        assert!(!observed.footer_present, "unknown must never claim a footer");
+        assert_eq!(observed.partition_bytes, 0);
+        let problem = observed.problem.as_deref().unwrap_or("");
+        // The whole point: the report names what was tried, not just "unknown".
+        assert!(
+            problem.contains("/definitely/not/here/boot"),
+            "problem must name the explicit candidate: {problem}"
+        );
+        assert!(
+            problem.contains("skipped(absent)"),
+            "problem must say why it was rejected: {problem}"
+        );
+        // The walk ran and found nothing: that must be stated explicitly, since
+        // "no by-name dir at all" and "by-name dir exists but aliases unreadable"
+        // are different bugs with different fixes.
+        assert!(
+            problem.contains("no by-name directory found under"),
+            "problem must report the scan phase: {problem}"
+        );
+        assert!(
+            problem.contains(root.to_str().unwrap()),
+            "problem must name the scanned root: {problem}"
+        );
+        assert!(trace.attempts.iter().all(|a| !a.selected));
+        assert!(trace.selected().is_none());
+    }
+
+    /// A root that does not exist (or is a regular file) must produce a note,
+    /// not an error and certainly not a panic.
+    #[test]
+    fn avb_scan_tolerates_missing_and_non_directory_roots() {
+        let scratch = Scratch::new("scan-missing");
+        let file = scratch.path("a-regular-file");
+        fs::write(&file, b"x").unwrap();
+
+        let (dirs, notes) = discover_by_name_dirs_in(&[
+            "/no/such/root/at/all",
+            file.to_str().unwrap(),
+        ]);
+        assert!(dirs.is_empty(), "nothing to find: {dirs:?}");
+        assert_eq!(notes.len(), 2, "both roots must be explained: {notes:?}");
+        assert!(notes[0].contains("cannot stat"), "notes={notes:?}");
+        assert!(notes[1].contains("not a directory"), "notes={notes:?}");
+
+        // And the probe on top of it still answers `unobservable`.
+        let (observed, _) = probe_avb_with(true, &["/no/such/boot"], &["/no/such/root/at/all"]);
+        assert_eq!(observed.code(), "avb_unobservable");
+    }
+
+    /// A `by-name` directory whose `boot` link points at an unreadable target
+    /// must be reported as skipped with the open error, and the probe must keep
+    /// looking instead of aborting.
+    #[cfg(unix)]
+    #[test]
+    fn avb_scan_records_open_failures_per_path() {
+        use std::os::unix::fs::symlink;
+        let scratch = Scratch::new("scan-dangling");
+        let by_name = scratch.path("platform/soc/by-name");
+        fs::create_dir_all(&by_name).unwrap();
+        // Dangling symlink: exercise "path exists check passes, open fails" OR
+        // absence, depending on the filesystem; either way it must be recorded.
+        symlink(scratch.path("gone.bin"), by_name.join("boot")).unwrap();
+        symlink(scratch.path("gone_a.bin"), by_name.join("boot_a")).unwrap();
+
+        let root = scratch.path("platform");
+        let (observed, trace) =
+            probe_avb_with(true, &["/no/such/candidate"], &[root.to_str().unwrap()]);
+
+        assert_eq!(observed.code(), "avb_unobservable");
+        assert!(observed.problem.as_deref().unwrap_or("").contains("skipped"));
+        // Both aliases were attempted and each got its own record.
+        let scan_attempts: Vec<_> = trace
+            .attempts
+            .iter()
+            .filter(|a| a.origin == "scan")
+            .collect();
+        assert_eq!(scan_attempts.len(), 2, "attempts={:?}", trace.attempts);
+        assert!(scan_attempts.iter().all(|a| a.skip.is_some()));
+    }
+
+    /// The walk must be bounded: a `by-name`-free tree deeper than the depth cap
+    /// is not descended into forever, and an unreadable directory is a note.
+    #[test]
+    fn avb_scan_is_bounded_and_never_panics() {
+        let scratch = Scratch::new("scan-bounded");
+        // Level 1..5 nesting, with the by-name only at level 5 (past the cap).
+        let mut dir = scratch.path("platform");
+        for i in 0..5 {
+            dir = dir.join(format!("lvl{i}"));
+        }
+        fs::create_dir_all(dir.join("by-name")).unwrap();
+        let root = scratch.path("platform");
+
+        let (dirs, _notes) = discover_by_name_dirs_in(&[root.to_str().unwrap()]);
+        assert!(
+            dirs.is_empty(),
+            "depth cap must stop before level-5 by-name: {dirs:?}"
+        );
+
+        // A root that is itself a by-name directory is accepted directly.
+        let direct = scratch.path("platform/lvl0/lvl1/lvl2/by-name");
+        fs::create_dir_all(&direct).unwrap();
+        let (dirs, _) = discover_by_name_dirs_in(&[direct.to_str().unwrap()]);
+        assert_eq!(dirs, vec![direct]);
+    }
+
+    /// The rendered trace is what lands in `state.json`/the selftest detail, so
+    /// it must stay bounded (no unbounded growth on a pathological layout) and
+    /// must actually contain the evidence.
+    #[test]
+    fn avb_probe_trace_render_is_informative_and_capped() {
+        let mut trace = AvbProbeTrace::default();
+        for i in 0..20 {
+            trace.attempts.push(AvbProbeAttempt::skipped(
+                format!("/dev/block/by-name/boot{i}"),
+                "explicit",
+                "absent",
+            ));
+        }
+        let rendered = trace.render();
+        assert!(rendered.contains("more attempt(s)"), "must cap: {rendered}");
+        assert!(rendered.len() < 2048, "trace must stay small: {} B", rendered.len());
+        assert!(trace.selected().is_none());
+
+        // Empty trace still says something rather than an empty string.
+        assert!(!AvbProbeTrace::default().render().is_empty());
+    }
+
+    /// `state.json` must carry the trace so a device reporting
+    /// `avb_unobservable` is self-diagnosing. Round-trips through JSON because
+    /// that is the only way the report actually reaches the manager.
+    #[test]
+    fn deploy_state_serialises_the_avb_probe_trace() {
+        let state = DeployState {
+            version: "test".into(),
+            commit: "deadbeef".into(),
+            avb: "avb_unobservable".into(),
+            avb_footer_sha256: None,
+            avb_vbmeta_sha256: None,
+            avb_source: None,
+            avb_probe_trace: Some("/dev/block/by-name/boot [explicit] skipped(absent)".into()),
+            avb_partition_bytes: None,
+            deployed_at: 0,
+            hidden_file: "x".into(),
+            source: "/tmp".into(),
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("avb_probe_trace"), "json={json}");
+        let back: DeployState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.avb_probe_trace, state.avb_probe_trace);
+
+        // Old state files (written before this field existed) still load: the
+        // manager must not break on an upgrade.
+        let legacy = serde_json::json!({
+            "version": "old",
+            "commit": "",
+            "avb": "avb_ok",
+            "avb_footer_sha256": null,
+            "avb_vbmeta_sha256": null,
+            "avb_source": "/dev/block/by-name/boot",
+            "avb_partition_bytes": 8192,
+            "deployed_at": 0,
+            "hidden_file": "x",
+            "source": "/tmp",
+        });
+        let parsed: DeployState = serde_json::from_value(legacy).unwrap();
+        assert!(parsed.avb_probe_trace.is_none());
     }
 }

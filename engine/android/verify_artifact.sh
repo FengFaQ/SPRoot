@@ -203,6 +203,32 @@ if [[ -n "$QEMU" && -f "$EXEC" ]]; then
   }
   a8_expect_launcher 6.1.0 "" 15
   a8_expect_launcher 5.10.0 "" 12
+
+  # ---- A8b（task-16）：hook_groups_expected_breakdown 对账矩阵 ----
+  # 目的：让"14 vs 15 到底差在哪一项"可从 report 自证，而不是靠读源码或猜测。
+  # 正样本证明会绿、负样本证明会红（GBREAK 用例名逐条 grep，防被删空）。
+  OUT_B="$("$QEMU" "$EXEC" --self-test-groups --assume-kernel-version 6.1.0 2>&1)"
+  if [[ "$OUT_B" == *"GBREAKRESULT PASS"* ]]; then
+    pass "A8b breakdown 对账矩阵全绿（GBREAKRESULT PASS）"
+  else
+    fail "A8b breakdown 对账矩阵失败：$(printf '%s\n' "$OUT_B" | grep -E 'FAIL$|GBREAKRESULT' | head -5)"
+  fi
+  for gcase in pos_61_huawei_total15 pos_61_huawei_bypass1 pos_61_huawei_source_detected \
+               pos_61_nohuawei_total14 pos_61_nohuawei_emptylist pos_510_base11 \
+               pos_61_huawei_rc_total16 pos_assumed_no_fake_names \
+               pos_total_is_sum_of_parts pos_count_matches_breakdown \
+               pos_huawei_bypass_follows_hit_1 pos_huawei_bypass_follows_hit_0 \
+               neg_baseline_ok neg_total_mismatch_expected neg_huawei_hit_but_zero \
+               neg_branch_base_wrong neg_breakdown_missing neg_none_with_names; do
+    if [[ "$OUT_B" == *"GBREAK $gcase"*"PASS"* ]]; then
+      pass "A8b-[$gcase]"
+    else
+      fail "A8b-[$gcase] 用例缺失或未 PASS（breakdown 断言被削弱成空断言）"
+    fi
+  done
+  GCNT="$(printf '%s\n' "$OUT_B" | grep -c '^GBREAK ' || true)"
+  [[ "${GCNT:-0}" -ge 30 ]] && pass "A8b 规模 ${GCNT} 例（>=30，防 breakdown 用例被删）" \
+                            || fail "A8b 规模仅 ${GCNT} 例（<30，疑似用例被删）"
 else
   echo "SKIP  A8 期望组数分支自检（需 qemu）"
 fi
@@ -417,6 +443,45 @@ hua = bool(r.get("hook_has_huawei_symbols", False))
 ok = (exp > 0 and cnt == exp and res >= exp - (1 if hua else 0))
 sys.exit(0 if ok else 1)
 GRPCHK
+    fi
+    # B8b（task-16）：真机 report 的 hook_groups_expected_breakdown 必须自洽且能解释组数。
+    # 这是"魅族21 实测 15 组"与基线 14 对账的**唯一机器判据**：若 total 与
+    # hook_groups_expected 不一致、或 huawei 命中却写 0、或字段缺失，这里直接红。
+    if [[ -f "$OUT.report.json" ]] && command -v python3 >/dev/null; then
+      python3 - "$OUT.report.json" <<'BDCHK' && pass "B8b breakdown 自洽：total==hook_groups_expected，且 huawei/rc 分项与命中情况一致" || fail "B8b breakdown 不自洽（14/15 疑云无法对账 → 必须修引擎，不许放过）"
+import json, sys
+r = json.load(open(sys.argv[1]))
+bd = r.get("hook_groups_expected_breakdown")
+if not isinstance(bd, dict):
+    print("breakdown 缺失"); sys.exit(1)
+base = int(bd.get("branch_base", -1))
+hw   = int(bd.get("huawei_bypass", -1))
+lrc  = int(bd.get("launcher_rc", -1))
+tot  = int(bd.get("total", -1))
+ge61 = bool(bd.get("kernel_ge_6_1"))
+names = bd.get("huawei_symbols_detected")
+src   = bd.get("huawei_bypass_source")
+exp   = int(r.get("hook_groups_expected", -2))
+problems = []
+if not isinstance(names, list): problems.append("huawei_symbols_detected 非数组")
+if base != (14 if ge61 else 11): problems.append("branch_base 与分支不符")
+if tot != base + hw + lrc:       problems.append("total != 分项之和")
+if tot != exp:                   problems.append("total(%s) != hook_groups_expected(%s)" % (tot, exp))
+if src == "detected":
+    if not names: problems.append("source=detected 但无符号名")
+    if hw != 1:   problems.append("符号命中却 huawei_bypass=%s" % hw)
+elif src == "assumed":
+    if hw != 1:   problems.append("source=assumed 却 huawei_bypass=%s" % hw)
+elif src == "none":
+    if names:  problems.append("source=none 却列了符号名")
+    if hw != 0: problems.append("source=none 却 huawei_bypass=%s" % hw)
+else:
+    problems.append("huawei_bypass_source 非法: %r" % src)
+if bd.get("consistent") is not True: problems.append("consistent 不为 true")
+if problems:
+    print("; ".join(problems)); sys.exit(1)
+sys.exit(0)
+BDCHK
     fi
     if [[ -f "$OUT.report.json" ]] && command -v python3 >/dev/null; then
       python3 - "$OUT.report.json" "$KEY" <<'KEYCHK' && pass "B7 密钥自证：embed_key.new_bytes = 48 字节(key[:47]hex+\"00\")，key_spec 四字段自证" || fail "B7 密钥自证/key_spec 断言失败（47+NUL ABI 被破坏 → 提权会静默失败）"

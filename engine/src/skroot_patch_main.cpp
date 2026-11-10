@@ -314,6 +314,84 @@ static std::string launcher_reason_effective(const std::string& mode, bool enabl
     return "not_embedded (launcher mode=" + mode + " produced no blob)";
 }
 
+// ---------------------------------------------------------------- 期望组数 breakdown（纯函数）
+// task-16：把「期望组数」从"一个数字"变成"可自解释的构成 + 具名证据"。
+// 序列化集中在此一处，build_report 与 --self-test-groups 共用，避免两边字段集漂移。
+// 字段语义与「如何用它把魅族21 的 15 组与基线 14 对账」见 patch_pipeline.h 里
+// HookGroupsExpectedBreakdown 的注释（三步 SOP：先看 branch_base，再看
+// huawei_symbols_detected 是否为空，最后看 launcher_rc）。
+static J breakdown_to_json(const HookGroupsExpectedBreakdown& b) {
+    J o;
+    o.set("kernel_ge_6_1", b.kernel_ge_6_1)
+     .set("branch_base", static_cast<long long>(b.branch_base))
+     .set("huawei_bypass", static_cast<long long>(b.huawei_bypass))
+     .set("huawei_symbols_detected", [&b]() -> J {
+         J arr = J::array();
+         for (const auto& n : b.huawei_symbols_detected) arr.push(n);
+         return arr;   // 空数组 = 一个都没命中（不是"未知"）
+     }())
+     .set("huawei_bypass_source", b.huawei_bypass_source)
+     .set("launcher_rc", static_cast<long long>(b.launcher_rc))
+     .set("total", static_cast<long long>(b.total()))
+     // 自洽标记：分项之和 == total，且 huawei_bypass 与其依据一致。false = 引擎自身算错。
+     .set("consistent", b.consistent());
+    return o;
+}
+
+// 从 report 的 breakdown 里**独立重算**一遍，供对账断言使用：
+//   total == branch_base + huawei_bypass + launcher_rc
+//   total == report.hook_groups_expected（两处数字必须一致）
+//   huawei_bypass == (huawei_symbols_detected 非空 ? 1 : 0)，除非 source=="assumed"
+// 与 breakdown_to_json 不同：这里从 cJSON 读回来再算，**故意不复用构建期对象**，
+// 否则"写错"和"读错"会一起错、断言永远绿。
+static bool breakdown_json_selfconsistent(const cJSON* rep, std::string* why = nullptr) {
+    auto fail = [&](const char* m) { if (why) *why = m; return false; };
+    if (!rep) return fail("report null");
+    const cJSON* bd = cJSON_GetObjectItem(rep, "hook_groups_expected_breakdown");
+    if (!bd) return fail("breakdown 字段缺失");
+    auto num = [&](const char* k, long long dflt) -> long long {
+        const cJSON* it = cJSON_GetObjectItem(bd, k);
+        return (it && cJSON_IsNumber(it)) ? static_cast<long long>(it->valuedouble) : dflt;
+    };
+    auto str = [&](const char* k) -> std::string {
+        const cJSON* it = cJSON_GetObjectItem(bd, k);
+        return (it && cJSON_IsString(it) && it->valuestring) ? std::string(it->valuestring) : std::string();
+    };
+    const bool   ge61   = [&]{ const cJSON* it = cJSON_GetObjectItem(bd, "kernel_ge_6_1");
+                               return it && cJSON_IsTrue(it); }();
+    const long long base = num("branch_base", -1);
+    const long long hw   = num("huawei_bypass", -1);
+    const long long lrc  = num("launcher_rc", -1);
+    const long long tot  = num("total", -1);
+    if (base != (ge61 ? 14 : 11)) return fail("branch_base 与 kernel_ge_6_1 不符");
+    if (hw < 0 || hw > 1)         return fail("huawei_bypass 应为 0/1");
+    if (lrc < 0 || lrc > 1)       return fail("launcher_rc 应为 0/1");
+    if (tot != base + hw + lrc)   return fail("total != branch_base + huawei_bypass + launcher_rc");
+
+    const cJSON* arr = cJSON_GetObjectItem(bd, "huawei_symbols_detected");
+    if (!arr || !cJSON_IsArray(arr)) return fail("huawei_symbols_detected 不是数组");
+    const long long nhit = static_cast<long long>(cJSON_GetArraySize(arr));
+    const std::string src = str("huawei_bypass_source");
+    if (src == "detected") {
+        if (nhit < 1) return fail("source=detected 却没有任何符号名");
+        if (hw != 1)  return fail("huawei 符号命中却 huawei_bypass=0");
+    } else if (src == "assumed") {
+        if (hw != 1)  return fail("source=assumed 却 huawei_bypass=0");
+    } else if (src == "none") {
+        if (nhit != 0) return fail("source=none 却列出了符号名");
+        if (hw != 0)   return fail("source=none 却 huawei_bypass=1");
+    } else {
+        return fail("huawei_bypass_source 取值非法");
+    }
+    // 跨字段一致性：breakdown.total 必须等于顶层 hook_groups_expected（单一来源）
+    const cJSON* exp = cJSON_GetObjectItem(rep, "hook_groups_expected");
+    const long long expv = (exp && cJSON_IsNumber(exp)) ? static_cast<long long>(exp->valuedouble) : -1;
+    if (expv != tot) return fail("total != report.hook_groups_expected");
+    const cJSON* cons = cJSON_GetObjectItem(bd, "consistent");
+    if (!cons || !cJSON_IsTrue(cons)) return fail("breakdown.consistent 不为 true");
+    return true;
+}
+
 // ---------------------------------------------------------------- report 构造
 struct EngineState {
     std::string kernel_version = "unknown";
@@ -328,7 +406,10 @@ struct EngineState {
     size_t huawei_patch_count = 0;
     // C1 §2.3：逐 hook 落位（非破坏性新增；旧 hook_table 聚合字段保留）
     std::vector<PatchGroupSpan> groups;
-    size_t groups_expected = 0;                 // 期望组数（唯一来源 hook_groups_expected_count）
+    size_t groups_expected = 0;                 // 期望组数（唯一来源 = breakdown.total()）
+    // task-16：期望组数的**构成**（自解释用）。total() 就是上面的 groups_expected，
+    // 两者不得各算一份（build_report 用同一对象序列化 + 写 expected，天然不会漂移）。
+    HookGroupsExpectedBreakdown expected_breakdown;
     bool branch_ge_6_1 = true;
     bool has_huawei = false;
     std::string groups_expected_source = "kernel";  // kernel | assume
@@ -490,8 +571,15 @@ static J build_report(const EngineOptions& opt, const EngineState& st, const std
             return arr;
         }())
        .set("hook_groups_count", static_cast<long long>(st.groups.size()))
-       .set("hook_groups_expected", static_cast<long long>(st.groups_expected))
+       // hook_groups_expected 直接取 breakdown.total()：单一来源，避免"两处算数漂移"。
+       // （st.groups_expected 也由同一 total() 赋值，见主流程；这里再取一次是为了
+       //   让 build_report 在 fail() 路径上也不必依赖外部赋值顺序。）
+       .set("hook_groups_expected", static_cast<long long>(st.expected_breakdown.total()))
        .set("hook_groups_expected_source", st.groups_expected_source)
+       // ★ task-16：把「那个数字怎么来的」显式化，任何人拿 report 就能对账 14 vs 15，
+       //   不必读引擎源码。字段含义与真机复核步骤见 patch_pipeline.h 的
+       //   HookGroupsExpectedBreakdown 注释（含魅族21 15 组的三步判定 SOP）。
+       .set("hook_groups_expected_breakdown", breakdown_to_json(st.expected_breakdown))
        .set("hook_branch", st.branch_ge_6_1 ? ">=6.1" : "<6.1")
        .set("hook_has_huawei_symbols", st.has_huawei)
        .set("hook_groups_resolved", [&st]() -> long long {
@@ -951,6 +1039,181 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
              .set("hook_groups_expected", static_cast<long long>(exp))
              .set("launcher", opt.launcher_mode)
              .set("hook_groups_expected_with_launcher", static_cast<long long>(exp_launcher));
+
+        // ---- task-16：breakdown 对账矩阵（正样本 + 负样本，全部真跑）----
+        // 铁律：每条断言都要有负样本证明它会红；否则又是"永远 PASS 的空断言"。
+        // 用例名 GBREAK<name>，被 --na 以外的 CI 逐条 grep（见 verify_artifact.sh A8b）。
+        {
+            int fails = 0, cases = 0;
+            auto chk = [&](const char* name, bool ok) {
+                ++cases; if (!ok) ++fails;
+                std::cout << "GBREAK " << name << (ok ? " PASS" : " FAIL") << "\n";
+            };
+            // 构造一个"命中 huawei"的 breakdown 进行对账（符号名走真实函数名）
+            const std::vector<std::string> hit = { "hkip_check_uid_root" };
+            const std::vector<std::string> none;
+
+            // ① 正样本：>=6.1 + huawei 命中 → total 15，且 +1 可归因到 huawei
+            //    这正是"魅族21 实测 15 组"的假定成因；若真机 report 长这样即为自证。
+            {
+                HookGroupsExpectedBreakdown b = hook_groups_expected_breakdown(true, hit, false);
+                chk("pos_61_huawei_total15", b.total() == 15);
+                chk("pos_61_huawei_branch14", b.branch_base == 14);
+                chk("pos_61_huawei_bypass1", b.huawei_bypass == 1);
+                chk("pos_61_huawei_source_detected", b.huawei_bypass_source == "detected");
+                chk("pos_61_huawei_names_present", b.huawei_symbols_detected.size() == 1);
+                chk("pos_61_huawei_consistent", b.consistent());
+            }
+            // ② 正样本：>=6.1 无 huawei → 14（基线），数组必须为空且 source=none
+            {
+                HookGroupsExpectedBreakdown b = hook_groups_expected_breakdown(true, none, false);
+                chk("pos_61_nohuawei_total14", b.total() == 14);
+                chk("pos_61_nohuawei_emptylist", b.huawei_symbols_detected.empty());
+                chk("pos_61_nohuawei_source_none", b.huawei_bypass_source == "none");
+                chk("pos_61_nohuawei_consistent", b.consistent());
+            }
+            // ③ 正样本：<6.1 分支基数 11（证明基数字不是写死 14）
+            {
+                HookGroupsExpectedBreakdown b = hook_groups_expected_breakdown(false, none, false);
+                chk("pos_510_base11", b.total() == 11 && b.branch_base == 11);
+            }
+            // ④ 正样本：+launcher rc 与 +huawei 可叠加（14+1+1=16）
+            {
+                HookGroupsExpectedBreakdown b = hook_groups_expected_breakdown(true, hit, true);
+                chk("pos_61_huawei_rc_total16", b.total() == 16 && b.launcher_rc == 1);
+            }
+            // ⑤ 正样本：--assume-huawei-symbols 的"假定"不得伪造符号名
+            {
+                HookGroupsExpectedBreakdown b = hook_groups_expected_breakdown(true, none, false, /*assumed*/true);
+                chk("pos_assumed_total15", b.total() == 15);
+                chk("pos_assumed_no_fake_names", b.huawei_symbols_detected.empty());
+                chk("pos_assumed_source", b.huawei_bypass_source == "assumed");
+                chk("pos_assumed_consistent", b.consistent());
+            }
+            // ⑤b total() 必须真的等于分项之和（防 total() 实现漂移成只返回 branch_base）。
+            //     用**独立算式**逐个组合核验，而不是拿 total() 跟自己比。
+            //     mutant 实测：把 total() 改成 return branch_base 时，只有这组会红。
+            {
+                const std::vector<std::string> combos[] = { none, hit };
+                for (int gi = 0; gi < 2; ++gi) {
+                    for (int li = 0; li < 2; ++li) {
+                        for (int ai = 0; ai < 2; ++ai) {
+                            HookGroupsExpectedBreakdown b = hook_groups_expected_breakdown(
+                                true, combos[gi], li == 1, ai == 1);
+                            const unsigned expect =
+                                (unsigned)(14 + (b.huawei_bypass) + (b.launcher_rc));
+                            chk("pos_total_is_sum_of_parts", b.total() == expect);
+                        }
+                    }
+                }
+            }
+            // ⑤c hook_groups_expected_count() 与 breakdown.total() 必须同值
+            //     （它是"有无 huawei"布尔口径，与带符号名的口径必须一致，否则两处算数漂移）
+            {
+                const bool hs[2] = { false, true };
+                const bool lr[2] = { false, true };
+                for (int hi = 0; hi < 2; ++hi)
+                    for (int li = 0; li < 2; ++li) {
+                        const size_t via_count = hook_groups_expected_count(true, hs[hi], lr[li]);
+                        const size_t via_bd = hook_groups_expected_breakdown(
+                            true, hs[hi] ? hit : none, lr[li], hs[hi]).total();
+                        chk("pos_count_matches_breakdown", via_count == via_bd);
+                    }
+            }
+            // ⑤d huawei_bypass 必须随符号命中而 +1（不是恒 0/恒 1）。
+            //     mutant 实测：把 breakdown 里 huawei_bypass 恒置 0 时，这组与 ① 会红。
+            chk("pos_huawei_bypass_follows_hit_1", hook_groups_expected_breakdown(true, hit, false).huawei_bypass == 1);
+            chk("pos_huawei_bypass_follows_hit_0", hook_groups_expected_breakdown(true, none, false).huawei_bypass == 0);
+
+            // ---- 负样本：从**已生成的真实 report JSON** 里改坏，再读回来判定必须红 ----
+            // 用 EngineState 真实构造一份 report，保证测的是 build_report 的产物结构。
+            auto make_report = [&]() -> J {
+                EngineOptions o; o.key_from_user = true;
+                EngineState s;
+                s.branch_ge_6_1 = ge61;
+                s.has_huawei = opt.assume_huawei;
+                s.expected_breakdown = hook_groups_expected_breakdown(
+                    ge61, opt.assume_huawei ? hit : none, opt.launcher_mode == "rc",
+                    opt.assume_huawei);
+                s.groups_expected = s.expected_breakdown.total();
+                return build_report(o, s, std::string(48, 'A'));
+            };
+            J rep = make_report();
+            chk("neg_baseline_ok", breakdown_json_selfconsistent(rep.raw()));
+
+            auto mutated_bad = [&](const char* name, void (*mut)(cJSON*)) {
+                cJSON* d = cJSON_Duplicate(rep.raw(), 1);
+                mut(d);
+                std::string why;
+                const bool bad = !breakdown_json_selfconsistent(d, &why);
+                cJSON_Delete(d);
+                chk(name, bad);
+            };
+            // ⑥ 负样本：total 与 hook_groups_expected 不一致 → 必须红。
+            //    构造要点（这是上一版被我自己抓到的漏洞）：只改**顶层** hook_groups_expected，
+            //    保持 breakdown 内部算术完全自洽（total 仍 = base+bypass+launcher）。
+            //    若连 total 一起改坏，算术规则会先报错，这条"跨字段一致"规则就没被测到 ——
+            //    mutant 实测：删掉跨字段检查后用例仍全绿，说明它当时是假证据。
+            mutated_bad("neg_total_mismatch_expected", [](cJSON* r) {
+                cJSON* e = cJSON_GetObjectItem(r, "hook_groups_expected");
+                const long long v = (e && cJSON_IsNumber(e)) ? (long long)e->valuedouble : 0;
+                cJSON_ReplaceItemInObject(r, "hook_groups_expected", cJSON_CreateNumber((double)(v + 7)));
+            });
+            // ⑦ 负样本：huawei 命中但 huawei_bypass 写 0 → 必须红（task-16 明确要求）。
+            //    构造要点：**保持算术自洽**（total 设为 branch_base+0+launcher_rc），
+            //    使 branch_base+huawei_bypass+launcher_rc == total 仍成立，这样只有
+            //    "命中却写 0" 这条规则能抓住它。否则会被前面的算术检查提前命中，
+            //    断言就变成"看起来会红、其实被别的规则兜着"的假证据。
+            //    total 用变量算，保证在 --assume-huawei-symbols 基线下也成立。
+            {
+                cJSON* d = cJSON_Duplicate(rep.raw(), 1);
+                cJSON* bd = cJSON_GetObjectItem(d, "hook_groups_expected_breakdown");
+                const cJSON* bj = cJSON_GetObjectItem(bd, "branch_base");
+                const cJSON* lj = cJSON_GetObjectItem(bd, "launcher_rc");
+                const long long base_v = (bj && cJSON_IsNumber(bj)) ? (long long)bj->valuedouble : 14;
+                const long long lrc_v  = (lj && cJSON_IsNumber(lj)) ? (long long)lj->valuedouble : 0;
+                cJSON_DeleteItemFromObject(bd, "huawei_symbols_detected");
+                cJSON_AddItemToObject(bd, "huawei_symbols_detected",
+                    cJSON_Parse("[\"hkip_check_uid_root\",\"hkip_check_gid_root\"]"));  // 命中
+                cJSON_ReplaceItemInObject(bd, "huawei_bypass", cJSON_CreateNumber(0));   // 却写 0
+                cJSON_ReplaceItemInObject(bd, "huawei_bypass_source", cJSON_CreateString("detected"));
+                // 让算术检查通过，逼出 huawei 专用规则
+                cJSON_ReplaceItemInObject(bd, "total", cJSON_CreateNumber((double)(base_v + lrc_v)));
+                cJSON_ReplaceItemInObject(d, "hook_groups_expected",
+                                          cJSON_CreateNumber((double)(base_v + lrc_v)));
+                std::string why;
+                const bool bad = !breakdown_json_selfconsistent(d, &why);
+                cJSON_Delete(d);
+                // 还要求"因预期原因"变红，而不是被算术规则顺手拦下
+                chk("neg_huawei_hit_but_zero", bad && why.find("huawei") != std::string::npos);
+            }
+            // ⑧ 负样本：分项改了但 total 没跟着改（算术漂移）
+            mutated_bad("neg_branch_base_wrong", [](cJSON* r) {
+                cJSON* bd = cJSON_GetObjectItem(r, "hook_groups_expected_breakdown");
+                cJSON_ReplaceItemInObject(bd, "branch_base", cJSON_CreateNumber(99));
+            });
+            // ⑨ 负样本：删掉 breakdown 字段 → 必须红（防字段被悄悄拿掉）
+            mutated_bad("neg_breakdown_missing", [](cJSON* r) {
+                cJSON_DeleteItemFromObject(r, "hook_groups_expected_breakdown");
+            });
+            // ⑩ 负样本：source=none 却仍列符号名（假证据）
+            mutated_bad("neg_none_with_names", [](cJSON* r) {
+                cJSON* bd = cJSON_GetObjectItem(r, "hook_groups_expected_breakdown");
+                cJSON_ReplaceItemInObject(bd, "huawei_bypass_source", cJSON_CreateString("none"));
+                cJSON_DeleteItemFromObject(bd, "huawei_symbols_detected");
+                cJSON_AddItemToObject(bd, "huawei_symbols_detected",
+                    cJSON_Parse("[\"hkip_check_uid_root\"]"));
+            });
+            std::cout << "GBREAKRESULT " << (fails == 0 ? "PASS" : "FAIL")
+                      << " " << (cases - fails) << "/" << cases << " cases\n";
+            extra.set("breakdown_matrix", fails == 0 ? "PASS" : "FAIL")
+                 .set("breakdown_cases", cases);
+            if (fails != 0) {
+                emit_result(E_USAGE, std::move(extra));
+                if (g_ndjson.is_open()) g_ndjson.close();
+                return E_USAGE;
+            }
+        }
         emit_result(OK, std::move(extra));
         if (g_ndjson.is_open()) g_ndjson.close();
         return OK;
@@ -1118,14 +1381,27 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
 
         {   // 期望组数（唯一来源）：分支判据与 patch_kernel_handler 一致（KV 版本比较）
             st.branch_ge_6_1 = !kv.is_kernel_version_less("6.1.0");
-            st.has_huawei = hook_has_huawei_symbols(sym);
+            // 实际命中的华为符号名（不是布尔）：空数组 = 该内核无此保护路径。
+            // 这是 task-16 的证据核心——report 里能指名道姓，才谈得上对账魅族21 的 15 组。
+            std::vector<std::string> hw_syms = hook_huawei_symbols_detected(sym);
+            st.has_huawei = !hw_syms.empty();
+            bool hw_assumed = false;
             if (!opt.assume_kernel_version.empty()) {
                 st.branch_ge_6_1 = !KernelVersionParser::version_less(opt.assume_kernel_version, "6.1.0");
                 st.groups_expected_source = "assume";
             }
-            if (opt.assume_huawei) { st.has_huawei = true; st.groups_expected_source = "assume"; }
-            st.groups_expected = hook_groups_expected_count(st.branch_ge_6_1, st.has_huawei,
-                                                            opt.launcher_mode == "rc");
+            if (opt.assume_huawei) {
+                st.has_huawei = true;
+                st.groups_expected_source = "assume";
+                // --assume-huawei-symbols：真机没符号也当有。此时不能伪造符号名（那是假证据），
+                // 只置 huawei_assumed，report 里 huawei_bypass_source="assumed" 明示其性质。
+                if (hw_syms.empty()) hw_assumed = true;
+            }
+            st.expected_breakdown = hook_groups_expected_breakdown(
+                st.branch_ge_6_1, hw_syms, opt.launcher_mode == "rc", hw_assumed);
+            // 单一来源：期望值只来自 breakdown.total()，不再调用 hook_groups_expected_count()
+            // 算第二遍（两处算数迟早漂移，这正是 14/15 疑云的温床）。
+            st.groups_expected = st.expected_breakdown.total();
         }
         {   // C1 §2.3：kernel_version 必须是真实版本串（qa/审计依赖），解析失败才回落 unknown
             std::string ver = kv.get_kernel_version();

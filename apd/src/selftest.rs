@@ -202,6 +202,53 @@ fn is_daemon_process(pid: u32) -> bool {
         && !args.iter().any(|arg| *arg == "--selftest")
 }
 
+/// What the `apd` entry at `path` actually is.
+///
+/// The three states are deliberately distinct: a *missing* entry and a *wrong*
+/// entry need different remediation text, and neither may be conflated with the
+/// passing case.
+#[derive(Debug, PartialEq, Eq)]
+enum SymlinkState {
+    /// Exists and resolves to [`defs::DAEMON_PATH`].
+    Correct,
+    /// Nothing there.
+    Missing,
+    /// Present but resolves elsewhere.
+    Wrong(String),
+}
+
+fn symlink_target_state(path: &str) -> SymlinkState {
+    let p = Path::new(path);
+    match fs::symlink_metadata(p) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => SymlinkState::Missing,
+        Err(_) => SymlinkState::Missing,
+        Ok(_) => match fs::canonicalize(p) {
+            Ok(target) if target.display().to_string() == defs::DAEMON_PATH => {
+                SymlinkState::Correct
+            }
+            Ok(target) => SymlinkState::Wrong(target.display().to_string()),
+            // A dangling link: it exists but resolves nowhere, which is a wrong
+            // entry rather than an absent one.
+            Err(_) => SymlinkState::Wrong("<dangling>".to_string()),
+        },
+    }
+}
+
+/// Can we actually look at the directories that `apd` would be resolved from?
+///
+/// Same role as [`proc_scan_available`] for the daemon check: "not found" is only
+/// a *defect* when we were allowed to look. When the directories are unreadable
+/// (EACCES on a parent, or the mount is absent) the honest answer is `unknown`,
+/// not `fail` — but it is never `ok` either.
+fn path_probe_is_determinable() -> bool {
+    [defs::BINARY_DIR, defs::ADB_DIR].iter().any(|dir| {
+        let path = Path::new(dir);
+        // A readable directory settles it; a *missing* directory (NotFound) also
+        // settles it (the entry really is absent, which is the defect we report).
+        fs::read_dir(path).is_ok() || !path.exists()
+    })
+}
+
 /// PID of the running daemon: the instance-lock pid first, then a `/proc` scan.
 /// `None` only means "no daemon observed"; the caller decides whether that is
 /// determinable (see [`proc_scan_available`]).
@@ -732,6 +779,132 @@ pub fn run(json: bool) -> Result<()> {
         ));
     }
 
+    // ---- apd resolvable from a module script's PATH (P0, 2026-11-11) ------
+    //
+    // The failure this guards against is *silent* in production: NeoZygisk runs
+    // `Command::new("apd")` inside a module script, gets ENOENT, falls back to
+    // `RootImpl::None`, and the Zygisk chain just never works — logged at
+    // `debug!`, i.e. invisible on a device. So the check is critical: once
+    // deployed, "module scripts cannot find apd" is a real defect, not a warning.
+    //
+    // Three states, and "unknown" is never a pass:
+    //   * resolvable to DAEMON_PATH               -> ok
+    //   * resolved elsewhere / not at all / PATH
+    //     missing a required entry                -> fail (critical)
+    //   * cannot be determined (no /data/adb, no
+    //     read permission on the tree)             -> unknown (not critical)
+    let apd_path_check = if !deployed {
+        Check::pending("apd_in_path", "first-boot self-check")
+    } else {
+        let path_env = crate::module::module_script_path(
+            &std::env::var("PATH").unwrap_or_default(),
+        );
+        let verdict = crate::module::apd_path_verdict(&path_env, |entry| {
+            // Resolve `entry/apd` the way execvp would: follow the symlink and
+            // canonicalise, so a link to the wrong place is caught.
+            let candidate = Path::new(entry).join(crate::module::APD_IN_PATH_NAME);
+            fs::canonicalize(candidate).ok()
+        });
+        let symlink = crate::module::apd_in_path_symlink();
+        // The symlink is asserted **separately** from resolution, because the
+        // `/data/adb` PATH entry is a fallback that would otherwise hide its
+        // absence entirely: with `/data/adb/apd` present, `apd` still resolves
+        // even when `bin/apd` is gone (verified on the CLI). That masking is
+        // exactly why a missing symlink must be reported rather than absorbed —
+        // it means deploy's contract is violated, and the next PATH change (a
+        // module that rewrites PATH, a busybox-only environment) would silently
+        // reintroduce the original Zygisk failure.
+        let symlink_state = symlink_target_state(&symlink);
+        match verdict {
+            crate::module::ApdPathVerdict::Resolved => match symlink_state {
+                SymlinkState::Correct => Check::new(
+                    "apd_in_path",
+                    true,
+                    true,
+                    format!(
+                        "`apd` resolves from module-script PATH ({} -> {}); PATH carries {} and {}",
+                        symlink,
+                        defs::DAEMON_PATH,
+                        defs::BINARY_DIR.trim_end_matches('/'),
+                        defs::ADB_DIR.trim_end_matches('/'),
+                    ),
+                ),
+                SymlinkState::Missing => Check::new(
+                    "apd_in_path",
+                    false,
+                    true,
+                    format!(
+                        "{symlink} is MISSING (deploy must create it). `apd` currently still \
+                         resolves via the {} PATH entry, so Zygisk works today — but the \
+                         documented symlink is gone, so any module that rewrites PATH brings \
+                         back the silent RootImpl::None failure. Re-run deploy.",
+                        defs::ADB_DIR.trim_end_matches('/')
+                    ),
+                ),
+                SymlinkState::Wrong(other) => Check::new(
+                    "apd_in_path",
+                    false,
+                    true,
+                    format!(
+                        "{symlink} points to {other}, expected {} (stale/foreign entry; \
+                         re-run deploy to recreate it)",
+                        defs::DAEMON_PATH
+                    ),
+                ),
+            },
+            // Before declaring a failure, ask whether we were *allowed to look*.
+            // `canonicalize` fails for ENOENT (a real defect) and also for EACCES
+            // on a parent directory (we simply cannot see it). Reporting the
+            // latter as FAIL would be crying wolf on an unobservable environment,
+            // which the project's `rc_started` convention forbids.
+            crate::module::ApdPathVerdict::NotFound
+                if !path_probe_is_determinable() =>
+            {
+                Check::unknown(
+                    "apd_in_path",
+                    format!(
+                        "unknown — cannot enumerate {} or {} (permission denied or missing \
+                         mount); `apd` was not found but neither can we prove it is absent. \
+                         NOT a pass",
+                        defs::BINARY_DIR,
+                        defs::ADB_DIR,
+                    ),
+                )
+            }
+            crate::module::ApdPathVerdict::NotFound => Check::new(
+                "apd_in_path",
+                false,
+                true,
+                format!(
+                    "module scripts CANNOT resolve `apd` (no {symlink}, and no {} on PATH) \
+                     -> NeoZygisk falls back to RootImpl::None and the Zygisk chain fails \
+                     silently",
+                    defs::DAEMON_PATH
+                ),
+            ),
+            crate::module::ApdPathVerdict::WrongTarget(found) => Check::new(
+                "apd_in_path",
+                false,
+                true,
+                format!(
+                    "`apd` on PATH resolves to {found}, expected {} (stale/foreign entry; \
+                     re-run deploy to recreate {symlink})",
+                    defs::DAEMON_PATH
+                ),
+            ),
+            crate::module::ApdPathVerdict::MissingEntry(entry) => Check::new(
+                "apd_in_path",
+                false,
+                true,
+                format!(
+                    "module-script PATH is missing {entry} (required so `apd` resolves); \
+                     a path string without it is contract drift, not a working install"
+                ),
+            ),
+        }
+    };
+    checks.push(apd_path_check);
+
     // ---- daemon + socket -------------------------------------------------
     let mut daemon_alive = false;
     if deployed {
@@ -933,6 +1106,7 @@ mod tests {
             avb_footer_sha256: footer.map(str::to_string),
             avb_vbmeta_sha256: vbmeta.map(str::to_string),
             avb_source: Some("/dev/block/by-name/boot".into()),
+            avb_probe_trace: Some("fixture".into()),
             avb_partition_bytes: bytes,
             deployed_at: 0,
             hidden_file: "x".into(),
@@ -1214,5 +1388,94 @@ mod tests {
         let c = avb_verdict(Some(&no_baseline), &malformed);
         assert!(!c.ok, "detail={}", c.detail);
         assert_eq!(c.status, "fail");
+    }
+
+    // -----------------------------------------------------------------------
+    // `apd_in_path` symlink classification (P0, 2026-11-11).
+    //
+    // `symlink_target_state` is the piece that decides whether the deployed
+    // `bin/apd` entry is correct. It has to be asserted separately from PATH
+    // resolution because the `/data/adb` PATH entry masks a missing symlink
+    // (verified on the CLI: deleting `bin/apd` still resolved `apd`). These
+    // tests build real links in a temp dir, so no root and no device.
+    // -----------------------------------------------------------------------
+
+    struct LinkScratch(PathBuf);
+    impl LinkScratch {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "sproot-apdpath-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            fs::create_dir_all(&dir).expect("create scratch");
+            LinkScratch(dir)
+        }
+        fn path(&self, name: &str) -> String {
+            self.0.join(name).display().to_string()
+        }
+    }
+    impl Drop for LinkScratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A missing entry is `Missing`, never silently `Correct`.
+    #[test]
+    fn symlink_state_reports_missing() {
+        let scratch = LinkScratch::new("missing");
+        assert_eq!(
+            symlink_target_state(&scratch.path("apd")),
+            SymlinkState::Missing
+        );
+    }
+
+    /// A link to the wrong binary is `Wrong`, and the detail carries the target
+    /// so an operator can see *where* it points.
+    #[test]
+    fn symlink_state_reports_wrong_target() {
+        let scratch = LinkScratch::new("wrong");
+        let real = scratch.path("not-apd");
+        fs::write(&real, b"x").unwrap();
+        let link = scratch.path("apd");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        match symlink_target_state(&link) {
+            SymlinkState::Wrong(found) => assert!(
+                found.contains("not-apd"),
+                "detail must name the actual target: {found}"
+            ),
+            other => panic!("expected Wrong, got {other:?}"),
+        }
+    }
+
+    /// A dangling symlink exists but resolves nowhere: `Wrong`, not `Missing`
+    /// (the remediation differs — "recreate the link", not "deploy never ran").
+    #[test]
+    fn symlink_state_reports_dangling_as_wrong() {
+        let scratch = LinkScratch::new("dangling");
+        let link = scratch.path("apd");
+        std::os::unix::fs::symlink(scratch.path("gone"), &link).unwrap();
+        assert_eq!(
+            symlink_target_state(&link),
+            SymlinkState::Wrong("<dangling>".to_string())
+        );
+    }
+
+    /// A regular file (not a link) at that path is `Wrong`, not `Correct`:
+    /// deploy installs a *symlink* to the daemon, and a stale copy would run
+    /// outdated code.
+    #[test]
+    fn symlink_state_rejects_a_plain_file() {
+        let scratch = LinkScratch::new("plainfile");
+        let path = scratch.path("apd");
+        fs::write(&path, b"#!/bin/sh\n").unwrap();
+        match symlink_target_state(&path) {
+            SymlinkState::Wrong(found) => assert!(found.contains("apd"), "{found}"),
+            other => panic!("a plain file must not count as the daemon link: {other:?}"),
+        }
     }
 }

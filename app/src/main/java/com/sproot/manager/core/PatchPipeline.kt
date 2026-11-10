@@ -829,8 +829,14 @@ object PatchPipeline {
                 )
             }
 
-            // 引擎 report 里的 root_key 是其 48 字符入参；内核真正内嵌的是前 47 位
-            val rootKey = PatchEngine.lastRootKey()?.let { SecretStore.kernelKeyOf(it) } ?: key
+            // 引擎 report 的 root_key 是**调引擎时传入的 48 字符**（47 字符 + 1 位填充），
+            // 内核真正内嵌的只是前 47 位。这里必须先归一到 47 再交给 kernelKeyOf，
+            // 否则会在 require(isValidKey) 处抛 IllegalArgumentException。
+            // 2026-11-11 真机实证：report 补上 root_key 字段后，kernelKeyOf(48) 直接崩，
+            // 表现为「产物已导出但状态机置 ERROR」的假失败。
+            val rootKey = PatchEngine.lastRootKey()
+                ?.let { raw -> SecretStore.normalizeEngineKey(raw) }
+                ?: key
             state.value = state.value.copy(
                 stage = PatchStage.DONE,
                 progress = 1f,
