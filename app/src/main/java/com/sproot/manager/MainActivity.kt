@@ -24,6 +24,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // ① 首屏构建失败要落证据（崩溃兜底会写 crash 报告），不让"首次打开闪退"无迹可查
+        runCatching {
         setContent {
             val darkMode = isSystemInDarkTheme()
             DisposableEffect(darkMode) {
@@ -41,6 +43,9 @@ class MainActivity : ComponentActivity() {
                 onDispose { }
             }
             AppRoot(modifier = Modifier.fillMaxSize())
+        }
+        }.onFailure {
+            com.sproot.manager.core.AppLog.error("Activity", "首屏 setContent 失败", it)
         }
     }
 }

@@ -13,15 +13,20 @@ import android.content.Intent
 class BootReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
-        val pending = goAsync()
-        Thread {
-            try {
-                runCatching { DaemonBootstrap.ensure(context, "boot_completed") }
-                    .onFailure { AppLog.warn("Boot", "开机自引导失败：${it.message}") }
-            } finally {
-                pending.finish()
-            }
-        }.start()
+        // ① 全捕获：onReceive 里任何异常都不能抛（会 ANR/崩溃）；耗时工作一律 goAsync + 后台线程
+        runCatching {
+            if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
+            val pending = goAsync()
+            Thread {
+                try {
+                    runCatching { DaemonBootstrap.ensure(context, "boot_completed") }
+                        .onFailure { AppLog.warn("Boot", "开机自引导失败：${it.message}") }
+                } finally {
+                    pending.finish()
+                }
+            }.apply { isDaemon = true }.start()
+        }.onFailure {
+            AppLog.error("Boot", "onReceive 异常（已吞掉，不闪退）：${it.message}", it)
+        }
     }
 }
