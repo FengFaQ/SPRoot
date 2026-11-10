@@ -64,6 +64,28 @@ pub const SPROOT_BOOT_COUNT_FILE: &str = concatcp!(SPROOT_DIR, "boot_count");
 pub const SPROOT_STATE_FILE: &str = concatcp!(SPROOT_DIR, "state.json");
 
 // ---------------------------------------------------------------------------
+// AVB audit (2026-11-10 S1 fix). The previous `avb_untouched` check wrote the
+// literal `"vbmeta_untouched"` into state.json and then compared it back to the
+// same literal — a self-referential assertion that could never fail (the exact
+// AVB-3 anti-pattern recorded in HANDOFF-2026-11-08 §"教训"). The replacement
+// reads the real boot partition: AVB footer magic + the vbmeta section digest.
+// ---------------------------------------------------------------------------
+/// Boot partition block devices probed for the AVB footer, in priority order.
+/// `boot_a` covers A/B devices whose `by-name/boot` link is absent; the
+/// `bootdevice`/`platform/soc` forms cover pre-GKI vendor layouts.
+pub const AVB_BOOT_CANDIDATES: [&str; 4] = [
+    "/dev/block/by-name/boot",
+    "/dev/block/bootdevice/by-name/boot",
+    "/dev/block/by-name/boot_a",
+    "/dev/block/bootdevice/by-name/boot_a",
+];
+/// Diagnostic/test override: point the AVB auditor at a regular file (an
+/// unpacked `boot.img` or a copy of the partition). Written by nobody in
+/// production; when it is in effect the check detail says so, so an overridden
+/// run can never be mistaken for a real device measurement.
+pub const AVB_BOOT_OVERRIDE_ENV: &str = "SPROOT_AVB_BOOT_IMAGE";
+
+// ---------------------------------------------------------------------------
 // Authorisation table (contract v1.1 §3.2/§3.6, E4): ONE csv file
 // (pkg,exclude,allow,uid,to_uid,sctx). `exclude` is a row field — the separate
 // `exclude_list` file of v1.0 §3.6 is deliberately NOT implemented.

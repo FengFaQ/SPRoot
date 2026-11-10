@@ -15,6 +15,10 @@ on:
       # 不纳入触发路径会导致模板更新后 APK 不重建、静默发出旧模板。
       - 'apd/assets/**'
       - '.github/workflows/apk.yml'
+      # 门禁脚本本身改动必须触发重跑（见 apd.yml 同款说明）
+      - 'quality/static/check_rc_template.py'
+      - 'quality/static/check_apk_payload.py'
+      - 'app/native.lock.json'
   workflow_dispatch:
 
 jobs:
@@ -114,11 +118,29 @@ jobs:
           mkdir -p app/src/main/assets
           cp -f "$SRC" "$DEST"
           echo "rc template copied: $(stat -c %s "$DEST") bytes"
-          grep -q "service sproot-apd" "$DEST" || { echo "::error::rc 模板缺 service sproot-apd"; exit 1; }
-          grep -q "sys.boot_completed" "$DEST" || { echo "::error::rc 模板缺 boot_completed 触发器"; exit 1; }
-          grep -q "oneshot" "$DEST" || { echo "::error::rc 模板缺 oneshot（防 bootloop）"; exit 1; }
-          grep -q "disabled" "$DEST" || { echo "::error::rc 模板缺 disabled（防 bootloop）"; exit 1; }
-          echo "rc template content checks OK"
+
+          # ── 结构化校验（已废弃的四条 grep，务必不要恢复）─────────────────
+          # 旧写法：grep -q "service sproot-apd" / "sys.boot_completed" /
+          #         "oneshot" / "disabled"
+          # 四条**全是子串匹配**，而 init.sproot.rc 的注释里就写着
+          # 「oneshot + disabled：daemon 退出后 init 不会重启它」（:11）和
+          # 「⛔ oneshot」「⛔ disabled」说明（:39-40）。
+          # 实测复现：把 service 块内真正的 oneshot/disabled/override/class
+          # 四行指令**整行删掉**（防 bootloop 的实质内容），旧四条 grep 仍全 PASS
+          # —— 注释替它们过了门禁。这是"假门禁"的典型：删了功能也绿。
+          #
+          # 新判据（quality/static/check_rc_template.py）：先剥离 `#` 注释再按
+          # section 块解析，断言 oneshot/disabled/override/class late_start/
+          # user root/group root 都在 **service sproot-apd 块内**，
+          # 以及 boot_completed 触发器、post-fs-data 的关键 exec 行、
+          # 且 rc 中不得出现明文密钥。注释完全不参与判定。
+          GATE=quality/static/check_rc_template.py
+          [ -f "$GATE" ] || { echo "::error::缺 $GATE（rc 结构化门禁不可缺）"; exit 1; }
+          # 先证明门禁自身可失败（每条断言都在合成坏样本上变红）
+          python3 "$GATE" --self-test
+          # 再校验**将被打进 APK 的那份副本**（不是源文件——防止 cp 出错）
+          python3 "$GATE" "$DEST"
+          echo "rc template structural checks OK"
 
       - name: Assemble NOTICE assets (single source of truth)
         run: |
@@ -243,6 +265,34 @@ jobs:
           # extractNativeLibs 断言（Android 需解压 nativeLibraryDir 才能 exec magiskboot/apd）
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | tail -1)
           "$BT/aapt2" dump xmltree --file AndroidManifest.xml "$APK" | grep -i "extractNativeLibs" || true
+
+      # 载荷总门禁（T1/T2/T6 静态部分）。LICENSES.md:108 与
+      # docs/NEW-DOC-06:290/291/306/343 一直把它当作已落地门禁引用，但该文件
+      # 此前**从未存在** —— 文档承诺的门禁是空的。此处补实现并真正执行。
+      # 断言：native 齐全 + 仅 arm64-v8a + AArch64/许可全文/随包 rc 结构/
+      #      版本一致性/作废旧名/sha256 锁定（见脚本 docstring）。
+      # 先跑 --self-test 证明每条断言都能在合成坏 APK 上变红，再校验真 APK。
+      - name: APK payload gate (check_apk_payload.py)
+        run: |
+          set -euo pipefail
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          GATE=quality/static/check_apk_payload.py
+          [ -f "$GATE" ] || { echo "::error::缺 $GATE（APK 载荷门禁不可缺）"; exit 1; }
+          python3 "$GATE" --self-test
+          # 版本一致性：用本次构建的 apd-version.txt 作为期望 commit 来源
+          EXPECT=""
+          if [ -f app/src/main/assets/apd-version.txt ]; then
+            EXPECT=$(grep -E '^commit=' app/src/main/assets/apd-version.txt | cut -d= -f2- || true)
+          fi
+          if [ -n "$EXPECT" ]; then
+            python3 "$GATE" "$APK" --expect-commit "$EXPECT" --lock app/native.lock.json \
+              | tee /tmp/apk-payload.log
+          else
+            echo "::warning::APK 内无 assets/apd-version.txt → 跳过 commit 一致性断言"
+            python3 "$GATE" "$APK" --lock app/native.lock.json | tee /tmp/apk-payload.log
+          fi
+          grep -q "RESULT: ALL PASS" /tmp/apk-payload.log || {
+            echo "::error::APK 载荷门禁未 ALL PASS"; exit 1; }
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

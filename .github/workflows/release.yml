@@ -337,17 +337,29 @@ jobs:
           # `resetprop` 是 default feature，其 prop-rs 依赖为 UNKNOWN 许可（见
           # THIRD_PARTY_LICENSES.md）。发布候对应来自 --no-default-features 干净构建；
           # 这里不硬失败（人工开关/清单负责），但必须在 summary 留下风险记录。
-          if grep -aq -- resetprop "$LIB"; then
+          #
+          # ⚠️ 已废弃的旧判据（务必不要恢复）：`grep -aq resetprop "$LIB"`。
+          # 实测证伪：**干净构建的产物里也有 "resetprop" 字符串**（7 次），因为
+          # `--no-default-features` 走 resetprop_disabled.rs 存根，同名字符串仍被
+          # 编入（存根的错误文案里就写着 resetprop）。
+          # → 旧判据把干净构建判成"含 UNKNOWN 许可"（人造假红），
+          #    且对真的 default 构建也没有鉴别力（两边都命中）。
+          #
+          # 正确判据：只在真的启用 prop-rs 时才出现的，是 bionic 属性区符号
+          # `__system_properties_init`（resetprop_prop_rs.rs 经 prop-rs 调用它，
+          # 存根完全不引用）。实测：干净构建=0 次，default 构建=2 次。
+          if grep -aq -- "__system_properties_init" "$LIB"; then
             {
               echo "## ⚠️ 候选 libapd.so 含 `resetprop` feature（依赖 `prop-rs`：**UNKNOWN 许可**）"
               echo ""
+              echo "- 依据：产物中检出 bionic 属性区符号 \`__system_properties_init\`（仅启用 prop-rs 时编入）。"
               echo "- 该候选**不是**许可干净构建；发布前必须人工确认已改用 \`--no-default-features\` 构建或取得上游书面授权。"
-              echo "- 依据：\`apd/THIRD_PARTY_LICENSES.md\` 阻断项 / NEW-DOC-05 R16。"
+              echo "- 依据文件：\`apd/THIRD_PARTY_LICENSES.md\` 阻断项 / NEW-DOC-05 R16。"
             } >> "$GITHUB_STEP_SUMMARY"
             echo "::warning::候选含 UNKNOWN 许可依赖 prop-rs（resetprop feature）；发布前需人工确认干净构建或授权"
           else
-            echo "OK license-clean candidate (no resetprop feature in libapd.so)"
-            echo "## ✅ 候选为许可干净构建（libapd.so 无 resetprop/prop-rs）" >> "$GITHUB_STEP_SUMMARY"
+            echo "OK license-clean candidate (no prop-rs: __system_properties_init absent)"
+            echo "## ✅ 候选为许可干净构建（libapd.so 无 prop-rs 属性区符号）" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       # ------------------------------------------------------------------

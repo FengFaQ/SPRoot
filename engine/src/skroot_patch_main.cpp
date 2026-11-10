@@ -8,7 +8,10 @@
 //   3. 失败不落盘铁律（非 0 退出码绝不产生 --out 文件）
 //   4. NDJSON 进度流 + report.json（含 hook_table / hidden_dir_prefix）
 //   5. 退出码 12 枚举（C1 §3）
-//   6. report.json 是密钥权威源；stdout ROOT_KEY= 末行为兜底（客户端会签口径）
+//   6. report.json 是密钥权威源：顶层 `root_key` 为 48 字符明文（C1 §2.2），
+//      与 `key_spec` 同源（同一份 root_key 派生，绝无第二份密钥）；
+//      stdout 末行 `ROOT_KEY=<48字符>` 仅为兜底（客户端会签口径）。
+//      ★ V-18：report.json 含明文密钥，禁止外发/归档（NEW-DOC-06 §V-18）。
 
 #include "patch_pipeline.h"
 #include "bootimg.h"
@@ -274,6 +277,43 @@ static bool embed_key_bytes(const std::string& cli_key, std::string& out) {
            static_cast<unsigned char>(out[kKeyStoredChars]) == 0;
 }
 
+// ---------------------------------------------------------------- report 字段取值（纯函数）
+// 从 build_report() 产出的报告里读出**顶层 root_key**，按下游真实消费方的口径判可用性：
+//   quality/static/verify_patch.py:163  root_key = report.get("root_key")，随后
+//     :200 if root_key and root_key != key         → V3「防刷别人的密钥」
+//     :209 else                                    → V6 SKIP（空断言！）
+//     :711 key or report.get("root_key")           → 不传 --key 时的密钥来源
+// 与 JSON 里取值的区别：**键存在但为 null / 空串**时 cJSON 取到空串，jsonschema 语义上
+// 下游 Python 会得到 None 或 ""，两者都不满足 `if root_key` ⇒ 等同于"没有字段"。
+// 因此这里把「缺失 / null / 空串」统一判为 false，避免自检只认"键存在"而放过空值。
+// 纯函数（无 IO）：主流程 build_report 与 --self-test-keyabi 共用同一份判定。
+static bool report_root_key_usable(const cJSON* rep, std::string* out = nullptr) {
+    if (out) out->clear();
+    if (!rep) return false;
+    const cJSON* it = cJSON_GetObjectItem(rep, "root_key");
+    if (!it || !cJSON_IsString(it) || !it->valuestring) return false;
+    const std::string v = it->valuestring;
+    if (v.empty()) return false;                       // 空串 ⇒ 下游 `if root_key` 为假
+    if (out) *out = v;
+    return true;
+}
+
+// ---------------------------------------------------------------- launcher.reason（纯函数）
+// patch_rc_virtualize.h 声明「reason：未织入原因（enabled=false 时必填）」，但默认构造
+// （mode="off"）的 reason 是**空串** ⇒ 默认路径下 report.json 会是
+//   "launcher": {"mode":"off","enabled":false,"reason":""}
+// 这正是 task-8 要根除的形态：enabled=false 却给不出理由 = 静默跳过。真机上「rc 没织入」
+// 既有「默认关」也有「前置不满足」，两者若在 report 里长得一样，排障只能靠猜。
+// 本函数把「关闭/未织入」永远变成一句可读原因；enabled=true 时保持原样（不需要理由）。
+// 纯函数（无 IO/全局状态）：build_report 与 --self-test-rcvirtual 共用同一份判定。
+static std::string launcher_reason_effective(const std::string& mode, bool enabled,
+                                             const std::string& reason) {
+    if (enabled) return reason;                        // 已织入：reason 语义上不适用，原样保留
+    if (!reason.empty()) return reason;                // 已有明确原因（precheck/weave 填的）：绝不覆盖
+    if (mode == "off" || mode.empty()) return "disabled_by_default (--launcher off)";
+    return "not_embedded (launcher mode=" + mode + " produced no blob)";
+}
+
 // ---------------------------------------------------------------- report 构造
 struct EngineState {
     std::string kernel_version = "unknown";
@@ -334,15 +374,23 @@ static J build_report(const EngineOptions& opt, const EngineState& st, const std
             .set("abi", "47+nul")         // P0：与 Skroot-Next 的 48 字节无 NUL ABI 不兼容
             .set("source", opt.key_from_user ? "user" : "gen");
     // rc 虚拟化结果（--launcher rc；off 时 mode=off/enabled=false）。caves/symbols 供真机排障。
+    // reason 经 launcher_reason_effective 归一：enabled=false 时**绝不写空串**（防"静默跳过"）。
     J launcher;
     launcher.set("mode", st.launcher.mode)
             .set("enabled", st.launcher.enabled)
-            .set("reason", st.launcher.reason)
+            .set("reason", launcher_reason_effective(st.launcher.mode, st.launcher.enabled,
+                                                     st.launcher.reason))
             .set("hook_addr", static_cast<long long>(st.launcher.hook_addr))
             .set("cave_offset", static_cast<long long>(st.launcher.cave_offset))
             .set("cave_size", static_cast<long long>(st.launcher.cave_size))
             .set("shellcode_bytes", static_cast<long long>(st.launcher.shellcode_bytes))
-            .set("template_bytes", static_cast<long long>(st.launcher.template_bytes));
+            .set("template_bytes", static_cast<long long>(st.launcher.template_bytes))
+            // 运行期安全闸阈值（task-8）：init 打开 rc 时若读到 >= 该字节数，shellcode 判定
+            // "可能被截断"→ 放弃重定向（截断 rc 会破坏 init 解析 → 开机失败）。
+            // 该闸**在开机时才触发**，故 patch 期 report 无法给出 enabled:false/reason；
+            // 这里把阈值常量写进 report，供真机排障时对照"rc 是否超过上限"这一最常见原因。
+            .set("read_max_bytes", static_cast<long long>(RC_VIRT_READ_MAX_BYTES))
+            .set("read_max_bytes_scope", "runtime");
     {
         J caves = J::array();
         for (const auto& c : st.launcher.caves) {
@@ -369,6 +417,15 @@ static J build_report(const EngineOptions& opt, const EngineState& st, const std
        .set("input", std::move(input))
        .set("output", std::move(output))
        .set("kernel_version", st.kernel_version)
+       // C1 §2.2 顶层 root_key = 密钥权威源（48 字符明文，与 key_spec 同源：同一份 root_key）。
+       // ★ 修复（task-8）：此前本函数只写 key_spec 子对象，从不写顶层 root_key，导致
+       //   quality/static/verify_patch.py:163 的 report.get("root_key") 恒为 None
+       //   → 不传 --key 时 V2（密钥内嵌）/V3（root_key 与 --key 一致）/V6（前缀一致性）
+       //   静默 SKIP = 空断言（密钥链等于没验）。
+       // ★ 安全（V-18 / NEW-DOC-06 §V-18）：本字段含明文密钥 ⇒ report.json 禁止外发/归档。
+       .set("root_key", root_key)
+       .set("root_key_contains_secret", true)   // 机器可读的"禁止外发"标记
+       .set("root_key_sensitivity", "contains_secret_do_not_distribute")
        .set("key_spec", std::move(key_spec))
        .set("launcher", std::move(launcher))
        .set("hook_table", std::move(hooks))
@@ -506,6 +563,62 @@ static int self_test_keyabi_contract(const std::string& cli_key) {
     check("spec_stored_len_47",    ks_num("stored_len") == 47);
     check("spec_length_48",        ks_num("length") == 48);
 
+    // ⑥ report 顶层 root_key（task-8 修复：此字段此前**从未写过**，导致下游
+    //    quality/static/verify_patch.py:163 恒取到 None → 不传 --key 时 V2/V3/V6 静默
+    //    SKIP（空断言：密钥链等于没验）。铁律：每条新断言都必须配**负样本证明会 FAIL**，
+    //    否则又是 AVB-3 那种"永远 PASS 的空断言"。故此处同时断言正/负两侧：
+    //      正样本 ⇒ 自检必须判定"可用"；负样本 ⇒ 自检必须判定"不可用"。
+    //    否则本用例本身退化成恒 PASS，下面每个 case 单列一行便于 CI 逐条 grep。
+    {
+        std::string got;
+        const bool positive_ok = report_root_key_usable(rep.raw(), &got);
+        check("report_root_key_present",     positive_ok);
+        check("report_root_key_equals_key",  positive_ok && got == key);
+        check("report_root_key_48_chars",    positive_ok && got.size() == kKeyInputChars);
+        // 同源校验：顶层 root_key 与 key_spec 必须由**同一份** root_key 派生（长度不得漂移）
+        check("report_root_key_matches_key_spec_len",
+              positive_ok && ks_num("input_len") == static_cast<long long>(got.size()));
+        // V-18：明文密钥字段必须自带"禁止外发"标记（NEW-DOC-06 §V-18 要求标注）
+        check("report_root_key_marked_secret", [&]{
+            cJSON* m = cJSON_GetObjectItem(rep.raw(), "root_key_contains_secret");
+            return m && cJSON_IsTrue(m);
+        }());
+
+        // ---- 负样本：复制正样本后逐项破坏，判定函数必须返回 false ----
+        // 否则 report_root_key_present 就是"永远 PASS"的空断言（真实回归正是"字段没写"）。
+        // 每条单列一个 KEYCASE，便于 CI 逐条 grep，也便于人类看到它确实会变红。
+        auto mutated_unusable = [&](const char* cname, cJSON* replacement) {
+            cJSON* m = cJSON_Duplicate(rep.raw(), 1);
+            cJSON_ReplaceItemInObject(m, "root_key", replacement);   // 接管所有权
+            const bool unusable = !report_root_key_usable(m);
+            cJSON_Delete(m);
+            check(cname, unusable);
+        };
+        {   // ① 删掉字段：正是修复前的真实状态（下游 report.get 恒 None）⇒ 必须判不可用
+            cJSON* m = cJSON_Duplicate(rep.raw(), 1);
+            cJSON_DeleteItemFromObject(m, "root_key");
+            const bool unusable = !report_root_key_usable(m);
+            cJSON_Delete(m);
+            check("neg_missing_root_key_unusable", unusable);
+        }
+        // ② 字段为 null（JSON 语义上存在；下游 Python 取到 None）⇒ 必须判不可用
+        mutated_unusable("neg_null_root_key_unusable", cJSON_CreateNull());
+        // ③ 字段为空串（下游 `if root_key` 为假 ⇒ V2/V6 仍会 SKIP）⇒ 必须判不可用
+        mutated_unusable("neg_empty_root_key_unusable", cJSON_CreateString(""));
+        // ④ 字段存在但不是密钥本身：判定须"可用"，且与 CLI 密钥**不等**——
+        //    这是下游 V3「防刷别人的密钥」能变红的前提（若引擎把 key 抄错，此处必须能发现）。
+        {
+            cJSON* m = cJSON_Duplicate(rep.raw(), 1);
+            cJSON_ReplaceItemInObject(m, "root_key", cJSON_CreateString(std::string(48, 'Z').c_str()));
+            std::string other;
+            const bool usable = report_root_key_usable(m, &other);
+            cJSON_Delete(m);
+            check("neg_wrong_root_key_detected", usable && other != key);
+        }
+        // ⑤ 非字符串类型（数字）：下游取到 int，不是密钥串 ⇒ 必须判不可用
+        mutated_unusable("neg_nonstring_root_key_unusable", cJSON_CreateNumber(12345));
+    }
+
     // 人类/脚本可读的一行摘要（A10 用它断言、qa 可贴进报告）
     std::cout << "KEYSPEC abi=" << ks_str("abi")
               << " bytes=" << ks_num("bytes")
@@ -638,6 +751,28 @@ static int self_test_rcvirtual_contract() {
     check("read_limit_sane", RC_VIRT_READ_MAX_BYTES >= 256 * 1024, "RC_VIRT_READ_MAX_BYTES=" + std::to_string(RC_VIRT_READ_MAX_BYTES));
     check("min_cave_sane", RC_VIRT_MIN_CAVE_BYTES >= 2048 && RC_VIRT_MIN_CAVE_BYTES <= 65536,
           "RC_VIRT_MIN_CAVE_BYTES=" + std::to_string(RC_VIRT_MIN_CAVE_BYTES));
+
+    // ⑨c enabled=false ⇒ reason 必须非空（防"静默跳过"；task-8 第二项）。
+    //    512KB 读取上限是**运行期**安全闸（init 打开 rc 时才知道真实大小，patch 期无从得知），
+    //    它不可能出现在 patch 期 report 里；但它属于同一类"降级要用显式原因说话"的语义，
+    //    故此处把 patch 期可判定的部分锁死：任何 enabled=false 的组合都不得留下空 reason。
+    check("reason_off_nonempty",
+          !launcher_reason_effective("off", false, "").empty());
+    check("reason_off_explicit",
+          launcher_reason_effective("off", false, "").find("disabled_by_default") != std::string::npos);
+    check("reason_rc_not_embedded_nonempty",
+          !launcher_reason_effective("rc", false, "").empty());
+    check("reason_preserves_precheck_text",   // precheck/weave 已填的原因必须原样保留
+          launcher_reason_effective("rc", false, "symbol missing: strcmp") == "symbol missing: strcmp");
+    // ★ 负样本：若把"空 reason"当合法（即 launcher_reason_effective 直接返回空串），
+    //   上面三条正向断言必须能把它照出来 —— 这里显式断言"空串不是合法结果"，
+    //   否则本组断言在实现退化成 return reason 时仍会 PASS（空断言）。
+    check("neg_empty_reason_rejected",
+          launcher_reason_effective("off", false, "") != "" &&
+          launcher_reason_effective("rc", false, "") != "");
+    // 已织入（enabled=true）时不得凭空编造理由（保持空串语义，由 shellcode_bytes 等字段自证）
+    check("reason_enabled_untouched",
+          launcher_reason_effective("rc", true, "").empty());
 
     // ⑩ 组数矩阵（默认 off 不变；rc on 时 +1）
     check("groups_off_61", hook_groups_expected_count(true, false, false) == 14);

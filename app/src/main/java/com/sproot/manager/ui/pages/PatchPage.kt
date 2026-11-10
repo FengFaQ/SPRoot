@@ -120,7 +120,12 @@ fun PatchPager(
                 android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
             )
         }
-        PatchPipeline.selectInput(uri, queryDisplayName(context, uri))
+        // DISPLAY_NAME 要从 DocumentsProvider 取（跨进程 IPC，慢 provider 可达数秒 → 主线程会 ANR）。
+        // 用后台线程（与本文件其它异步动作一致），保证用户选完文件立刻返回也不会丢选择。
+        Thread {
+            val name = queryDisplayName(context, uri)
+            PatchPipeline.selectInput(uri, name)
+        }.start()
     }
     val initBootPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         if (uri == null) {
@@ -133,7 +138,10 @@ fun PatchPager(
                 android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
             )
         }
-        PatchPipeline.selectInitBootInput(uri, queryDisplayName(context, uri))
+        Thread {
+            val name = queryDisplayName(context, uri)
+            PatchPipeline.selectInitBootInput(uri, name)
+        }.start()
     }
 
     ConfirmDialog(
@@ -500,6 +508,13 @@ private fun LogExportLine() {
     )
 }
 
+/**
+ * 读取 DocumentsProvider 的 DISPLAY_NAME。
+ *
+ * ⚠️ **必须在后台线程调用**：`contentResolver.query` 是跨进程 IPC，慢 provider（云盘/网盘
+ * 的 DocumentsProvider）响应可长达数秒，在主线程调用会直接 ANR。两个 picker 回调里都用
+ * `Thread { … }.start()` 调用它。
+ */
 private fun queryDisplayName(context: Context, uri: Uri): String? {
     return runCatching {
         context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->

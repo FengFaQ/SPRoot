@@ -85,7 +85,7 @@
 └───────────────▲──────────────────────────────┘
                 │ init（原厂，未修改）按注入 rc 拉起
 ┌───────────────┴──────────────────────────────┐
-│ SK 修补内核（五 hook，零常驻，零事件）        │
+│ SK 修补内核（五类 hook，实际织入 11/14 组，零常驻，零事件）│
 │  do_execve 提权 / filldir 隐藏 / avc_denied  │
 └──────────────────────────────────────────────┘
 ```
@@ -412,11 +412,26 @@ service sproot-apd /data/adb/apd --superkey-file /data/adb/sproot/key daemon
 
 **既有 `init.rc` 末尾文本级追加一行**：`import /init.sproot.rc`（magiskboot `cpio add`；不依赖 kptools embed-extra——SK 无开机解压运行时，时序稿 §3.4 已定）。
 
+#### 5.1′ 备选交付路径：C′ rc 虚拟化（`--launcher rc`，2026-11-10 补写）
+
+> **本节为此前缺失的补写**：C′ 是 2026-11-10 落地的头号架构简化项（`docs/ARCHIVE-2026-11-10.md` §2.3），但本文与 NEW-DOC-01 此前零记载、仍按「RcInject 必做」叙述。**以代码为准**：`engine/src/patch_rc_virtualize.{h,cpp}`、`engine/src/skroot_patch_main.cpp`。
+
+**机制**（clean-room 实现）：hook `__arm64_sys_openat`（双过滤 `uid==0` + `O_RDONLY`）→ 原地把 init 要读的 rc 路径覆写为 `/dev/user_init.rc`（19 B）→ init 读到「原 rc 原文 + 我们的追加段」，**根本不需要改 ramdisk**。
+
+| 维度 | 结论 |
+|---|---|
+| 默认值 | **`--launcher off`（默认）**；off 时产物与旧引擎**逐字节相同**，`hook_groups_expected` 不变 |
+| 组数联动 | `hook_groups_expected_count(ge61, huawei, launcher_rc)` 三参：off → 14/11（+huawei 15/12）；on → 15/12（+huawei 16/13）（`patch_pipeline.h:58-61`） |
+| 失败语义 | 显式 `--launcher rc` 但前置不满足（符号缺失/无洞/洞非法）→ **E202 且不产出 `--out`**，绝不静默降级（`skroot_patch_main.cpp:1069-1071`）；`--launcher umh` 未实现 → E101（`:882-891`） |
+| 对本文的自启链影响 | **开启后可退役整条 init_boot 修补链**（unpack/repack/T-12/AVB），启动时序不变——rc 内容仍是 `apd/assets/init.sproot.rc` 语义，只是送达方式从「写 ramdisk」改为「运行期路径替换」 |
+| 当前状态 | **未验证**：真机 5 项（`/dev` 时机、PAN/UAO、SELinux、init 解析拼接、开机稳定性）**尚未跑**（ARCHIVE §5 P0）；静态断言覆盖不到。**真机窗口关闭前不得宣称可用**，本文仍以 §5.1 的 RcInject 为默认路径 |
+
 **AVB / 分区约束（2026-11-08 AVB 专项结论，三家方案一致：不碰 AVB 密码学）**：
 1. **禁止任何 vbmeta/AVB 操作**：不改 `vbmeta.img`、不加 `--disable-verification`、不改 AVB 元数据。仅依赖「已解锁 bootloader 跳过验证」这一前提。
 2. **刷入链**：`fastboot flash boot`（双槽 `--slot=all`）+ `reboot`；**不得**出现 `fastboot flash vbmeta` / `fastboot --disable-verification`（后者还会清数据，必须禁用）。
 3. **rc 注入目标与尺寸**：优先 `init_boot`（有则用 init_boot，其次 boot 的 ramdisk）；rc 注入会改变 ramdisk cpio 大小 → **必须按目标分区大小补齐**（`init_boot` = 8388608 字节），保证镜像长度与分区一致，避免 AVB/分区校验与刷入异常。
-4. **审计证据**：`deploy` 在 `state.json` 写入 `"avb": "vbmeta_untouched"`；`apd selftest` 的 `avb_untouched` 检查项供 qa 自动断言「部署过程从未触碰 vbmeta」。
+4. **审计证据**：`deploy` 在 `state.json` 写入**实测三态** `avb` 字段（`AvbObservation::code()`，`apd/src/deploy.rs:546-554`）：`"avb_ok"`（定位到 footer 且已摘要 vbmeta 区）/ `"avb_no_footer"`（该分区**没有** AVB footer，属合法设备态但**不构成 PASS**）/ `"avb_unobservable"`（读不到分区，**unknown ≠ pass**）；配套记录 `avb_footer_sha256` / `avb_vbmeta_sha256` / `avb_source` / `avb_partition_bytes`。`apd selftest` 的 `avb_untouched` 检查项由 `avb_verdict()`（`apd/src/selftest.rs:273-`）做「部署时记录值 vs 现场重测」比对，**只有 `avb_ok` 且两侧 footer+vbmeta 摘要相同才 `ok`**，其余一律 `unknown` 或 `critical fail`。
+   > **2026-11-10 修订（本条曾有自指哨兵，属假安全）**：原文写「写入 `"avb": "vbmeta_untouched"`，selftest 据此断言」——这是**写入一个常量再把同一个常量读回来比对**的恒真断言（`selftest.rs:774`、`defs.rs:68` 均有此教训记载）。现改为**可证伪的实测比对**：footer 消失 / vbmeta 摘要变化 / 分区尺寸变化 / footer 凭空出现 → 一律 fail。**注意 CI marker 名仍沿用 `vbmeta_untouched` 字符串（见 §7 的 marker 说明），但它是检查项标签，不是 state 值**。
 
 **为什么 services/boot-completed 不各占一个 rc 触发器**：
 1. 厂商 `init.rc` 结构差异大，rc 钩子越少越稳（时序稿 §3.4 实测门禁项）；
@@ -481,26 +496,31 @@ apd --superkey-file /data/adb/sproot/key daemon
 
 ### 6.2 `apd deploy` 清单（原子、幂等、可校验）
 
+> **2026-11-10 修订：本清单实为 10 步（原写 9 步）**。步数以 `apd/src/deploy.rs` 的运行时日志为准（`:87-133`，逐条打印 `[deploy] step N/10: …`）；旧文把「rc 审计副本」并入 key 步、「socket 名」并入 state 步，导致编号与实际不符。下表按代码 1:1 对齐。
+
 按顺序执行，每步失败即中止并保留日志；已存在且校验通过则跳过（幂等）：
 
 | # | 动作 | 校验 |
 |---|---|---|
-| 1 | `mkdir -p /data/adb/{ap/{bin,log,module_configs},sproot,modules,modules_update}`，权限 0700/0755 | 存在性 + mode |
-| 2 | 复制 `libapd.so` → `/data/adb/apd`（0755） | **sha256 与源一致**；并校验 `apd-version.txt`（见 §6.2 版本一致性检查） |
+| 1 | `mkdir -p /data/adb/{ap/{bin,log,module_configs},sproot,modules,modules_update}`，权限 0700/0755（`ensure_layout()`） | 存在性 + mode |
+| 2 | 复制 `libapd.so` → `/data/adb/apd`（0755）（`install_file`） | **sha256 与源一致**；并校验 `apd-version.txt`（见下「版本一致性检查」） |
 | 3 | 复制 `libbusybox.so` → `/data/adb/ap/bin/busybox`（0755） | sha256 |
-| 4 | `ln -sfn /data/adb/apd /data/adb/ap/bin/{resetprop,magiskpolicy}` | `readlink` 目标 |
-| 5 | 从临时 key 文件读密钥 → 写 `/data/adb/sproot/key`（47 字节纯文本、无 NUL；0600 root；tmp+fsync+rename 原子写，幂等）+ 写 rc 审计副本 `/data/adb/sproot/init.sproot.rc`（0644） | `mode=0600`、`len=47`、无 NUL；写入失败 → deploy 明确失败 |
-| 6 | **install_su 等价**：`key16 = key[0:16]`；`mkdir /data/<key16>`（0700，label 伪装）→ 复制 AP 副本为 `<随机16字符>`（0700）→ `ln -sfn <隐藏路径> /data/adb/ap/bin/su` | 隐藏文件可执行；`exec -a su` 冒烟 |
-| 7 | 初始化 `/data/adb/ap/allow_list`（表头 + 空）+ `.lock`（0600） | 可被 daemon 解析 |
-| 8 | 写 `/data/adb/sproot/state.json`（版本、**build commit**、部署时间、隐藏文件名、**`avb: vbmeta_untouched` 审计位**——**不含密钥任何片段**）+ 清空 `boot_count` + 写抽象 socket 名 `/data/adb/ap/bin/.su.sock`（0644，名字不含密钥） | JSON 可解析；socket 名可被客户端读取；AVB 审计位存在 |
-| 9 | 冒烟：`/data/adb/apd version --json`（以 root）+ `su -c id`（经 root-exec） | exit 0 |
+| 4 | `ensure_symlink(/data/adb/apd → /data/adb/ap/bin/{resetprop,magiskpolicy})` | `readlink` 目标 |
+| 5 | **key file**：从临时 key 文件读密钥 → 写 `/data/adb/sproot/key`（**47 字节纯文本、无 NUL**；0600 root；tmp+fsync+rename 原子写，幂等；各分支擦内存副本） | `mode=0600`、`len=47`、无 NUL；写入失败 → deploy 明确失败（`?` 直接中止，绝不「假装成功」） |
+| 6 | **rc audit copy**：写 `/data/adb/sproot/init.sproot.rc`（0644，审计副本，与 ramdisk 内 `/init.sproot.rc` 同源） | 文件存在且与模板 sha256 一致 |
+| 7 | **install_su 等价**：`key16 = key[0:16]`；`mkdir /data/<key16>`（0700，label 伪装）→ 复制 AP 副本为 `<随机16字符>`（0700）→ `ln -sfn <隐藏路径> /data/adb/ap/bin/su` | 隐藏文件可执行；`exec -a su` 冒烟 |
+| 8 | 初始化 `/data/adb/ap/allow_list`（表头 + 空）+ `.lock`（0600）+ 生成/保持抽象 socket 名 `/data/adb/ap/bin/.su.sock`（0644，名字不含密钥，幂等以免打断已运行 daemon） | 可被 daemon 解析；socket 名可被客户端读取 |
+| 9 | 写 `/data/adb/sproot/state.json`（版本、**build commit**、部署时间、隐藏文件名、**`avb` 实测三态审计位**（`avb_ok`/`avb_no_footer`/`avb_unobservable`）+ `avb_footer_sha256`/`avb_vbmeta_sha256`/`avb_source`/`avb_partition_bytes`——**不含密钥任何片段**）+ 清空 `boot_count` | JSON 可解析；`avb` ∈ {`avb_ok`,`avb_no_footer`,`avb_unobservable`}（**不得是常量哨兵**） |
+| 10 | 冒烟：`/data/adb/apd version --json`（以 root）+ `su -c id`（经 root-exec）（`smoke_check`） | exit 0 |
+
+> **⚠️ 已知缺口（与 `docs/ARCHIVE-2026-11-10.md` §3.2/§5 的 P0 同源）**：代码 step 4 只建 `resetprop`/`magiskpolicy` 两个符号链接，**未把 `apd` 放进 `/data/adb/ap/bin/`**，导致 NeoZygisk 侧 `Command::new("apd")` 找不到 → `RootImpl::None` → Zygisk 链静默失效。以 ARCHIVE 记录为准，此项仍待修（2026-11-10 时点）。
 
 **版本一致性检查（APK 内 libapd.so ↔ /data/adb/apd，2026-11-08 lead 要求）**：
 1. 客户端 CI 从 apd 工作流拉取**固定命名 artifact** `apd-aarch64-latest`（含 `libapd-arm64.so` + `apd-version.txt`，字段：`commit / version / sha256 / size_bytes / run_id`），打进 APK `jniLibs/arm64-v8a/libapd.so`；
 2. 管理器调 `apd version --json` 读已部署二进制的 `commit`（由 `build.rs` 编译期注入 `VERSION_COMMIT`），与 APK 内置 `apd-version.txt.commit` 比对；
 3. 不一致 → 管理器提示「需重新部署」并允许 `deploy` 覆盖（`deploy` 幂等，写入的 `state.json` 同样带 `commit`）；**禁止**静默用旧二进制提供 root-exec（行为差异会导致授权/部署语义漂移）。
 
-**失败回滚（T2 内）**：deploy 整体是「先写临时目录 → rename 就位」的两段式；第 2~8 步任一步失败 → 删除已就位物（只删本步清单内文件，不碰 `/data/adb/modules` 用户数据）→ 状态仍为未部署，可重试。
+**失败回滚（T2 内）**：deploy 整体是「先写临时目录 → rename 就位」的两段式；**第 2~9 步**任一步失败 → 删除已就位物（只删本步清单内文件，不碰 `/data/adb/modules` 用户数据）→ 状态仍为未部署，可重试。（2026-11-10 修订：原写「第 2~8 步」，随 10 步清单对齐；step 10 是只读冒烟，无需回滚物。）
 
 ### 6.3 回滚矩阵
 
@@ -563,7 +583,7 @@ apd --superkey-file /data/adb/sproot/key daemon
 | `-Z` 真 setcon | ✅ | 新模块 `selinux.rs`：不依赖 libselinux，`open/write/close` 写 `/proc/self/attr/current`（async-signal-safe，可入 `pre_exec`）；`root-exec --scontext` 在 drop uid **之前**切换；`su -Z` 真实切换（失败仅告警，保留原 context） |
 | daemon `--selftest` / `selftest` 子命令 | ✅ | 新模块 `selftest.rs`：检查 root/binary/key_file(0600/47-48/mlocked)/allow_list/hidden_su(0700)/目录权限/daemon pid/socket 探活/bootstate/version 一致性/**AVB 审计**；`--json` 供 App 与 qa；exit 0/1 |
 | 体积再瘦身 | ✅ 已改（数值待 CI） | `opt-level = "z"`（原 3）；`env_logger` 移出 Android 构建（`cfg(not(target_os="android"))`）；上一轮已删 goblin/scroll/adb_client（2.11MB→1.35MB） |
-| AVB 审计字段 | ✅ | `deploy` 的 `state.json` 增 `avb: "vbmeta_untouched"` + `commit`；`selftest` 断言；部署/卸载代码**零** vbmeta 操作（grep 证实） |
+| AVB 审计字段 | ✅ | `deploy` 的 `state.json` 增**实测三态** `avb`（`avb_ok`/`avb_no_footer`/`avb_unobservable`，`apd/src/deploy.rs:546-554`）+ 四个观测字段（`avb_footer_sha256`/`avb_vbmeta_sha256`/`avb_source`/`avb_partition_bytes`）+ `commit`；`selftest::avb_verdict()` 做「记录值 vs 现场重测」的**可证伪**比对；部署/卸载代码**零** vbmeta 写操作（grep 证实）。**2026-11-10 修订**：原写常量哨兵 `avb: "vbmeta_untouched"`，与写入后读回自身的恒真断言同源，已废弃 |
 | 许可合规（AGPL-3.0） | ✅ | `Cargo.toml` 增 `license = "AGPL-3.0-only"`；**移除 GPL-2.0-only 的 `extattr`**（与 AGPL 不兼容）→ raw `libc` `lsetxattr/lgetxattr` 等价替换；`apd/THIRD_PARTY_LICENSES.md` 全量清单（115 包）。`prop-rs`/`prop-rs-android` 为 **UNKNOWN 许可（发布阻断项）** → 按 lead 裁决**不删 resetprop**，改为 **feature 隔离**：`default = ["resetprop"]`，两个 crate `optional = true`；`--no-default-features` 产出**许可干净构建**（resetprop 返回明确错误） |
 | 许可干净构建路径 | ✅ | `apd/Cargo.toml` `[features] default=["resetprop"]`；`apd.yml` 新增 "Clean build check (no default features)"（`cargo check --locked --no-default-features --target aarch64-linux-android`）；capability 断言中 `resetprop` 标为**条件性**（缺省不判失败） |
 | 体积实测（CI） | ✅ | `libapd.so` = **2,054,408 B**（run 42488946176）；`llvm-size -A`：.text 1,234,160 / .rodata 335,176 / .eh_frame 240,768 / .rela.dyn 82,992；capability 断言 15/15 OK |
@@ -585,7 +605,9 @@ apd --superkey-file /data/adb/sproot/key daemon
 2. `src/` 24 个模块齐全（daemon/deploy/bootstate/secret/selinux/selftest/root-exec 路径等）。
 3. CLI help 14 个子命令：module/post-fs-data/services/boot-completed/uid-listener/daemon/deploy/undeploy/root-exec/auth/version/selftest/resetprop/sepolicy。
 4. `selftest` 16 个检查项含 `key_file.mlocked` 与 `avb_untouched`；undeployed/deployed 两阶段语义。
-5. CI 新增 **capability marker 断言**：二进制内必须存在 `daemon/deploy/undeploy/root-exec/selftest/auth/version/vbmeta_untouched/SPROOT_REQUEST_UID//proc/self/attr/current/sproot-/allow_list/boot_count/safemode/module` 等静态标记，缺一即 CI 失败（本轮起生效）。
+5. CI 新增 **capability marker 断言**：二进制内必须存在静态标记，缺一即 CI 失败（本轮起生效）。**当前列表（以 `.github/workflows/apd.yml:167-171` 为准，共 15 项）**：`daemon` `deploy` `undeploy` `root-exec` `selftest` `auth` `version` **`vbmeta_untouched`** `SPROOT_REQUEST_UID` `/proc/self/attr/current` `sproot-` `allow_list` `boot_count` `safemode` `module`；条件性 marker：`resetprop`（`--no-default-features` 构建缺省不判失败，`apd.yml:174`）。
+   > **⚠️ 2026-11-10 发现（已知会红的门禁，需 ci-dev 处置）**：`vbmeta_untouched` 这个 marker **已失效** —— 该字面量已从生产代码中移除（state 改为实测三态 `avb_ok`/`avb_no_footer`/`avb_unobservable`，`apd/src/deploy.rs:546-554`），现仅残留在注释与 `#[cfg(test)]` 中（`selftest.rs:1045` 位于 `mod tests`，不进 release 二进制），**注释不参与编译**。因此 `grep -aq "vbmeta_untouched" libapd.so` 预期 MISS → `apd.yml:182-184` 直接 `exit 1`。
+   > **建议替换**（文档先记录，实际改由 ci-dev 在 `apd.yml` 执行）：把 `vbmeta_untouched` 换成三个实测码 `avb_ok` `avb_no_footer` `avb_unobservable`（均为生产字面量），marker 总数 15 → 17。**在 ci-dev 落地前，本门禁处于「预期红」状态**，不要把它当作代码回归。
 6. 全程 `--locked` 编译（本地 `cargo check` + CI `cargo build --release --locked`）。
 
 ---
@@ -624,7 +646,11 @@ apd --superkey-file /data/adb/sproot/key daemon
 7. **契约一致性**：E1–E5 在契约 v1.1 中已修订或明确接受（会签记录）。
 8. **版本一致性**：APK 内置 libapd.so 的 commit 与 `/data/adb/apd` 的 `version --json.commit` 一致；不一致时 UI 有明确「重新部署」提示。
 9. **自检可用**：`apd selftest --json` 在健康部署上返回 `ok=true`、全 critical 项通过；删除 key/隐藏 su 后对应 critical 项失败且 exit 1。
-10. **AVB 未被触碰**：`state.json.avb == "vbmeta_untouched"`；刷入链无任何 vbmeta 命令；rc 注入产物按分区大小补齐（init_boot 8388608）。
+10. **AVB 未被触碰**（**2026-11-10 修订：验收判据改为三态，原「`state.json.avb == "vbmeta_untouched"`」在新代码下必然失败**）：`state.json.avb` ∈ {`avb_ok`, `avb_no_footer`, `avb_unobservable`}，且：
+    - **判 PASS 的唯一条件**是 `avb` == `avb_ok` **且** `apd selftest --json` 的 `avb_untouched` 检查项 `ok=true`（含义：deploy 时测到 footer 并记下 `avb_footer_sha256`/`avb_vbmeta_sha256`，现场重测两者一致且分区尺寸未变）。
+    - `avb_no_footer` / `avb_unobservable` **不是 PASS 也不是 FAIL**，必须显式呈现为 **`unknown`**（`selftest.rs:277` 的 `NO_PASS` 文案「unknown — cannot be verified, NOT a pass」），并在报告里带 `avb_source`/`avb_partition_bytes` 便于定位。
+    - **FAIL（critical）**：记录 `avb_ok` 而现场无 footer（分区被重写）、两侧摘要不一致（vbmeta 被动过）、分区尺寸变化、或 footer 凭空出现。
+    - 刷入链无任何 vbmeta 命令；rc 注入产物按分区大小补齐（init_boot 8388608）。
 11. **密钥无残留**：`selftest` 的 `key_file.mlocked=true`；进程退出后 `/proc/<pid>/cmdline`/日志中无密钥原文或前缀。
 
 ---

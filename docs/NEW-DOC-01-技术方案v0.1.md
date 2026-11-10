@@ -1,7 +1,7 @@
 ﻿# 全新 SP 管理器技术方案 v0.1（NEW-DOC-01）
 
 - 文档编号：NEW-DOC-01
-- 版本：**v1.1.3（定稿）**（新增 §3.7「客户端已实现能力清单（v2 实况）」+ §8.2 按实况修正为 5 个工作流 + 7 项设计/实现差异）
+- 版本：**v1.1.3（定稿）**（新增 §3.7「客户端已实现能力清单（v2 实况）」+ §8.2 按实况修正为 6 个工作流（2026-11-10 修订：原写「5 个」）+ 7 项设计/实现差异）
 - 作者：架构（architect）
 - 状态：**定稿 v1.1.3｜供实现与质测引用**
 - 项目重大转向：**放弃「改造 APatch 管理器 APK」路线，从零实现全新 SP 管理器；内核修补全程在安卓手机本地完成（不经 PC/云端）**
@@ -56,7 +56,8 @@
 ### 1.2 非目标（v0.1）
 
 - **不做 PC/云端修补**：无桌面端、无在线修补服务、无远程密钥协商。
-- **不改 SK 内核机制**：五组 hook、48 位密钥、SELinux 零触碰（A1 §8）原样继承，管理器只做「调用方」。
+- **不改 SK 内核机制**：五类 hook 函数、48 位密钥、SELinux 零触碰（A1 §8）原样继承，管理器只做「调用方」。
+  > 术语订正（2026-11-10）：「五」指的是**五类 hook 函数/机制**（提权 do_execve / 隐藏 filldir / SELinux avc+audit / CFI+DRM 兼容 / 密钥内嵌），**不是织入的 hook 组数**。实际织入组数由内核版本决定：**≥6.1 基 14 组、<6.1 基 11 组，+huawei_bypass 符号存在再 +1，显式 `--launcher rc` 再 +1**（唯一来源 `engine/src/patch_pipeline.h:52-62`）。
 - **不实现内核级授权表**：按 CALL §3.2 裁决，授权表是 AP 用户态文件，管理器只做 UI 展示与审计。
 - **不做 KPM 内核模块运行时**：SK 无 KP 内核运行时，KPM 能力无载体（A1 §1）；模块页只保留 APM（apd 模块）语义。
 - **不覆盖 32 位设备**：SK 引擎与 AP 链均只 arm64（APL §2.2 层 2 提到 32 位 App 明确不支持）。
@@ -305,7 +306,7 @@ init（原厂）import init.sproot.rc（管理器在步 7 注入）
 
 | 接口 | 用途 | 调用形态 | 备注 |
 |---|---|---|---|
-| `apd version --json` | 探测部署状态/版本/内核修补状态 | 普通进程执行（无需 root） | 替代旧 `-V` 字符串；返回 `{apd_version, deployed, key_present, kernel_patched?}` |
+| `apd version --json` | 探测部署状态/版本/内核修补状态 | 普通进程执行（无需 root） | 替代旧 `-V` 字符串；实际字段（以 `apd/src/cli.rs:755-765` 为准）：`version` / `version_code` / `commit` / `deployed` / `key_prefix_sha256` / `daemon_pid` / `boot_stage_done` / `deployed_at` / `hidden_file`。**2026-11-10 修订**：原文写的 `apd_version`/`key_present`/`kernel_patched?` 三个字段代码里**不存在**（`apd_version`→`version`；`key_present` 由 `key_prefix_sha256 != null` 表达；内核是否已修补要看 `deployed`+`boot_stage_done`，无独立布尔字段） |
 | `apd deploy --source <nativeLibDir> --superkey-file <tmp>` | **T2 首启自举**（安装 AP/busybox/key/隐藏 su/空授权表） | 普通进程启动 → AP 自提权 → 执行清单 | 幂等；替代已取消的独立部署器（E5） |
 | `apd root-exec --superkey-file <tmp> [--uid N] -- <cmd>` | **管理器唯一 root 入口** | 普通进程启动 → AP 自提权 → exec 目标命令 | 透传 stdout/stderr/exit code；管理器不解析内部实现 |
 | `apd auth list/grant/revoke/exclude/unexclude` | 授权表 UI | 经 `root-exec` 调用（或 AP 内部直调） | 真值 = `/data/adb/ap/allow_list` 单文件（E4） |
@@ -423,9 +424,9 @@ data class AppState(
 | D2 | §5.4.2 PatchMode **四模式全开** | 实为 **2 可用 + 2 预留**（RESTORE/UNINSTALL `enabled=false`） | 与「导出与刷入分离」原则一致；直刷模式待 AP 部署链打通后开放（task-5） |
 | D3 | §3.6 **12 态双轴状态机** | 客户端用 `PatchUiState` + `InstallState` + `ApdSelfTest.stage` 组合表达，**未落显式 12 态枚举** | task-4 后续收敛为单一 `deriveCapabilities(state)`（避免散落条件判断） |
 | D4 | §5.2.1 `nativeSelftest()` | 引擎侧仅实现 `engineVersion()`；自检以 `Capabilities`+`Elf` 断言替代 | 可选：引擎补 `nativeSelftest`；当前替代方案已满足「缺件即阻断」 |
-| D5 | §8.2 设计态 **6 工作流** | 实际 **5 个**（`apk/engine/apd/licenses/release`）；无 `ci-static`、无独立 `magiskboot.yml` | 文档已改（§8.2）；静态检查是缺口（D7），magiskboot 并入 `native.lock` |
+| D5 | §8.2 设计态 **6 工作流** | ~~实际 5 个（`apk/engine/apd/licenses/release`），无 `ci-static`~~ **→ 2026-11-10 复核：实为 6 个**（`apk/apd/ci-static/engine/licenses/release`）；仍无独立 `magiskboot.yml` | 文档已改（§8.2，2026-11-10 再修订）；`magiskboot` 并入 `native.lock` |
 | D6 | §5.4.1 **AVB 硬断言（等长+区段 diff）** | 客户端目前仅做「AVB footer 存在性前后对比 + 不修改」日志（`PatchPipeline.kt:465-469`）+ 等长/sha256 | task-5 补「AVB 区段逐字节 diff」硬门禁（PKG-2/AVB-2） |
-| D7 | §8.1 G2「本地只做静态检查」 | **无 `ci-static` 工作流**（ktlint/detekt/clippy 未在 CI 强制） | task-8 补最小静态检查 job（低成本、高收益） |
+| D7 | §8.1 G2「本地只做静态检查」 | ~~**无 `ci-static` 工作流**~~ **→ 2026-11-10 复核：`ci-static.yml` 已存在**（D7 由 `44290e1` 补齐，见 `docs/HANDOFF-2026-11-08.md` §6.5-D7） | ✅ 已闭环；剩余子项仅是 ktlint/detekt/clippy 尚未纳入 CI 强制 |
 
 #### 3.7.3 验证方式（可直接复用）
 
@@ -739,7 +740,7 @@ magiskboot repack work/boot.img work/new-boot.img
 > 「引擎 patch kernel 段（SK shellcode）；**同一流水线的 RcInject 步骤**向 ramdisk 写入 `init.sproot.rc` + `init.rc` import 行。二者是流水线两个独立步骤，SK 内核运行时零 ramdisk 依赖。」
 
 落地约束（lead 明确，写死）：
-1. **SK 内核运行时**只依赖 kernel Image 内的五 hook/密钥，**不依赖 ramdisk 任何内容**——这点比 KSU 简单（KSU 需改 `init`→`init.real`）。
+1. **SK 内核运行时**只依赖 kernel Image 内的五类 hook/密钥（实际织入 11 或 14 组，见 §1.2 术语订正），**不依赖 ramdisk 任何内容**——这点比 KSU 简单（KSU 需改 `init`→`init.real`）。
 2. 我们是**安装器**：在修补流水线内改 ramdisk 是允许且必要的（KSU 同样改 init）。
 3. **隐藏性约束**：ramdisk **只加 2 个文件**（`init.sproot.rc` + 一行 `import` 追加），**不碰 SELinux policy、不改 AVB 逻辑**；AVB 只按 §5.4.1 的显式策略处理。
 4. **RcInject 目标（D-12 裁决）**：本机存在 `init_boot.img`（8MB，ramdisk 形态）→ **优先注入 init_boot 的 ramdisk**（Android 13+ 通用 ramdisk 在 init_boot）；`boot.img` 的 ramdisk 作为回退；**实现中两者都探测并在 manifest 记录实际目标**。
@@ -814,8 +815,8 @@ magiskboot repack work/boot.img work/new-boot.img
 | **3 Unpack** | 拆镜像 + **解压归一**（magiskboot 主路径，自研 bootimg 交叉校验） | `magiskboot unpack work/boot.img` → `kernel`、`ramdisk.cpio`（若有）、`dtb*`；自研 bootimg 独立解析同一镜像做交叉校验（段 offset+size 必须一致）；判断 `kernel` 是否已解压裸 Image：压缩魔数（`1f 8b` gzip / `04 22 4d 18` lz4）→ 解压为 `kernel.raw` 并**记录原压缩类型与参数** | `[E-IMG-06] 镜像格式无法解析（%s）`；`[E-IMG-07] 内核压缩格式不支持（%s）`；magiskboot 失败 → 自动回退自研 bootimg（置 `fallback_used=true`） |
 | **4 Inspect** | 前置校验（APL §2.3-1 教训） | 引擎 `nativeInspect`：①必含 `CONFIG_KALLSYMS=y`；②`patched=false`（已修补则拒）；③内核版本落在引擎支持域（3.10~6.18，A1）；④记录 sha256 与大小 | 每项具名错误：`[E-IMG-08] 内核未开启 CONFIG_KALLSYMS`、`[E-IMG-09] 该镜像已被修补，请使用原厂 boot.img`、`[E-IMG-10] 内核版本 %s 不支持` |
 | **5 Patch** | 调 SK 引擎（**JNI 进程内**） | `nativeRunPatch(in = work/kernel.raw, out = work/kernel.patched, key = K \| null(gen), json = work/p.ndjson)`；进度回调 + NDJSON 双写；引擎内部仍按 C1 落 `report.json` | 退出码→中文映射（§5.5）；**同时**校验 C1 §3 铁律：rc≠0 时 `kernel.patched` 必须不存在（若存在 → `E-ENG-11` 引擎违约并删除） |
-| **6 Verify** | 产物断言（C1 §4 + RC §5.1-[5]） | ① `size(out)==size(in)`；② `sha256(out)!=sha256(in)`；③ out 内存在 48B 窗口 == `key[0:47]+NUL`；④ `report.hook_table` 含 5 个 hook 且地址非 0；⑤ `report.hidden_dir_prefix == key[0:16]`；⑥ `report.root_key == 传入 key`（防「刷了别人的 key」）；⑦ 引擎回读 `patched=true`（若引擎提供该能力，否则记 `skipped`） | 任一失败 → `[E-VER-12] 产物校验失败：<断言名>`，**删除产物、不导出、不回写**，保留 workdir |
-| **7 RcInject**（**必做**，D-14 解读 A） | ramdisk rc 注入（magiskboot cpio）；**目标优先 `init_boot` 的 ramdisk，`boot.img` ramdisk 回退**（D-12） | `magiskboot cpio ramdisk.cpio "add 0644 init.sproot.rc …"` + extract/追加 `import /init.sproot.rc`/add 回写；断言：cpio 内可见 `/init.sproot.rc` 且 `init.rc` 尾部含该行；原 `init.rc` 备份进 manifest；**只动这 2 个文件，不碰 policy/AVB** | `[E-RC-17] rc 注入失败`；`[E-RC-18] 目标分区无 ramdisk 或 init.rc 结构不支持` → 按 D-12 回退另一分区；仍失败则报「该机型暂不支持 AP 自启」，内核 patch 仍可导出（UI 明示模块需手动启动） |
+| **6 Verify** | 产物断言（C1 §4 + RC §5.1-[5]） | ① `size(out)==size(in)`；② `sha256(out)!=sha256(in)`；③ out 内存在 48B 窗口 == `key[0:47]+NUL`；④ `report.hook_groups_count == report.hook_groups_expected`（**严格等值**，期望值 = ≥6.1 基 14 / <6.1 基 11，+huawei +1、+`--launcher rc` +1，唯一来源 `engine/src/patch_pipeline.h:52-62`；⑤ `report.hidden_dir_prefix == key[0:16]`；⑥ `report.root_key == 传入 key`（防「刷了别人的 key」）；⑦ 引擎回读 `patched=true`（若引擎提供该能力，否则记 `skipped`） | 任一失败 → `[E-VER-12] 产物校验失败：<断言名>`，**删除产物、不导出、不回写**，保留 workdir |
+| **7 RcInject**（**默认必做**，D-14 解读 A；C′ `--launcher rc` 为备选路径，见 §5.4.3） | ramdisk rc 注入（magiskboot cpio）；**目标优先 `init_boot` 的 ramdisk，`boot.img` ramdisk 回退**（D-12） | `magiskboot cpio ramdisk.cpio "add 0644 init.sproot.rc …"` + extract/追加 `import /init.sproot.rc`/add 回写；断言：cpio 内可见 `/init.sproot.rc` 且 `init.rc` 尾部含该行；原 `init.rc` 备份进 manifest；**只动这 2 个文件，不碰 policy/AVB** | `[E-RC-17] rc 注入失败`；`[E-RC-18] 目标分区无 ramdisk 或 init.rc 结构不支持` → 按 D-12 回退另一分区；仍失败则报「该机型暂不支持 AP 自启」，内核 patch 仍可导出（UI 明示模块需手动启动） |
 | **8 Repack+Deliver** | 重打包与交付（成功判据=可验证事实） | `magiskboot repack work/boot.img work/new-boot.img`（**原图作模板**）+ 自研 bootimg 交叉校验（§5.3.1 PKG-1~PKG-5）；断言（**全部必须通过**）：① 存在且头部魔数 `ANDROID!`；② **产物长度严格等于目标分区大小**（`boot`=100663296 B / `init_boot`=8388608 B，**不是「≤」**）；③ **AVB footer + 内嵌 vbmeta 区逐字节保留**（与原厂镜像对应区段 diff 为空）；④ `sha256` 与 manifest 一致；交付按 **PatchMode 四模式**（§5.4.2） | `[E-PKG-13] 重打包失败/产物头非法`；`[E-PKG-21] 交叉校验不一致`；`[E-AVB-19] AVB 区段被改动`；`[E-AVB-20] 产物长度与分区不符（期望 %d，实际 %d）`；`[E-DEL-14] 导出被取消`；`[E-FLS-15] 刷入失败（槽位 %s），已回滚`；`[E-FLS-16] 刷入后回读不一致，已尝试恢复备份` |
 
 #### 5.4.1 AVB 处理（**lead 2026-11-08 结论，已推翻 v0.5 旧路径**）
@@ -854,9 +855,11 @@ fastboot reboot
 | # | 断言 | 判定 |
 |---|---|---|
 | AVB-1 | `stat -c%s new boot.img == 100663296`（boot）/ `== 8388608`（init_boot） | 硬断言，不等即失败 |
-| AVB-2 | 原厂镜像与产物的 `[size-fixed_avb_tail, size)` 区段逐字节相等（footer + 内嵌 vbmeta） | 硬断言，diff 非空即失败 |
+| AVB-2 | 原厂镜像与产物的 **AVB 区段**逐字节相等：**AVBf footer（末 64 B）** + **内嵌 vbmeta 区 `[vbmeta_offset, vbmeta_offset+vbmeta_size)`**（`vbmeta_offset` 由 footer 第 12 字节起的大端 `>QQQ` 三元组给出，是**分区内绝对偏移**，不是「距文件尾的距离」） | 硬断言，diff 非空即失败 |
 | AVB-3 | 产物头部 `ANDROID!` 魔数正确、kernel/ramdisk 段可被引擎重新解包 | 硬断言 |
 | AVB-4 | 刷入命令文本中**不含** `vbmeta` / `disable-verification` / `disable-verity` | 静态检查（UI/文档/脚本） |
+
+> **⚠️ AVB-2 公式勘误（2026-11-10 修订，本条曾是有毒断言）**：早期版本写作「`[size-fixed_avb_tail, size)` 尾段逐字节相等」——该公式把 `vbmeta_offset` 误当「距文件尾的距离」，算出的区间落在**分区零填充区**，于任何产物上都恒成立，使 AVB-2 退化为**永远 PASS 的空断言（假安全）**。正解与 `quality/static/verify_patch.py::_avb_footer()/check_bootimg_diff()` 的 RB2/RB3 实现严格一致：`orig, voff, vsize = struct.unpack_from(">QQQ", t, 12)` 取绝对偏移，比对 `a[voff:voff+vsize] == b[voff:voff+vsize]`（魅族 21 实测 `vbmeta@33,898,496 == vbmeta_offset`）。记录见 `docs/HANDOFF-2026-11-08.md` §6.8 第 3 条。
 
 **实现要求**：① 步 2 记录原厂 boot/init_boot 的**精确字节长度与 AVB 区段偏移**；② 步 8 以「等长 + AVB 区段清零 diff」为硬门禁；③ UI 交付前展示「仅刷 boot、禁止 vbmeta 操作」的一键复制指令；④ 回滚路径见 §5.6-③。
 
@@ -878,6 +881,35 @@ fastboot reboot
 **日志落盘要求（RC F5）**：`filesDir/logs/patch-<yyyyMMdd-HHmmss>.log`，内容含：机型/内核/系统版本、每步参数与环境（脱敏：密钥替换为 `<KEY:len=48,sha256前8位>`）、引擎进度事件、退出码、产物 sha256、耗时。日志保留最近 20 次，可一键导出 zip。
 
 **shell 与 busybox 处置（新链明确不用）**：不走 `boot_patch.sh`，不打包 busybox；打包/rc 注入用 **magiskboot 官方二进制**（exec），kernel patch 在 JNI 引擎内，刷入经 `root-exec`。RC §四 已论证「最小可判定失败面越短越好」，且 `echo; exit $?` 类吞码 bug（RC P2）在脚本层无法根治——干脆去掉脚本层（magiskboot 是程序而非脚本，其退出码直接透传）。
+
+#### 5.4.3 C′ 方案：rc 虚拟化（`--launcher rc`，2026-11-10 补写）
+
+> **本节为此前设计文档的缺口补写**：C′ 是 2026-11-10 落地的头号架构简化项（`docs/ARCHIVE-2026-11-10.md` §2.3），但 NEW-DOC-01/05 此前零记载，仍按「RcInject 必做」叙述。**本节以代码为准**（`engine/src/patch_rc_virtualize.{h,cpp}`、`engine/src/skroot_patch_main.cpp`）。
+
+**原发现（借 APatch 机制）**：APatch 不改 init_boot，靠 hook `openat` 把 init 要读的 rc 换成 `/dev/user_init.rc`（原文 + 追加段）。
+
+**引擎实现（clean-room，`patch_rc_virtualize.cpp`）**：
+
+| 项 | 实现 |
+|---|---|
+| hook 点 | `__arm64_sys_openat`（`patch_rc_virtualize.cpp:75`） |
+| 双过滤 | 只处理 **`uid==0`（init）+ `O_RDONLY`**；非 root 的 openat 只多 5~6 条指令（`:254-257`） |
+| 替换目标 | 原地覆写用户态 path 串为 `/dev/user_init.rc`（19 B，`RC_VIRT_REPLACE_PATH`，`:23`）；写入串 28/34 B > 18 B 槽位时**不改栈指针** |
+| 洞扫描 | 零硬编码 + 三重断言，扫描结果输出 `caves[]`（`:88`、`:192-198`） |
+| 失败语义 | 显式 `--launcher rc` 但前置不满足（符号缺失/无洞/洞非法）→ **E202 且不产出 `--out`**，绝不静默降级（`skroot_patch_main.cpp:1204-1207`，走统一 `fail()` 出口 `:1062-1078` 删除 `--out`） |
+| `--launcher umh` | B 方案**未实现**，显式 E101 报错（`skroot_patch_main.cpp:882-891`） |
+
+> **⚠️ 真机验证必须知道的语义差异（2026-11-10 补写）**：**只有默认 `off` 才静默跳过**；一旦显式传 `--launcher rc` 而内核不适配，现象是**「修补直接失败」而非「修补成功但自启无效」**。
+> - `--launcher off`（默认）：不织入 openat hook，不检查前置条件，正常出产物 → 若此时自启无效，原因在 **rc 注入/init 解析**，与 C′ 无关。
+> - `--launcher rc` 且前置不满足：`patch_kernel_handler` 返回 `launcher.enabled == false` → 立即 `fail(E_SYMBOL_MISSING, "E202: --launcher rc preconditions not met", <reason>)` → `--out` 被删除、rc=202、report 里带具体 reason（符号缺失 / 无代码洞 / 洞非法）。
+> **排查含义**：真机看到 E202 **不代表内核不支持 SK 修补**（默认 off 仍可正常修补），只代表**该内核不能走 C′ 路径**（多半是找不到 `__arm64_sys_openat` 符号或没有满足三重断言的代码洞）。这是设计上的「快速失败」，比静默降级安全——否则会得到一个「patch 成功但开机后 rc 根本没被虚拟化」的假成功镜像。
+
+**关键工程性质（决定了它可以安全上线）**：
+
+1. **默认 `off`**：`--launcher off` 时 rc 虚拟化完全不织入，**产物与旧引擎逐字节相同**（worktree 对照验证，ARCHIVE §2.3）；`hook_groups_expected` 也不 +1（`patch_pipeline.h:58-61`）。
+2. **组数契约联动**：`hook_groups_expected_count(ge61, huawei, launcher_rc)` 三参；off 时 14/11（+huawei 15/12），on 时 15/12（+huawei 16/13）。A8 自检矩阵扩到 8 例（off 6 + rc 2，`skroot_patch_main.cpp:643-648,808`）。
+3. **与 §5.4 步⑦ 的关系**：C′ **不是** RcInject 的替代实现，而是**另一条交付路径**。开启 C′ 后，`init_boot` 修补链（unpack/repack/T-12/AVB）**理论上可整条退役**（ARCHIVE §2.3「价值」）——但那属于 **P2/后续版本收敛**，本方案 v0.1 仍以 RcInject 为默认交付路径。
+4. **未验证项（诚实声明）**：真机 5 项（`/dev` 时机、PAN/UAO、SELinux、init 解析拼接、开机稳定性）**尚未验证**（ARCHIVE §5 的 P0「真机验证 C′」）；静态断言覆盖不到。**在真机窗口关闭前，不得在文档或 UI 里宣称 C′ 可用**。
 
 ### 5.5 引擎契约（与 C1 §1/§3 语义完全对齐；JNI 主路径，CLI 仅诊断）
 
@@ -1149,15 +1181,16 @@ IDLE ──选镜像──> INPUT_READY ──开始──> PREFLIGHT ─> UNPAC
 | G5 | **不可信输入不参与构建** | 所有第三方二进制（若有）必须 sha256 固定；网络下载仅作辅助且失败即 fail（RC F3） |
 | G6 | **分支策略：`v2` 为唯一开发分支**（lead 2026-11-08 决定） | `main` 是旧代码 + app-client 早期推送，**不作为测试/构建对象**；所有 workflow 的 push/PR 触发只监听 `v2`（及 tag） |
 
-### 8.2 CI 工作流清单（GitHub Actions）——**按 v2 实况修正（5 个，非设计态 6 个）**
+### 8.2 CI 工作流清单（GitHub Actions）——**按 v2 实况修正（6 个）**
 
-> 设计态曾列 6 个工作流（`ci-static/engine/magiskboot/apd/newapp/release`）。v2 实际为 **5 个**：`apk / engine / apd / licenses / release`。`ci-static` 未落地（静态检查是缺口，见 §3.7.2 D7）；`magiskboot` 无独立 workflow，改为在 `apk.yml` 内按 `app/native.lock.json` 精确拉取并 sha256 校验。
+> **2026-11-10 修订**：本节此前写「v2 实际为 5 个，`ci-static` 未落地」。**实况已变**：`.github/workflows/` 下实际有 **6 个** yml —— `apk / apd / ci-static / engine / licenses / release`（`ci-static.yml` 已由 D7 补齐，`44290e1`，见 `docs/HANDOFF-2026-11-08.md` §6.5-D7）。仍无误的是：`magiskboot` 无独立 workflow，改为在 `apk.yml` 内按 `app/native.lock.json` 精确拉取并 sha256 校验。设计态曾列 6 个（`ci-static/engine/magiskboot/apd/newapp/release`），与实况的差异仅剩 `magiskboot` 未独立成流、`newapp` 改名为 `apk`。
 
 | 工作流（v2 实际文件名） | 触发 | 产出 | 关键断言 | 归属 |
 |---|---|---|---|---|
 | `apk.yml` | `app/**`、`app/native.lock.json`、根 LICENSE/NOTICE 变更 | `SPRoot-APK`（release APK，签名） | 按 `native.lock.json` 精确拉取 engine/apd/magiskboot + **sha256 逐一校验**；装配 NOTICE assets（单一可信源）；`apksigner verify`；APK 内含所需 **AArch64 natives** 断言 | task-4/8 |
 | `engine.yml` | `engine/**` 变更 | `libskrootpatch.so`（arm64）+ `skroot-patch`（x86-64 诊断） | `readelf` 断言 AArch64；`--selftest` 返回 0；符号清单 + sha256；**依赖 apt `qemu-user`（提供 qemu-aarch64）做契约自检**——⚠️ 不是 `qemu-user-static`（无安装候选，首次 CI 失败原因） | task-3/8 |
 | `apd.yml` | `apd/**` 变更 | `libapd.so`（arm64） | ELF 断言（AARCH64+ET_DYN）；能力标记 grep；体积归因；`--no-default-features` **licence-clean 编译校验**（§11.4.4）；sha256 | task-6/8 |
+| `ci-static.yml` | `app/**`、`docs/**` 等源码变更（push/PR 到 `v2`） | 无产物（只报告） | 源码静态一致性：`check_licenses.py` / `check_error_codes.py` / `verify_patch.py` 自检 / `check_kt_{syntax,signatures,imports}.py` / `check_builtin_assets.py`；脚本缺失或非 0 退出即红 | task-8 |
 | `licenses.yml` | LICENSE/LICENSES.md/NOTICE/`engine/src/**`/检查脚本变更 | 无产物（只报告） | LICENSE 存在且为 AGPL-3.0；LICENSES.md 含「保留所有权利」+ SKRoot 来源；NOTICE 含 AGPL-3.0 + magiskboot；`check_licenses.py` 上游 **15 文件 sha256 指纹未漂移** | task-8 |
 | `release.yml` | tag `v*` | Release assets + SHA256SUMS | 上述汇总 + 版本号与 tag 一致 | task-8 |
 

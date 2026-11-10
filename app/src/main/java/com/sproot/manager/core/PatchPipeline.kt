@@ -138,6 +138,11 @@ object PatchPipeline {
         }
 
         val appContext = context.applicationContext
+        // 关键：把 Application context 落到**字段**上（局部 val 同名会遮蔽字段）。
+        // finishFailure() 在后台线程、且在局部作用域之外，只能通过字段取 context；
+        // 此前漏了这句赋值 → 字段恒 null → InstallState.markError 是死代码，
+        // 修补失败不置 ERROR，主页「上次修补失败」卡永不亮（S3 缺陷）。
+        this.appContext = appContext
         AppLog.init(appContext)
         val logFile = AppLog.currentLogFile()
 
@@ -1104,8 +1109,18 @@ object PatchPipeline {
         )
         AppLog.error(TAG, "修补失败：$title\n$detail")
         logStageDurations()
-        runCatching {
-            appContext?.let { InstallState.markError(it, title) }
+        // 失败必须反映到持久化状态机（否则主页「上次修补失败」卡不亮）。
+        // 这里取的是**字段**：execute()/finishFailure() 都在后台线程，start() 的局部 val 不可见。
+        val ctx = appContext
+        if (ctx == null) {
+            AppLog.error(TAG, "内部错误：appContext 未初始化 → InstallState.markError 未执行（状态机不会置 ERROR）")
+        } else {
+            val marked = runCatching { InstallState.markError(ctx, title) }
+            if (marked.isSuccess) {
+                AppLog.info(TAG, "状态机已置 ERROR（InstallState.markError 已执行）：$title")
+            } else {
+                AppLog.error(TAG, "写入 ERROR 状态失败（不影响失败展示）：${marked.exceptionOrNull()?.message}")
+            }
         }
     }
 

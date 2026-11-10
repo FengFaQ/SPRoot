@@ -16,7 +16,7 @@
 
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -46,10 +46,34 @@ pub struct DeployState {
     /// APK-bundled `libapd.so` (version consistency check).
     #[serde(default)]
     pub commit: String,
-    /// AVB audit evidence: deploy never touches vbmeta/AVB structures. The
-    /// value is a fixed marker so QA can prove it from state.json.
+    /// AVB audit evidence captured **from the boot partition** at deploy time.
+    ///
+    /// This used to be the literal `"vbmeta_untouched"`, which made the selftest
+    /// tautological (write a constant, read the constant back). It is now the
+    /// measured observation produced by [`probe_avb`]: `"avb_ok"` when a footer
+    /// was located and digested, `"avb_no_footer"` when the partition carries no
+    /// AVB footer, `"avb_unobservable"` when the device could not be read at all.
+    /// Only `"avb_ok"` is a positive claim; the other two are explicitly *not*.
     #[serde(default)]
     pub avb: String,
+    /// SHA-256 of the whole 64-byte AVB footer (the part that carries
+    /// `original_image_size` / `vbmeta_offset` / `vbmeta_size`). `None` when the
+    /// partition could not be observed — never a placeholder string.
+    #[serde(default)]
+    pub avb_footer_sha256: Option<String>,
+    /// SHA-256 of the embedded vbmeta section `[vbmeta_offset, +vbmeta_size)`.
+    /// `None` unless `avb == "avb_ok"`.
+    #[serde(default)]
+    pub avb_vbmeta_sha256: Option<String>,
+    /// Which device/path the observation came from (audit trail; `None` when
+    /// unobservable). Kept so a mismatch is diagnosable instead of just "FAIL".
+    #[serde(default)]
+    pub avb_source: Option<String>,
+    /// Total partition size in bytes at observation time. A later change means
+    /// the partition was rewritten (footer is at the *end*, so any resize moves
+    /// it) — the selftest re-measures and compares.
+    #[serde(default)]
+    pub avb_partition_bytes: Option<u64>,
     pub deployed_at: u64,
     /// Random file name inside `/data/<key16>/`, needed by `undeploy`.
     /// Contains no key material (the directory name is derived from the key
@@ -472,11 +496,441 @@ fn init_allow_list() -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// AVB observation (2026-11-10 S1). See `defs::AVB_BOOT_CANDIDATES`.
+//
+// The project rule (HANDOFF-2026-11-08 §"教训", NEW-DOC-02 T-12 铁律) is that a
+// new assertion must first be proven able to FAIL. The observation below can
+// fail three ways, all reachable in unit tests against plain files:
+//   * footer magic missing at the end of the partition  → `NoFooter`
+//   * vbmeta section out of bounds / overlapping footer → `Unobservable`
+//   * footer or vbmeta digest differs from the recorded  → selftest FAIL
+// ---------------------------------------------------------------------------
+
+/// AVB footer length in bytes (`avb_footer` is a fixed 64 B struct at the very
+/// end of the partition; mirrors `app/.../Elf.kt: AVB_FOOTER_SIZE`).
+pub const AVB_FOOTER_SIZE: u64 = 64;
+/// `AVBf` magic, big-endian struct per avbtool.
+pub const AVB_FOOTER_MAGIC: &[u8; 4] = b"AVBf";
+
+/// How far the observation actually got.
+///
+/// This is **explicit state, not a guess derived from `partition_bytes`**
+/// (auditor finding 2026-11-10 #3): "we could not read the partition" and "we
+/// read it and there is genuinely no AVB footer" are different facts and must
+/// stay distinguishable in `state.json`, otherwise a device whose partition is
+/// unreadable silently reports the same thing as a device that legitimately has
+/// no AVB — and neither may look like a pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvbOutcome {
+    /// Footer located, magic + bounds valid (and in full mode, vbmeta digested).
+    Ok,
+    /// Partition fully readable, and it carries **no** `AVBf` footer at the tail.
+    /// A legitimate un-AVB'd vendor image: nothing to have touched.
+    NoFooter,
+    /// Opened and sized, but the footer or its vbmeta range is malformed.
+    /// We saw *something* and could not decide — distinct from `NoFooter`.
+    Malformed,
+    /// Could not open, could not size, or the partition is too small to hold a
+    /// footer. Nothing was measured.
+    Unobservable,
+}
+
+/// Result of reading the AVB footer off a partition/file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AvbObservation {
+    pub source: String,
+    pub partition_bytes: u64,
+    /// SHA-256 of the 64-byte footer itself.
+    pub footer_sha256: Option<String>,
+    /// SHA-256 of the embedded vbmeta section — `Some` only when the section was
+    /// actually read (the cheap footer-only mode leaves it `None`; see
+    /// [`observe_avb_footer_only_from_path`]).
+    pub vbmeta_sha256: Option<String>,
+    /// `true` when a footer with valid magic **and** structurally valid vbmeta
+    /// bounds was located at the tail. In footer-only mode this is a statement
+    /// about the footer alone (the vbmeta bytes were not compared).
+    pub footer_present: bool,
+    /// How far the observation got (drives `code()`; never inferred).
+    pub outcome: AvbOutcome,
+    /// Why the observation is incomplete (`None` when fully observed).
+    pub problem: Option<String>,
+}
+
+impl AvbObservation {
+    /// Machine code stored in `state.json` / reported by the selftest and the
+    /// module `--json` responses. Values are stable identifiers:
+    ///
+    /// * `avb_ok`          — measured: footer present (and, in full mode, its
+    ///   vbmeta section digested).
+    /// * `avb_no_footer`   — measured: the partition is readable and has **no**
+    ///   AVB footer. A *legitimate* device state (un-AVB'd vendor images), but
+    ///   explicitly **not** a PASS of "vbmeta untouched" — there is nothing to
+    ///   have touched.
+    /// * `avb_malformed`   — a footer is present but its fields are invalid
+    ///   (out of bounds, overlapping, illegal vbmeta offset/size). Not the same
+    ///   as "no footer", and not a pass either.
+    /// * `avb_unobservable`— could not read or size the partition. Nothing was
+    ///   measured; "unknown", never "ok".
+    pub fn code(&self) -> &'static str {
+        match self.outcome {
+            AvbOutcome::Ok => "avb_ok",
+            AvbOutcome::NoFooter => "avb_no_footer",
+            AvbOutcome::Malformed => "avb_malformed",
+            AvbOutcome::Unobservable => "avb_unobservable",
+        }
+    }
+}
+
+/// Read the 64-byte AVB footer at the tail of `path` and digest the vbmeta
+/// section it points at. Pure I/O, no global state: unit-testable on any file.
+///
+/// On a real device the source is a block device (`open` + `seek` works the
+/// same as for a regular file), so no `O_DIRECT`/BLKGETSIZE64 dance is needed.
+///
+/// This is the **full** observation used by `deploy` and `selftest` (both are
+/// low-frequency and need to detect tampering inside the vbmeta payload). The
+/// module hot path uses the cheaper [`observe_avb_footer_only_from_path`].
+pub fn observe_avb_from_path(path: &Path) -> AvbObservation {
+    observe_avb_impl(path, true)
+}
+
+/// Footer-only variant: reads 64 B at the tail and validates the vbmeta bounds,
+/// but does **not** read the vbmeta section.
+///
+/// Why the cut (module install/uninstall hot path): the full observation costs a
+/// second seek plus a read of the whole vbmeta section — 2.5 KB on the SPROOT
+/// sample boot image but megabytes on devices with large vbmeta (the field is a
+/// free 64-bit size). For an audit line that runs on every module operation,
+/// the footer digest alone already detects the failure modes that matter there:
+/// a rewritten/moved/erased footer changes its own digest, and a resize changes
+/// `partition_bytes` and the footer's `vbmeta_offset`. What is **lost** is
+/// detection of tampering *inside* the vbmeta payload with an otherwise intact
+/// footer — that is precisely what `deploy`/`selftest` keep using the full mode
+/// for. Doc note recorded in `AvbObservation::vbmeta_sha256`.
+pub fn observe_avb_footer_only_from_path(path: &Path) -> AvbObservation {
+    observe_avb_impl(path, false)
+}
+
+/// Real byte length of an opened file **or block device**.
+///
+/// `metadata().len()` is unusable here: for a block device the kernel reports
+/// `st_size == 0` (the size lives in the block-device inode, not the size
+/// field), so any `len < AVB_FOOTER_SIZE` guard built on it rejects *every* real
+/// device and `avb_ok` becomes unreachable — the check would degrade from
+/// "always green" to "always grey", which is just a different way of never
+/// answering the question (auditor finding, 2026-11-10).
+///
+/// `seek(SeekFrom::End(0))` returns the true size for both regular files and
+/// block devices (measured: `/dev/sda` st_size=0 but SEEK_END=758038528), so a
+/// single code path covers the test fixtures and production. `BLKGETSIZE64`
+/// would also work but is Linux/Android-only and needs `unsafe` ioctl plumbing
+/// for no gain — SEEK_END is portable and already how the footer itself is
+/// located.
+fn real_len(file: &mut fs::File) -> std::io::Result<u64> {
+    file.seek(SeekFrom::End(0))
+}
+
+fn observe_avb_impl(path: &Path, digest_vbmeta: bool) -> AvbObservation {
+    let source = path.display().to_string();
+    let mut file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            return AvbObservation {
+                source,
+                partition_bytes: 0,
+                footer_sha256: None,
+                vbmeta_sha256: None,
+                footer_present: false,
+                outcome: AvbOutcome::Unobservable,
+                problem: Some(format!("cannot open: {e}")),
+            };
+        }
+    };
+    let len = match real_len(&mut file) {
+        Ok(len) => len,
+        Err(e) => {
+            return AvbObservation {
+                source,
+                partition_bytes: 0,
+                footer_sha256: None,
+                vbmeta_sha256: None,
+                footer_present: false,
+                outcome: AvbOutcome::Unobservable,
+                problem: Some(format!("cannot determine size (SEEK_END failed): {e}")),
+            };
+        }
+    };
+    if len < AVB_FOOTER_SIZE {
+        return AvbObservation {
+            source,
+            partition_bytes: len,
+            footer_sha256: None,
+            vbmeta_sha256: None,
+            footer_present: false,
+            outcome: AvbOutcome::Unobservable,
+            problem: Some(format!("partition too small ({len} B) to hold a footer")),
+        };
+    }
+
+    let mut footer = [0u8; AVB_FOOTER_SIZE as usize];
+    if let Err(e) = file.seek(SeekFrom::End(-(AVB_FOOTER_SIZE as i64))) {
+        return AvbObservation {
+            source,
+            partition_bytes: len,
+            footer_sha256: None,
+            vbmeta_sha256: None,
+            footer_present: false,
+            outcome: AvbOutcome::Unobservable,
+            problem: Some(format!("seek to footer failed: {e}")),
+        };
+    }
+    if let Err(e) = file.read_exact(&mut footer) {
+        return AvbObservation {
+            source,
+            partition_bytes: len,
+            footer_sha256: None,
+            vbmeta_sha256: None,
+            footer_present: false,
+            outcome: AvbOutcome::Unobservable,
+            problem: Some(format!("read footer failed: {e}")),
+        };
+    }
+    if &footer[0..4] != AVB_FOOTER_MAGIC {
+        return AvbObservation {
+            source,
+            partition_bytes: len,
+            footer_sha256: None,
+            vbmeta_sha256: None,
+            footer_present: false,
+            // Read the tail successfully and it is not an AVB footer: this is a
+            // *measured* "no AVB on this partition", not a failed observation.
+            outcome: AvbOutcome::NoFooter,
+            problem: Some(format!(
+                "no AVB footer (magic at -64 is {:?}, want \"AVBf\")",
+                String::from_utf8_lossy(&footer[0..4])
+            )),
+        };
+    }
+
+    // All AVB integer fields are big-endian (avbtool uses be32toh/be64toh).
+    let be64 = |off: usize| -> u64 {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&footer[off..off + 8]);
+        u64::from_be_bytes(b)
+    };
+    let orig_image_size = be64(12);
+    let vbmeta_offset = be64(20);
+    let vbmeta_size = be64(28);
+    let footer_sha256 = Some(crate::utils::sha256_hex(&footer));
+
+    // Bounds: the vbmeta section is an absolute range inside the partition and
+    // must not reach into the footer. A violation is "cannot decide", never ok.
+    if vbmeta_offset == 0 || vbmeta_size == 0 {
+        return AvbObservation {
+            source,
+            partition_bytes: len,
+            footer_sha256,
+            vbmeta_sha256: None,
+            footer_present: false,
+            outcome: AvbOutcome::Malformed,
+            problem: Some(format!(
+                "illegal vbmeta fields (offset={vbmeta_offset}, size={vbmeta_size})"
+            )),
+        };
+    }
+    let vbmeta_end = match vbmeta_offset.checked_add(vbmeta_size) {
+        Some(end) => end,
+        None => {
+            return AvbObservation {
+                source,
+                partition_bytes: len,
+                footer_sha256,
+                vbmeta_sha256: None,
+                footer_present: false,
+                outcome: AvbOutcome::Malformed,
+                problem: Some("vbmeta range overflows u64".to_string()),
+            };
+        }
+    };
+    if vbmeta_end > len {
+        return AvbObservation {
+            source,
+            partition_bytes: len,
+            footer_sha256,
+            vbmeta_sha256: None,
+            footer_present: false,
+            outcome: AvbOutcome::Malformed,
+            problem: Some(format!(
+                "vbmeta range [{vbmeta_offset}, {vbmeta_end}) exceeds partition ({len} B)"
+            )),
+        };
+    }
+    if vbmeta_end > len - AVB_FOOTER_SIZE {
+        return AvbObservation {
+            source,
+            partition_bytes: len,
+            footer_sha256,
+            vbmeta_sha256: None,
+            footer_present: false,
+            outcome: AvbOutcome::Malformed,
+            problem: Some(format!(
+                "vbmeta range ends at {vbmeta_end}, overlapping the footer at {}",
+                len - AVB_FOOTER_SIZE
+            )),
+        };
+    }
+
+    // Footer-only mode stops here: magic + bounds are validated, the payload is
+    // not read. `vbmeta_sha256` stays `None`, which is honest — we did not measure
+    // it. `footer_present` is still true because the footer itself was verified.
+    if !digest_vbmeta {
+        return AvbObservation {
+            source,
+            partition_bytes: len,
+            footer_sha256,
+            vbmeta_sha256: None,
+            footer_present: true,
+            outcome: AvbOutcome::Ok,
+            problem: None,
+        };
+    }
+
+    let mut vbmeta = vec![0u8; vbmeta_size as usize];
+    if let Err(e) = file.seek(SeekFrom::Start(vbmeta_offset)) {
+        return AvbObservation {
+            source,
+            partition_bytes: len,
+            footer_sha256,
+            vbmeta_sha256: None,
+            footer_present: false,
+            outcome: AvbOutcome::Unobservable,
+            problem: Some(format!("seek to vbmeta failed: {e}")),
+        };
+    }
+    if let Err(e) = file.read_exact(&mut vbmeta) {
+        return AvbObservation {
+            source,
+            partition_bytes: len,
+            footer_sha256,
+            vbmeta_sha256: None,
+            footer_present: false,
+            outcome: AvbOutcome::Unobservable,
+            problem: Some(format!("read vbmeta failed: {e}")),
+        };
+    }
+    let _ = orig_image_size; // recorded by the footer digest; kept for the reader
+    AvbObservation {
+        source,
+        partition_bytes: len,
+        footer_sha256,
+        vbmeta_sha256: Some(crate::utils::sha256_hex(&vbmeta)),
+        footer_present: true,
+        outcome: AvbOutcome::Ok,
+        problem: None,
+    }
+}
+
+/// Observe the AVB footer of the device's boot partition.
+///
+/// Order: `SPROOT_AVB_BOOT_IMAGE` (diagnostics/QA, logged as an override) →
+/// `defs::AVB_BOOT_CANDIDATES` (first that opens). When every candidate is
+/// unreadable the observation is `unobservable` — **not** a pass. Deploy runs as
+/// root, so a failure here is genuine (no partition / no AVB / SELinux denial).
+pub fn probe_avb() -> AvbObservation {
+    probe_avb_impl(true)
+}
+
+/// Footer-only probe for the module hot path (see
+/// [`observe_avb_footer_only_from_path`] for the cost/coverage trade-off).
+pub fn probe_avb_footer_only() -> AvbObservation {
+    probe_avb_impl(false)
+}
+
+fn probe_avb_impl(digest_vbmeta: bool) -> AvbObservation {
+    let observe = |path: &Path| {
+        if digest_vbmeta {
+            observe_avb_from_path(path)
+        } else {
+            observe_avb_footer_only_from_path(path)
+        }
+    };
+
+    if let Ok(raw) = std::env::var(defs::AVB_BOOT_OVERRIDE_ENV) {
+        let path = PathBuf::from(raw);
+        if !path.as_os_str().is_empty() {
+            let mut observed = observe(&path);
+            // Make the override self-evident in every downstream report.
+            observed.source = format!("{} (override via {})", observed.source, defs::AVB_BOOT_OVERRIDE_ENV);
+            warn!(
+                "[deploy] AVB probe using {} override: {}",
+                defs::AVB_BOOT_OVERRIDE_ENV,
+                observed.source
+            );
+            return observed;
+        }
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+    for candidate in defs::AVB_BOOT_CANDIDATES {
+        let path = Path::new(candidate);
+        if !path.exists() {
+            problems.push(format!("{candidate}: absent"));
+            continue;
+        }
+        let observed = observe(path);
+        match observed.problem.as_deref() {
+            // Unreadable device (permissions/SELinux/EIO): try the next layout.
+            None => return observed,
+            Some(reason) if reason.starts_with("cannot open") || reason.starts_with("cannot stat") => {
+                problems.push(format!("{candidate}: {reason}"));
+            }
+            // Device opened and a definite verdict was reached, including
+            // "no footer": that is the answer for this device.
+            Some(_) => return observed,
+        }
+    }
+    AvbObservation {
+        source: problems.join("; "),
+        partition_bytes: 0,
+        footer_sha256: None,
+        vbmeta_sha256: None,
+        footer_present: false,
+        // No candidate could even be opened: nothing was measured. This is the
+        // case that must stay distinguishable from a measured `NoFooter`.
+        outcome: AvbOutcome::Unobservable,
+        problem: Some("no readable boot partition (AVB state unknown)".to_string()),
+    }
+}
+
 fn write_state(hidden_file: &str, source_dir: &Path) -> Result<()> {
+    // Measured, not asserted: read the real boot partition. `avb` is the code
+    // of `AvbObservation::code()`, and the digests are only populated when the
+    // observation actually succeeded (a `None` means "not observed", and the
+    // selftest treats that as unknown — never as a pass).
+    let avb = probe_avb();
+    match avb.code() {
+        "avb_ok" => info!(
+            "[deploy] AVB observed: footer+vbmeta digested from {} ({} B partition)",
+            avb.source, avb.partition_bytes
+        ),
+        "avb_no_footer" => warn!(
+            "[deploy] AVB: boot partition has no AVB footer ({}) — recorded as avb_no_footer, NOT as a pass",
+            avb.problem.as_deref().unwrap_or("-")
+        ),
+        _ => warn!(
+            "[deploy] AVB: boot partition unobservable ({}) — recorded as avb_unobservable",
+            avb.problem.as_deref().unwrap_or("-")
+        ),
+    }
     let state = DeployState {
         version: defs::VERSION_NAME.trim().to_string(),
         commit: defs::VERSION_COMMIT.trim().to_string(),
-        avb: "vbmeta_untouched".to_string(),
+        avb: avb.code().to_string(),
+        avb_footer_sha256: avb.footer_sha256.clone(),
+        avb_vbmeta_sha256: avb.vbmeta_sha256.clone(),
+        avb_source: if avb.partition_bytes > 0 { Some(avb.source.clone()) } else { None },
+        avb_partition_bytes: if avb.partition_bytes > 0 { Some(avb.partition_bytes) } else { None },
         deployed_at: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -714,5 +1168,322 @@ mod tests {
         assert_eq!(defs::DAEMON_PATH, "/data/adb/apd");
         // The writer targets that same constant (no second literal path).
         assert!(defs::SPROOT_KEY_FILE.starts_with(defs::SPROOT_DIR));
+    }
+
+    // -----------------------------------------------------------------------
+    // AVB observation (2026-11-10 S1). Synthetic partitions only: no device,
+    // no root — exactly the property the old tautological check lacked.
+    // -----------------------------------------------------------------------
+
+    /// Scratch directory that removes itself (no external crate).
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let unique = format!(
+                "sproot-avb-{tag}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            );
+            let dir = std::env::temp_dir().join(unique);
+            fs::create_dir_all(&dir).expect("create scratch dir");
+            Scratch(dir)
+        }
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Build a minimal but structurally valid AVB-carrying partition:
+    /// `[payload][vbmeta][zero fill][64 B footer]`, footer fields big-endian
+    /// exactly as avbtool writes them (mirrors `app/.../Elf.kt:readAvbFooter`).
+    fn synth_partition(total: u64, payload: &[u8], vbmeta: &[u8]) -> Vec<u8> {
+        assert!(total >= 4096, "partition must hold payload+vbmeta+footer");
+        let mut img = vec![0u8; total as usize];
+        img[..payload.len()].copy_from_slice(payload);
+        let vbmeta_offset = payload.len() as u64;
+        let vbmeta_size = vbmeta.len() as u64;
+        img[vbmeta_offset as usize..(vbmeta_offset + vbmeta_size) as usize].copy_from_slice(vbmeta);
+        let footer_at = (total - AVB_FOOTER_SIZE) as usize;
+        img[footer_at..footer_at + 4].copy_from_slice(AVB_FOOTER_MAGIC);
+        // version_major=1, version_minor=0 (u32 BE each)
+        img[footer_at + 4..footer_at + 8].copy_from_slice(&1u32.to_be_bytes());
+        img[footer_at + 8..footer_at + 12].copy_from_slice(&0u32.to_be_bytes());
+        // original_image_size (u64 BE) = payload+vbmeta
+        img[footer_at + 12..footer_at + 20]
+            .copy_from_slice(&(vbmeta_offset + vbmeta_size).to_be_bytes());
+        img[footer_at + 20..footer_at + 28].copy_from_slice(&vbmeta_offset.to_be_bytes());
+        img[footer_at + 28..footer_at + 36].copy_from_slice(&vbmeta_size.to_be_bytes());
+        img
+    }
+
+    #[test]
+    fn avb_probe_reads_a_real_footer() {
+        let scratch = Scratch::new("ok");
+        let img = synth_partition(8192, b"PAYLOAD-SECTION", b"VBMETA-BYTES-HERE");
+        let path = scratch.path("boot.img");
+        fs::write(&path, &img).unwrap();
+
+        let observed = observe_avb_from_path(&path);
+        assert!(observed.footer_present, "problem={:?}", observed.problem);
+        assert_eq!(observed.code(), "avb_ok");
+        assert_eq!(observed.partition_bytes, 8192);
+        assert!(observed.footer_sha256.is_some());
+        assert!(observed.vbmeta_sha256.is_some());
+        // The digest must be of the *actual* vbmeta bytes.
+        assert_eq!(
+            observed.vbmeta_sha256.as_deref(),
+            Some(crate::utils::sha256_hex(b"VBMETA-BYTES-HERE").as_str())
+        );
+    }
+
+    /// Negative sample #1: a partition whose tail is not `AVBf` (no AVB at all,
+    /// or a truncated/overwritten footer) must be reported as `avb_no_footer`,
+    /// **never** as ok.
+    #[test]
+    fn avb_probe_reports_missing_footer() {
+        let scratch = Scratch::new("nofooter");
+        let path = scratch.path("boot.img");
+        let mut img = synth_partition(8192, b"PAYLOAD", b"VBMETA");
+        let footer_at = (8192 - AVB_FOOTER_SIZE) as usize;
+        img[footer_at..footer_at + 4].copy_from_slice(b"\0\0\0\0");
+        fs::write(&path, &img).unwrap();
+
+        let observed = observe_avb_from_path(&path);
+        assert!(!observed.footer_present);
+        assert_eq!(observed.code(), "avb_no_footer");
+        assert!(observed.vbmeta_sha256.is_none(), "must not digest a phantom vbmeta");
+        assert!(
+            observed.problem.as_deref().unwrap_or("").contains("no AVB footer"),
+            "problem={:?}",
+            observed.problem
+        );
+    }
+
+    /// Negative sample #2: a valid footer whose `vbmeta_offset` points outside
+    /// the partition (corrupted field) is *unobservable*, not ok.
+    #[test]
+    fn avb_probe_rejects_out_of_bounds_vbmeta() {
+        let scratch = Scratch::new("oob");
+        let mut img = synth_partition(8192, b"PAYLOAD", b"VBMETA");
+        let footer_at = (8192 - AVB_FOOTER_SIZE) as usize;
+        // vbmeta_offset = one byte past the end
+        img[footer_at + 20..footer_at + 28].copy_from_slice(&9000u64.to_be_bytes());
+        let path = scratch.path("boot.img");
+        fs::write(&path, &img).unwrap();
+
+        let observed = observe_avb_from_path(&path);
+        assert!(!observed.footer_present, "an invalid range must not claim success");
+        assert!(
+            observed.problem.as_deref().unwrap_or("").contains("exceeds partition"),
+            "problem={:?}",
+            observed.problem
+        );
+    }
+
+    /// Negative sample #3: vbmeta overlapping the footer is invalid too (this is
+    /// the exact semantics that once let AVB-3 pass forever: a range computed as
+    /// "distance from EOF" lands in the zero fill and compares equal).
+    #[test]
+    fn avb_probe_rejects_vbmeta_overlapping_footer() {
+        let scratch = Scratch::new("overlap");
+        let mut img = synth_partition(8192, b"PAYLOAD", b"VBMETA");
+        let footer_at = (8192 - AVB_FOOTER_SIZE) as usize;
+        img[footer_at + 20..footer_at + 28].copy_from_slice(&(footer_at as u64 - 2).to_be_bytes());
+        img[footer_at + 28..footer_at + 36].copy_from_slice(&8u64.to_be_bytes());
+        let path = scratch.path("boot.img");
+        fs::write(&path, &img).unwrap();
+
+        let observed = observe_avb_from_path(&path);
+        assert!(!observed.footer_present);
+        assert!(
+            observed.problem.as_deref().unwrap_or("").contains("overlapping"),
+            "problem={:?}",
+            observed.problem
+        );
+    }
+
+    /// A 32-byte "partition" cannot hold a footer: unobservable, not ok.
+    #[test]
+    fn avb_probe_handles_tiny_and_missing_files() {
+        let scratch = Scratch::new("tiny");
+        let tiny = scratch.path("tiny.img");
+        fs::write(&tiny, vec![0u8; 32]).unwrap();
+        let observed = observe_avb_from_path(&tiny);
+        assert!(!observed.footer_present);
+        assert!(observed.problem.as_deref().unwrap_or("").contains("too small"));
+
+        let missing = observe_avb_from_path(&scratch.path("does-not-exist.img"));
+        assert!(!missing.footer_present);
+        assert_eq!(missing.code(), "avb_unobservable");
+        assert_eq!(missing.partition_bytes, 0);
+    }
+
+    /// The vbmeta digest is byte-sensitive: flipping one byte of the vbmeta
+    /// section changes the observation (this is what makes the selftest able to
+    /// fail — see `selftest::tests::avb_verdict_fails_when_vbmeta_changes`).
+    #[test]
+    fn avb_vbmeta_digest_is_byte_sensitive() {
+        let scratch = Scratch::new("sens");
+        let before = scratch.path("before.img");
+        let after = scratch.path("after.img");
+        fs::write(&before, synth_partition(8192, b"PAYLOAD", b"VBMETA-AAAA")).unwrap();
+        fs::write(&after, synth_partition(8192, b"PAYLOAD", b"VBMETA-BBBB")).unwrap();
+
+        let a = observe_avb_from_path(&before);
+        let b = observe_avb_from_path(&after);
+        assert!(a.footer_present && b.footer_present);
+        assert_ne!(a.vbmeta_sha256, b.vbmeta_sha256);
+        // Footer digests are identical here: only vbmeta changed, proving the two
+        // digests measure different things (a footer-only check would miss it).
+        assert_eq!(a.footer_sha256, b.footer_sha256);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn avb_override_env_is_honoured_and_labelled() {
+        let scratch = Scratch::new("override");
+        let path = scratch.path("boot.img");
+        fs::write(&path, synth_partition(8192, b"PAYLOAD", b"VBMETA")).unwrap();
+        // SAFETY: single-threaded within this test; the var is removed below.
+        unsafe { std::env::set_var(defs::AVB_BOOT_OVERRIDE_ENV, &path) };
+        let observed = probe_avb();
+        unsafe { std::env::remove_var(defs::AVB_BOOT_OVERRIDE_ENV) };
+        assert_eq!(observed.code(), "avb_ok");
+        assert!(
+            observed.source.contains("override"),
+            "an overridden observation must be self-labelled: {}",
+            observed.source
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Block-device coverage (auditor finding, 2026-11-10).
+    //
+    // Every AVB test above writes a **regular file**, but production opens a
+    // **block device**. That asymmetry hid a fatal bug: `metadata().len()` is
+    // always 0 for block devices, so the `len < AVB_FOOTER_SIZE` guard fired on
+    // every real device and `avb_ok` was unreachable — the check degraded from
+    // "always green" to "always grey" instead of answering the question.
+    //
+    // The test below is the guard against that class of regression: it attaches
+    // a synthetic AVB image to a loop device (a genuine block device: st_size=0,
+    // SEEK_END=size) and requires a full, positive observation from it.
+    // -----------------------------------------------------------------------
+
+    /// `true` when this environment can create a loop device. Tests that need a
+    /// block device must **skip loudly** rather than silently pass: the whole
+    /// point of this coverage is that a non-block-device environment never
+    /// exercises it.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn loop_device_available() -> bool {
+        Path::new("/dev/loop-control").exists() || Path::new("/dev/loop0").exists()
+    }
+
+    /// Attach `image` to a free loop device; returns the device path.
+    /// Uses the `losetup` binary (no ioctl plumbing / extra crate needed).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn attach_loop(image: &Path) -> Option<PathBuf> {
+        let out = std::process::Command::new("losetup")
+            .args(["-f", "--show", &image.display().to_string()])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let dev = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if dev.is_empty() { None } else { Some(PathBuf::from(dev)) }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn detach_loop(dev: &Path) {
+        let _ = std::process::Command::new("losetup")
+            .args(["-d", &dev.display().to_string()])
+            .output();
+    }
+
+    /// **The auditor's regression test.** A block device must yield a real
+    /// `partition_bytes` (> 0) and a positive `avb_ok` observation.
+    ///
+    /// On the previous `metadata().len()` implementation this test fails: the
+    /// device reports `st_size == 0`, so the probe returns
+    /// `avb_unobservable` / `partition too small (0 B)` and every assertion
+    /// below trips. Verified by re-running the suite with the old code.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn avb_probe_works_on_a_real_block_device() {
+        if !loop_device_available() {
+            // Loud skip: say exactly what was not covered and why.
+            eprintln!(
+                "SKIP avb_probe_works_on_a_real_block_device: no /dev/loop* in this \
+                 environment — the block-device path is NOT covered by this run"
+            );
+            return;
+        }
+        let scratch = Scratch::new("blockdev");
+        let img = synth_partition(8 * 1024 * 1024, b"BLOCKDEV-PAYLOAD", b"VBMETA-FOR-LOOP");
+        let image = scratch.path("partition.img");
+        fs::write(&image, &img).unwrap();
+
+        let Some(dev) = attach_loop(&image) else {
+            eprintln!(
+                "SKIP avb_probe_works_on_a_real_block_device: losetup failed \
+                 (needs root/CAP_SYS_ADMIN) — block-device path NOT covered"
+            );
+            return;
+        };
+        // Assert we really got a block device, not a symlink/path that a later
+        // refactor turned into a regular file.
+        let meta = fs::metadata(&dev).expect("stat loop device");
+        let is_block = {
+            use std::os::unix::fs::FileTypeExt;
+            meta.file_type().is_block_device()
+        };
+
+        let observed = observe_avb_from_path(&dev);
+        let observed_footer_only = observe_avb_footer_only_from_path(&dev);
+        detach_loop(&dev);
+
+        assert!(is_block, "{} must be a block device for this test to mean anything", dev.display());
+        // The whole bug in one line: st_size is 0, SEEK_END is not.
+        assert_eq!(meta.len(), 0, "precondition: block devices report st_size == 0");
+        assert_eq!(
+            observed.partition_bytes,
+            8 * 1024 * 1024,
+            "block device size must come from SEEK_END, not st_size (got {})",
+            observed.partition_bytes
+        );
+        assert_eq!(observed.outcome, AvbOutcome::Ok, "problem={:?}", observed.problem);
+        assert_eq!(observed.code(), "avb_ok");
+        assert!(observed.footer_sha256.is_some());
+        assert!(observed.vbmeta_sha256.is_some(), "full mode must digest vbmeta");
+        // The cheap module-path probe must work on a block device too.
+        assert_eq!(observed_footer_only.outcome, AvbOutcome::Ok);
+        assert_eq!(observed_footer_only.partition_bytes, 8 * 1024 * 1024);
+        assert!(observed_footer_only.vbmeta_sha256.is_none());
+    }
+
+    /// The size helper itself must not trust `st_size`: this pins the exact
+    /// primitive the bug lived in, independent of loop-device availability.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn real_len_uses_seek_end_not_st_size() {
+        let scratch = Scratch::new("reallen");
+        let path = scratch.path("f.img");
+        fs::write(&path, vec![0u8; 12345]).unwrap();
+        let mut file = fs::File::open(&path).unwrap();
+        // Regular file: both agree, so the helper must not regress there.
+        assert_eq!(file.metadata().unwrap().len(), 12345);
+        assert_eq!(real_len(&mut file).unwrap(), 12345);
+        // And the helper must survive being called twice (SEEK_END leaves the
+        // cursor at EOF; a second call must not return 0).
+        assert_eq!(real_len(&mut file).unwrap(), 12345);
     }
 }

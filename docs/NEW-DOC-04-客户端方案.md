@@ -589,8 +589,10 @@ CI 行为（硬失败）：
    - CI 构建时把 `apd/assets/init.sproot.rc` 复制到 `app/src/main/assets/`，并校验模板含 `service sproot-apd`、`property:sys.boot_completed`、`oneshot`、`disabled`；APK 断言 `assets/init.sproot.rc` 必须存在；
    - 注入到 ramdisk：`/init.sproot.rc` = 模板原文；`/init.rc` 确保 `import /init.sproot.rc`（幂等）；
    - 日志记录 `rc_injected / rc_target / rc_source / rc_reason / rc_idempotent_hit`；`rc_source` 应为 `apd/assets/init.sproot.rc`；
-   - 模板安全设计（不在客户端改写）：密钥不入 rc（只引用 `/data/adb/sproot/superkey`）、`oneshot+disabled`（最坏自启失效，不会 bootloop）、`override` 幂等、`seclabel` 留空待真机 avc 结论；
-   - **仍缺一块（非客户端）**：`apd deploy` 尚未实现把密钥写入 `/data/adb/sproot/superkey`（0600），因此当前注入后 daemon 会因读不到 key 安全退出；
+   - 模板安全设计（不在客户端改写）：密钥不入 rc（只引用 **`/data/adb/sproot/key`**）、`oneshot+disabled`（最坏自启失效，不会 bootloop）、`override` 幂等、`seclabel` 留空待真机 avc 结论；
+     > **2026-11-10 修订（本条曾双重过期）**：① 路径原写 `/data/adb/sproot/superkey` —— **错误**，rc 模板与 `apd/src/defs.rs:54`（`SPROOT_KEY_FILE = /data/adb/sproot/key`）一致，全仓无 `superkey` 路径（该错由 `2e1323a` 修正，见 `docs/HANDOFF-2026-11-08.md` §6.8 第 1 条）；② 内容口径：该文件是 **47 字符纯文本、无 NUL**（不是「48 字符」，也不是「47+NUL」——后者只属内核 shellcode 内嵌格式）。
+   - ~~**仍缺一块（非客户端）**：`apd deploy` 尚未实现把密钥写入 `/data/adb/sproot/superkey`（0600），因此当前注入后 daemon 会因读不到 key 安全退出；~~
+     > **2026-11-10 修订：此项已闭环**。`apd deploy` 已实现密钥落盘 —— `apd/src/deploy.rs` 的 `write_key_file()`（step 5/10：`key_material()` 严格 47 字节校验 → tmp → 0600 → fsync → rename 原子写，幂等，各分支擦除内存副本）。daemon 不再因缺 key 退出。故 UI 文案里「待 AP 部署完成后生效」仍成立，但原因已不是「密钥未写入」，而是「首次开机前 `/data/adb/apd` 与 rc 尚未就位」。
    - UI 文案：「**已注入开机自启模板（target=…，来源=…）—— 待 AP 部署完成后生效**」，日志同口径，不显示"自启已开启"。
 
 ---

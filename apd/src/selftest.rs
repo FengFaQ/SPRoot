@@ -31,11 +31,26 @@ use serde::Serialize;
 
 use crate::{auth_list, daemon, defs, deploy, secret, selinux};
 
+/// Outcome of one check.
+///
+/// `status` was added by the 2026-11-10 S1 fix so "cannot be determined" is
+/// renderable without either lying (`ok: true` — what the old `avb_untouched`
+/// comparison effectively did) or crying wolf (`[FAIL]` for an unreadable block
+/// device). `ok` is kept as the machine-readable criticality input and for
+/// existing consumers; `status` is additive and never contradicts it:
+///
+/// | status  | ok    | meaning                                          |
+/// |---------|-------|--------------------------------------------------|
+/// | ok      | true  | asserted and measured                            |
+/// | fail    | false | asserted and violated (a real regression)        |
+/// | unknown | false | could not be determined — **not** a pass         |
+/// | pending | true  | not applicable yet (`stage=undeployed`)          |
 #[derive(Serialize)]
 struct Check {
     name: &'static str,
     ok: bool,
     critical: bool,
+    status: &'static str,
     detail: String,
 }
 
@@ -45,13 +60,34 @@ impl Check {
             name,
             ok,
             critical,
+            status: if ok { "ok" } else { "fail" },
+            detail,
+        }
+    }
+
+    /// A check that could not be determined. Never rendered as `ok`, and never
+    /// counted as a critical failure (project convention: an unobservable
+    /// environment must not be reported as a defect — but it must not be
+    /// reported as a pass either).
+    fn unknown(name: &'static str, detail: String) -> Self {
+        Check {
+            name,
+            ok: false,
+            critical: false,
+            status: "unknown",
             detail,
         }
     }
 
     /// Placeholder for a deployment-dependent check while nothing is deployed.
     fn pending(name: &'static str, detail: &str) -> Self {
-        Check::new(name, true, false, format!("not deployed yet ({detail})"))
+        Check {
+            name,
+            ok: true,
+            critical: false,
+            status: "pending",
+            detail: format!("not deployed yet ({detail})"),
+        }
     }
 }
 
@@ -208,6 +244,207 @@ fn running_from() -> (PathBuf, &'static str) {
         "other"
     };
     (exe, origin)
+}
+
+// ---------------------------------------------------------------------------
+// AVB audit verdict (2026-11-10 S1). Pure function: inputs are the recorded
+// deployment state and a fresh observation of the boot partition, so every
+// branch below is reachable from a unit test with no device.
+//
+// Decision table (`ok` / `critical`):
+//
+// | recorded avb        | fresh observation            | ok    | why                     |
+// |---------------------|------------------------------|-------|-------------------------|
+// | any                 | unobservable (no device)     | false | unknown ≠ pass          |
+// | avb_unobservable    | unobservable                 | false | deploy could not measure|
+// | avb_no_footer       | no footer                    | false | nothing was verified    |
+// | avb_no_footer       | footer appeared              | false | partition rewritten     |
+// | avb_ok              | no footer now                | false | footer destroyed        |
+// | avb_ok              | footer, digests differ       | false | footer/vbmeta modified  |
+// | avb_ok              | footer, digests equal        | true  | measured and unchanged  |
+// | missing/unknown str | any                          | false | state.json tampered/old |
+//
+// `critical` is always true here: once `deploy` recorded a measured value, a
+// later divergence is real evidence of an AVB-touching operation. When the
+// observation is impossible we still fail (unknown is not a pass) but mark it
+// non-critical, so an unobservable block device does not send the device into
+// `needs_repair` forever — the detail says `unknown` and QA sees it.
+// ---------------------------------------------------------------------------
+fn avb_verdict(
+    state: Option<&deploy::DeployState>,
+    observed: &deploy::AvbObservation,
+) -> Check {
+    const NO_PASS: &str = "unknown — cannot be verified, NOT a pass";
+
+    let Some(state) = state else {
+        return Check::unknown(
+            "avb_untouched",
+            format!("{NO_PASS}: no state.json (deploy has not recorded an observation)"),
+        );
+    };
+
+    let recorded_code = state.avb.as_str();
+    let live = observed.code();
+
+    // 1. Could we measure at all?
+    if live == "avb_unobservable" {
+        return Check::unknown(
+            "avb_untouched",
+            format!(
+                "{NO_PASS}: boot partition unreadable ({})",
+                observed.problem.as_deref().unwrap_or("-")
+            ),
+        );
+    }
+
+    // 2. Deploy itself never got a measurement — nothing to compare against.
+    //    `avb_malformed` is likewise not a baseline: a footer whose fields are
+    //    illegal tells us nothing about what the boot partition "should" look
+    //    like.
+    if recorded_code != "avb_ok" && recorded_code != "avb_no_footer" {
+        return Check::unknown(
+            "avb_untouched",
+            format!(
+                "unknown — recorded audit={recorded_code:?} is not a measurement \
+                 (deploy could not observe AVB); NOT a pass"
+            ),
+        );
+    }
+
+    // 1b. A footer exists now but its fields are invalid (out of bounds,
+    //     overlapping, illegal vbmeta offset/size). That is a *positive*
+    //     observation of corruption — reported as FAIL, and never as the
+    //     "no footer" branch below (auditor finding 2026-11-10 #3).
+    if live == "avb_malformed" {
+        let was_ok = recorded_code == "avb_ok";
+        return Check::new(
+            "avb_untouched",
+            false,
+            was_ok,
+            format!(
+                "AVB footer present but structurally invalid ever since \
+                 (recorded={recorded_code}): {}{}",
+                observed.problem.as_deref().unwrap_or("-"),
+                if was_ok {
+                    "; the boot partition was modified after deploy"
+                } else {
+                    "; no valid baseline exists, so this cannot be verified"
+                }
+            ),
+        );
+    }
+
+    // 3. A previously observed footer is gone now.
+    if recorded_code == "avb_ok" && live == "avb_no_footer" {
+        return Check::new(
+            "avb_untouched",
+            false,
+            true,
+            format!(
+                "AVB footer was present at deploy ({} B) but is missing now ({}): \
+                 the boot partition was rewritten",
+                state.avb_partition_bytes.unwrap_or(0),
+                observed.problem.as_deref().unwrap_or("-")
+            ),
+        );
+    }
+
+    // 4. A footer appeared where deploy saw none.
+    if recorded_code == "avb_no_footer" && live == "avb_ok" {
+        return Check::new(
+            "avb_untouched",
+            false,
+            true,
+            format!(
+                "AVB footer absent at deploy but present now ({}): the boot partition \
+                 was rewritten",
+                observed.source
+            ),
+        );
+    }
+
+    // 5. Both observations say "no footer": a legitimate un-AVB'd device, but
+    //    there is nothing to have untouched, so this must not read as a pass.
+    if live == "avb_no_footer" {
+        return Check::unknown(
+            "avb_untouched",
+            format!(
+                "measured: boot partition has no AVB footer ({}); nothing was verified \
+                 — not a pass",
+                observed.problem.as_deref().unwrap_or("-")
+            ),
+        );
+    }
+
+    // 6. Both sides claim a footer: compare the actual bytes' digests.
+    let footer_match = match (&state.avb_footer_sha256, &observed.footer_sha256) {
+        (Some(recorded), Some(live)) => recorded == live,
+        _ => false,
+    };
+    let vbmeta_match = match (&state.avb_vbmeta_sha256, &observed.vbmeta_sha256) {
+        (Some(recorded), Some(live)) => recorded == live,
+        _ => false,
+    };
+    let len_match = state.avb_partition_bytes == Some(observed.partition_bytes);
+
+    if footer_match && vbmeta_match && len_match {
+        return Check::new(
+            "avb_untouched",
+            true,
+            true,
+            format!(
+                "measured OK: AVB footer + vbmeta unchanged since deploy \
+                 (source={} partition={} B footer_sha256={} vbmeta_sha256={})",
+                observed.source,
+                observed.partition_bytes,
+                short_sha(state.avb_footer_sha256.as_deref()),
+                short_sha(state.avb_vbmeta_sha256.as_deref()),
+            ),
+        );
+    }
+
+    let mut diffs = Vec::new();
+    if !len_match {
+        diffs.push(format!(
+            "partition size {} B != recorded {:?}",
+            observed.partition_bytes, state.avb_partition_bytes
+        ));
+    }
+    if !footer_match {
+        diffs.push(format!(
+            "footer digest {} != recorded {}",
+            short_sha(observed.footer_sha256.as_deref()),
+            short_sha(state.avb_footer_sha256.as_deref())
+        ));
+    }
+    if !vbmeta_match {
+        diffs.push(format!(
+            "vbmeta digest {} != recorded {}",
+            short_sha(observed.vbmeta_sha256.as_deref()),
+            short_sha(state.avb_vbmeta_sha256.as_deref())
+        ));
+    }
+    Check::new(
+        "avb_untouched",
+        false,
+        true,
+        format!(
+            "AVB structures changed since deploy ({}): {}", observed.source, diffs.join("; ")
+        ),
+    )
+}
+
+fn short_sha(value: Option<&str>) -> String {
+    match value {
+        // `&sha[..16]` would panic on a non-ASCII string whose byte 16 is not a
+        // char boundary, and release builds use `panic = "abort"` — a corrupted
+        // state.json must never abort the diagnostic command (auditor 2026-11-10).
+        Some(sha) if sha.chars().count() >= 16 => {
+            format!("{}…", sha.chars().take(16).collect::<String>())
+        }
+        Some(sha) => sha.to_string(),
+        None => "<none>".to_string(),
+    }
 }
 
 pub fn run(json: bool) -> Result<()> {
@@ -563,18 +800,19 @@ pub fn run(json: bool) -> Result<()> {
                 defs::VERSION_COMMIT.trim()
             ),
         ));
-        checks.push(Check::new(
-            "avb_untouched",
-            state
-                .as_ref()
-                .map(|s| s.avb == "vbmeta_untouched")
-                .unwrap_or(false),
-            true,
-            format!(
-                "audit={:?} (no vbmeta/AVB operation must ever be performed)",
-                state.as_ref().map(|s| s.avb.clone())
-            ),
-        ));
+        // ---- AVB audit: re-measure, never trust the recorded string --------
+        // 2026-11-10 S1 fix. Before this, deploy wrote the literal
+        // `"vbmeta_untouched"` and this check compared it to the same literal:
+        // structurally always PASS and unrelated to any real vbmeta (the exact
+        // anti-pattern AVB-3 shipped once, HANDOFF-2026-11-08 §"教训").
+        //
+        // Now the check *re-reads the boot partition* and compares its digests
+        // to the ones recorded at deploy time. Every branch that cannot measure
+        // reports `ok=false` with a reason — an unverifiable AVB claim must never
+        // render as `[ok]`. See `avb_verdict` for the decision table and its
+        // unit tests (`avb_verdict_*`), including the negative samples.
+        let observed = deploy::probe_avb();
+        checks.push(avb_verdict(state.as_ref(), &observed));
     } else {
         checks.push(Check::pending(
             "version_consistency",
@@ -621,9 +859,11 @@ pub fn run(json: bool) -> Result<()> {
     } else {
         println!("stage: {stage}");
         for c in &checks {
+            // `unknown` must never print as `[ok]` (2026-11-10 S1): an
+            // unverifiable assertion is not a passing one.
             println!(
                 "[{}] {}{} — {}",
-                if c.ok { "ok" } else { "FAIL" },
+                c.status,
                 c.name,
                 if c.critical { " (critical)" } else { "" },
                 c.detail
@@ -672,5 +912,307 @@ mod tests {
         assert_eq!(superkey_abi_verdict(0o600, 48, false), (false, false));
         // 48 with a NUL is the kernel format copied in by hand, not legacy 48
         assert_eq!(superkey_abi_verdict(0o600, 48, false), (false, false));
+    }
+
+    // -----------------------------------------------------------------------
+    // AVB verdict (2026-11-10 S1). These are the tests that make the check
+    // *falsifiable* — the property the previous `state.avb == "vbmeta_untouched"`
+    // comparison structurally could not have (write a constant, read it back).
+    // -----------------------------------------------------------------------
+
+    fn avb_state(
+        code: &str,
+        footer: Option<&str>,
+        vbmeta: Option<&str>,
+        bytes: Option<u64>,
+    ) -> deploy::DeployState {
+        deploy::DeployState {
+            version: "test".into(),
+            commit: "0".into(),
+            avb: code.into(),
+            avb_footer_sha256: footer.map(str::to_string),
+            avb_vbmeta_sha256: vbmeta.map(str::to_string),
+            avb_source: Some("/dev/block/by-name/boot".into()),
+            avb_partition_bytes: bytes,
+            deployed_at: 0,
+            hidden_file: "x".into(),
+            source: "/tmp".into(),
+        }
+    }
+
+    fn observed(
+        partition_bytes: u64,
+        footer: Option<&str>,
+        vbmeta: Option<&str>,
+        problem: Option<&str>,
+    ) -> deploy::AvbObservation {
+        // Outcome mirrors what a real observation would report for these inputs,
+        // so tests exercise the same `code()` mapping as production:
+        //   no footer digest at all         -> Unobservable (nothing measured)
+        //   footer + vbmeta digests present -> Ok
+        //   footer digest but no vbmeta     -> footer-only mode, still Ok
+        let (outcome, footer_present) = if footer.is_none() {
+            (deploy::AvbOutcome::Unobservable, false)
+        } else {
+            (deploy::AvbOutcome::Ok, true)
+        };
+        deploy::AvbObservation {
+            source: "/dev/block/by-name/boot".into(),
+            partition_bytes,
+            footer_sha256: footer.map(str::to_string),
+            vbmeta_sha256: vbmeta.map(str::to_string),
+            footer_present,
+            outcome,
+            problem: problem.map(str::to_string),
+        }
+    }
+
+    /// Like [`observed`] but lets the caller choose the outcome explicitly — used
+    /// to exercise `avb_malformed` / `avb_no_footer` branches.
+    fn observed_as(
+        code: &str,
+        partition_bytes: u64,
+        problem: Option<&str>,
+    ) -> deploy::AvbObservation {
+        let outcome = match code {
+            "avb_ok" => deploy::AvbOutcome::Ok,
+            "avb_no_footer" => deploy::AvbOutcome::NoFooter,
+            "avb_malformed" => deploy::AvbOutcome::Malformed,
+            _ => deploy::AvbOutcome::Unobservable,
+        };
+        let present = outcome == deploy::AvbOutcome::Ok;
+        deploy::AvbObservation {
+            source: "/dev/block/by-name/boot".into(),
+            partition_bytes,
+            footer_sha256: if present { Some(F.to_string()) } else { None },
+            vbmeta_sha256: if present { Some(V.to_string()) } else { None },
+            footer_present: present,
+            outcome,
+            problem: problem.map(str::to_string),
+        }
+    }
+
+    const F: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const V: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// The only PASS branch: deploy measured, and the re-measurement matches.
+    #[test]
+    fn avb_verdict_passes_only_on_matching_measurements() {
+        let state = avb_state("avb_ok", Some(F), Some(V), Some(8192));
+        let live = observed(8192, Some(F), Some(V), None);
+        let c = avb_verdict(Some(&state), &live);
+        assert!(c.ok, "detail={}", c.detail);
+        assert!(c.critical, "a verified AVB claim stays critical: {}", c.detail);
+        assert_eq!(c.status, "ok");
+        assert!(c.detail.contains("measured OK"), "detail={}", c.detail);
+    }
+
+    /// **Negative sample: footer destroyed.** Deploy saw a footer, the device now
+    /// has none → FAIL (and critical). Under the old tautology this scenario was
+    /// unreachable, because nobody ever read the partition.
+    #[test]
+    fn avb_verdict_fails_when_footer_disappears() {
+        let state = avb_state("avb_ok", Some(F), Some(V), Some(8192));
+        // A *measured* no-footer (the partition was read; the magic is gone).
+        let live = observed_as("avb_no_footer", 8192, Some("no AVB footer (magic at -64 is ...)"));
+        let c = avb_verdict(Some(&state), &live);
+        assert!(!c.ok, "missing footer must FAIL: {}", c.detail);
+        assert!(c.critical, "a destroyed footer is a real regression: {}", c.detail);
+        assert_eq!(c.status, "fail");
+        assert!(c.detail.contains("missing now"), "detail={}", c.detail);
+    }
+
+    /// **Negative sample: footer or vbmeta modified.** Same size, same footer
+    /// magic, different bytes → FAIL. The footer digest alone would catch a
+    /// footer rewrite; the vbmeta digest catches payload tampering.
+    #[test]
+    fn avb_verdict_fails_when_vbmeta_changes() {
+        let state = avb_state("avb_ok", Some(F), Some(V), Some(8192));
+        let tampered_vbmeta = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let c = avb_verdict(Some(&state), &observed(8192, Some(F), Some(tampered_vbmeta), None));
+        assert!(!c.ok, "changed vbmeta must FAIL: {}", c.detail);
+        assert!(c.critical);
+        assert_eq!(c.status, "fail");
+        assert!(c.detail.contains("vbmeta digest"), "detail={}", c.detail);
+
+        let tampered_footer = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let c = avb_verdict(
+            Some(&state),
+            &observed(8192, Some(tampered_footer), Some(V), None),
+        );
+        assert!(!c.ok, "changed footer must FAIL: {}", c.detail);
+        assert!(c.detail.contains("footer digest"), "detail={}", c.detail);
+    }
+
+    /// **Negative sample: partition resized.** The footer lives at the end, so a
+    /// resize necessarily moves it — even with identical digests this must FAIL.
+    #[test]
+    fn avb_verdict_fails_when_partition_size_changes() {
+        let state = avb_state("avb_ok", Some(F), Some(V), Some(8192));
+        let c = avb_verdict(Some(&state), &observed(16384, Some(F), Some(V), None));
+        assert!(!c.ok, "resize must FAIL: {}", c.detail);
+        assert!(c.critical);
+        assert!(c.detail.contains("partition size"), "detail={}", c.detail);
+    }
+
+    /// A footer appearing where there was none is also a rewrite → FAIL.
+    #[test]
+    fn avb_verdict_fails_when_footer_appears() {
+        let state = avb_state("avb_no_footer", None, None, Some(8192));
+        let c = avb_verdict(Some(&state), &observed(8192, Some(F), Some(V), None));
+        assert!(!c.ok, "appearing footer must FAIL: {}", c.detail);
+        assert!(c.critical);
+        assert!(c.detail.contains("was rewritten"), "detail={}", c.detail);
+    }
+
+    /// "No footer" on both sides is a legitimate un-AVB'd device, but it is
+    /// **not** a pass: nothing was verified. Non-critical so the device is not
+    /// pushed into `needs_repair` for a state we cannot act on.
+    #[test]
+    fn avb_verdict_no_footer_is_not_a_pass() {
+        let state = avb_state("avb_no_footer", None, None, Some(8192));
+        // Readable partition that genuinely carries no AVB footer.
+        let c = avb_verdict(
+            Some(&state),
+            &observed_as("avb_no_footer", 8192, Some("no AVB footer")),
+        );
+        assert!(!c.ok, "no footer must not be reported as ok: {}", c.detail);
+        assert!(!c.critical, "unverifiable device state must not be critical: {}", c.detail);
+        assert_eq!(c.status, "unknown", "must render as unknown, not [ok]");
+        assert!(c.detail.contains("not a pass"), "detail={}", c.detail);
+    }
+
+    /// **Unknown is never a pass.** An unreadable block device reports
+    /// `ok=false` + `status=unknown`, so the text UI prints neither `[ok]` nor
+    /// `[fail]` — matching the existing `rc_started` convention ("无法判定报
+    /// unknown 不误报失败") while still refusing to claim a pass.
+    #[test]
+    fn avb_verdict_unobservable_is_unknown_not_pass() {
+        let state = avb_state("avb_ok", Some(F), Some(V), Some(8192));
+        let c = avb_verdict(Some(&state), &observed(0, None, None, Some("no readable boot partition")));
+        assert!(!c.ok, "unobservable must not pass: {}", c.detail);
+        assert!(!c.critical, "unknown must not be critical: {}", c.detail);
+        assert_eq!(c.status, "unknown");
+        assert!(c.detail.contains("unknown"), "detail={}", c.detail);
+        assert!(c.detail.contains("NOT a pass"), "detail={}", c.detail);
+    }
+
+    /// Deploy itself could not measure (recorded `avb_unobservable`) → still not
+    /// a pass, even if the device is readable now: there is no baseline.
+    #[test]
+    fn avb_verdict_without_recorded_measurement_never_passes() {
+        let state = avb_state("avb_unobservable", None, None, None);
+        let c = avb_verdict(Some(&state), &observed(8192, Some(F), Some(V), None));
+        assert!(!c.ok, "no baseline must not pass: {}", c.detail);
+        assert_eq!(c.status, "unknown");
+        assert!(c.detail.contains("NOT a pass"), "detail={}", c.detail);
+    }
+
+    /// The old sentinel string is now **worthless**: a state.json still holding
+    /// `"vbmeta_untouched"` (e.g. written by the buggy build) must fail loudly
+    /// rather than keep passing. This is the direct regression test for the S1
+    /// bug: with the old code this exact input returned `ok=true`.
+    #[test]
+    fn avb_verdict_rejects_legacy_self_referential_sentinel() {
+        let legacy = avb_state("vbmeta_untouched", None, None, None);
+        let c = avb_verdict(Some(&legacy), &observed(8192, Some(F), Some(V), None));
+        assert!(
+            !c.ok,
+            "the legacy constant must no longer be accepted (that was the bug): {}",
+            c.detail
+        );
+        assert_eq!(c.status, "unknown");
+        assert!(c.detail.contains("not a measurement"), "detail={}", c.detail);
+    }
+
+    /// Missing state.json → not a pass.
+    #[test]
+    fn avb_verdict_without_state_is_not_a_pass() {
+        let c = avb_verdict(None, &observed(8192, Some(F), Some(V), None));
+        assert!(!c.ok, "detail={}", c.detail);
+        assert_eq!(c.status, "unknown");
+        assert!(c.detail.contains("no state.json"), "detail={}", c.detail);
+    }
+
+    /// `pending` (stage=undeployed) is the one non-`ok`-renderable exception:
+    /// it is "not applicable yet", not an assertion, so it stays `ok: true` with
+    /// a distinct status — and it must never be confused with `unknown`.
+    #[test]
+    fn pending_and_unknown_are_distinct_statuses() {
+        let pending = Check::pending("avb_untouched", "first-boot self-check");
+        assert!(pending.ok);
+        assert!(!pending.critical);
+        assert_eq!(pending.status, "pending");
+
+        let unknown = Check::unknown("avb_untouched", "cannot read".into());
+        assert!(!unknown.ok);
+        assert!(!unknown.critical);
+        assert_eq!(unknown.status, "unknown");
+        assert_ne!(pending.status, unknown.status);
+        // Neither may ever render as the passing label.
+        assert_ne!(unknown.status, "ok");
+    }
+
+    // -----------------------------------------------------------------------
+    // `short_sha` must never panic (auditor finding 2026-11-10).
+    //
+    // It formats digests read from `state.json`, which an attacker or a bad write
+    // can fill with arbitrary bytes. The old `&sha[..16]` sliced by **byte** and
+    // panicked whenever byte 16 was not a UTF-8 char boundary — and release builds
+    // use `panic = "abort"`, so a corrupted state file would abort `apd selftest`
+    // instead of reporting the corruption.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn short_sha_handles_multibyte_and_short_inputs() {
+        // Multi-byte chars: 16 *bytes* lands mid-character, 16 *chars* does not.
+        let multibyte = "Ω".repeat(40); // 2 bytes per char
+        let out = short_sha(Some(&multibyte));
+        assert_eq!(out.chars().count(), 17, "16 chars + ellipsis: {out}");
+        assert!(out.ends_with('…'), "{out}");
+
+        // 3-byte and 4-byte code points, and a mix.
+        for s in [
+            "日本語".repeat(20),
+            "😀".repeat(20),
+            format!("{}{}", "Ω".repeat(9), "日本語日本語日本"), // 9 + 8 = 17 chars
+        ] {
+            let out = short_sha(Some(&s));
+            assert!(out.ends_with('…'), "{out}");
+        }
+
+        // A byte-16-boundary-violating prefix in isolation: 15 ASCII + 1 two-byte
+        // char means byte offset 16 is *inside* the char — the old code panicked.
+        let boundary = format!("{}{}", "a".repeat(15), "Ω".repeat(10));
+        let _ = short_sha(Some(&boundary));
+
+        // Short inputs pass through untouched; anything non-ASCII short is safe.
+        assert_eq!(short_sha(Some("abc")), "abc");
+        assert_eq!(short_sha(Some("Ω")), "Ω");
+        assert_eq!(short_sha(None), "<none>");
+
+        // Exactly 16 chars still gets the ellipsis treatment.
+        let sixteen = "a".repeat(16);
+        assert_eq!(short_sha(Some(&sixteen)), format!("{}…", "a".repeat(16)));
+        // 15 chars is returned verbatim.
+        assert_eq!(short_sha(Some(&"a".repeat(15))), "a".repeat(15));
+    }
+
+    /// The malformed footer is its own outcome — not "no footer", not a pass.
+    #[test]
+    fn avb_verdict_malformed_footer_is_distinct_from_no_footer() {
+        let state = avb_state("avb_ok", Some(F), Some(V), Some(8192));
+        let malformed = observed_as("avb_malformed", 8192, Some("vbmeta range exceeds partition"));
+        let c = avb_verdict(Some(&state), &malformed);
+        assert!(!c.ok, "malformed must fail: {}", c.detail);
+        assert!(c.critical, "a footer that became malformed is a regression: {}", c.detail);
+        assert_eq!(c.status, "fail");
+        assert!(c.detail.contains("structurally invalid"), "detail={}", c.detail);
+
+        // With no valid baseline it must still not pass.
+        let no_baseline = avb_state("avb_no_footer", None, None, Some(8192));
+        let c = avb_verdict(Some(&no_baseline), &malformed);
+        assert!(!c.ok, "detail={}", c.detail);
+        assert_eq!(c.status, "fail");
     }
 }

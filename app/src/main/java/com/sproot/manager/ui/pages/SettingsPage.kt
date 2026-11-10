@@ -157,10 +157,15 @@ fun SettingsPager(
         confirmText = "重新生成",
         onConfirm = {
             showRotateConfirm = false
-            key = runCatching { store.rotate() }.onFailure {
-                AppLog.error("Settings", "轮换密钥失败", it)
-            }.getOrNull()
-            AppLog.warn("Settings", "已轮换 Root 密钥：旧密钥修补的内核必须重新修补并刷入")
+            // rotate() 会真的写 Keystore（生成新密钥 + 可能迁移旧格式），绝不能留在主线程做：
+            // 交给后台线程执行，结果回来再更新 UI（期间卡片短暂显示旧密钥，与其它异步动作一致）。
+            Thread {
+                val rotated = runCatching { store.rotate() }.onFailure {
+                    AppLog.error("Settings", "轮换密钥失败", it)
+                }.getOrNull()
+                key = rotated
+                AppLog.warn("Settings", "已轮换 Root 密钥：旧密钥修补的内核必须重新修补并刷入")
+            }.start()
         },
         onDismiss = { showRotateConfirm = false },
     )

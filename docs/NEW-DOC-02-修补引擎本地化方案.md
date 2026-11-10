@@ -38,7 +38,7 @@
 ```
 engine/src/
 ├── skroot_patch_main.cpp       CLI/参数/NDJSON/report（DOC-C1 实现）
-├── patch_pipeline.cpp          五组 hook 编排（A1 §7）
+├── patch_pipeline.cpp          hook 编排（五类 hook 机制族 → 实际织入 11/14 组，见 §2.3；A1 §7）
 ├── analyze/                    kallsyms 解析（3.10~6.18 七套实现）
 ├── patch_*.cpp                 do_execve/filldir64/compat_filldir/avc_denied/audit_log_start
 ├── 3rdparty/asmjit2-src/       A64 汇编器（源码内编，4.9 MB）
@@ -564,9 +564,9 @@ magiskboot 来自 Magisk（**GPL-3.0**），我们以**独立可执行程序**�
 | §1 拒绝 `.img/.gz` | `main.cpp` 扩展名检查 → rc=102；A6f 实测 | ✅ |
 | §2.1 等长产物 | 写回逻辑基于输入 `file_buf` 拷贝；Tier B2 断言待样本 | ⏳ |
 | §2.2 密钥三处明文（stdout 末行 / NDJSON result / report.json） | `main.cpp` `ROOT_KEY=` 兜底行 + `emit_result` + `build_report`；A6c 实测输出含 `ROOT_KEY=` | ✅ |
-| **§2.3 `hooks[]` 逐 hook 落位（P1 新增，非破坏性）** | 引擎已输出顶层 `hooks[]`：每项 `{group,name,resolved,reason?,hook_addr,trampoline,bytes,patch_offset,orig_bytes,new_bytes,len,target_addr,target_resolved,patches[]}`；无法解析的组输出 `resolved:false + reason`（不省略）；`huawei_bypass` 仅在**内核存在 hkip_check_*_root 符号**时才产出（不适用 ≠ 失败）。魅族 21(6.1.25) 实测 **14 组**（cfi_bypass/drm×2/do_execve/filldir64×3/compat_filldir×3/avc_check/avc_denied/audit_log_start/embed_key）。旧 `hook_table` 聚合字段**原样保留** | ✅ |
-| **组数自校验 `hook_groups_expected`（P1 二期）** | 引擎自算期望组数（**唯一来源** `hook_groups_expected_count(ge61, huawei)`）：≥6.1 基 14、<6.1 基 11，`+1` when huawei 符号存在；report 并列输出 `hook_branch`(>=6.1/<6.1)、`hook_has_huawei_symbols`、`hook_groups_expected_source`(kernel/assume)。断言口径：**`hook_groups_count == hook_groups_expected` 严格等值** + `hook_groups_resolved >= expected - huawei` —— 比下界敏感，少织一组即红 | ✅ |
-| 组数分支自检（无真镜像覆盖 <6.1） | `--self-test-groups [--assume-kernel-version V] [--assume-huawei-symbols]`（隐藏测试参数，不面向用户）：输出 `branch/base/huawei/hook_groups_expected`，CI/A8 断言矩阵 `<6.1: 5.10.0→11, +huawei→12, 5.15.104→11`；`>=6.1: 6.1.0→14, +huawei→15, 6.6.30→14` | ✅ |
+| **§2.3 `hooks[]` 逐 hook 落位（P1 新增，非破坏性）** | 引擎已输出顶层 `hooks[]`：每项 `{group,name,resolved,reason?,hook_addr,trampoline,bytes,patch_offset,orig_bytes,new_bytes,len,target_addr,target_resolved,patches[]}`；无法解析的组输出 `resolved:false + reason`（不省略）；`huawei_bypass` 仅在**内核存在 hkip_check_*_root 符号**时才产出（不适用 ≠ 失败）。魅族 21(6.1.25) 实测 **14 组**（cfi_bypass/drm×2/do_execve/filldir64×3/compat_filldir×3/avc_check/avc_denied/audit_log_start/embed_key）。旧 `hook_table` 聚合字段**原样保留** | ✅ <br>⚠️ **2026-11-10 记录一处未解冲突**：`docs/TEAM-HANDOFF-2026-11-09.md:35` 写「魅族21 实测 **15 组**」，与本行「14 组」不符。两者可能对应不同引擎版本/是否含 huawei 符号，**当前无法判定**（真机样本不在本仓）。以引擎自算 `hook_groups_expected` 为准时，非华为 6.1.25 应为 14；若实测 15 说明该机存在 `hkip_check_*_root` 符号。**待真机复核后收敛**，勿据此改断言。 |
+| **组数自校验 `hook_groups_expected`（P1 二期）** | 引擎自算期望组数（**唯一来源** `hook_groups_expected_count(ge61, huawei, launcher_rc)`，`engine/src/patch_pipeline.h:52-62`）：≥6.1 基 **14**、<6.1 基 **11**，`+1` when huawei 符号存在，**`+1` when 显式 `--launcher rc`**（2026-11-10 修订：原写两参，代码实为三参，第三参默认 false）；report 并列输出 `hook_branch`(>=6.1/<6.1)、`hook_has_huawei_symbols`、`hook_groups_expected_source`(kernel/assume)。断言口径：**`hook_groups_count == hook_groups_expected` 严格等值** + `hook_groups_resolved >= expected - huawei` —— 比下界敏感，少织一组即红 | ✅ |
+| 组数分支自检（无真镜像覆盖 <6.1） | `--self-test-groups [--assume-kernel-version V] [--assume-huawei-symbols]`（隐藏测试参数，不面向用户）：输出 `branch/base/huawei/hook_groups_expected`，CI/A8 断言矩阵 `<6.1: 5.10.0→11, +huawei→12, 5.15.104→11`；`>=6.1: 6.1.0→14, +huawei→15, 6.6.30→14`；**`--launcher rc` 维度再加 2 例（6.1.0+rc→15、6.1.0+huawei+rc→16），矩阵共 8 例**（`skroot_patch_main.cpp:643-648`） | ✅ |
 | §2.3 report schema | `build_report`（engine_version/input/output/hook_table/hidden_dir_prefix…） | ✅（Tier B5 待样本验证） |
 | §3 退出码 11 枚举 | `ExitCode` enum；A6b/A6c/A6e 实测 101/102 | ✅ |
 | §3 失败不落盘铁律 | `fail()` 内 `fs::remove(opt.out_path)`；A6d 实测 | ✅ |
@@ -1824,7 +1824,8 @@ adb shell 'cd /data/local/tmp/patch && ./skroot-patch --in kernel --out kernel.p
   - rc=0，stdout 末行 `ROOT_KEY=<48字符>`；`ev.ndjson` 含 progress 阶段序列
     `read_input → parse_kallsyms → derive_offsets → locate_init_cred → patch_cfi_huawei → patch_hooks → embed_key → write_output` 与唯一 `result` 终态
   - `size(kernel.patched) == size(kernel)`（等长，C1 §2.1）
-  - `kernel.patched.report.json`：`hook_groups_count >= 13`、`hook_groups_resolved >= 10`、
+  - `kernel.patched.report.json`：`hook_groups_count == hook_groups_expected`（**严格等值**，见 C.3b；
+    ~~`>= 13`~~ 为旧的弱下界口径，2026-11-10 修订：与 §2.3「组数自校验」互相矛盾，以严格等值为准）、`hook_groups_resolved >= expected - (hook_has_huawei_symbols?1:0)`（原写 `>= 10`，同属旧弱下界，一并按期望值表达式化）、
     `hooks[group=embed_key].new_bytes` = `key[0:47]` hex + `00`（**96 hex = 48 字节**）、`key_spec.abi == "47+nul"`（另见 `bytes=48 / last_byte_is_nul=true / input_len=48`）
 - **耗时预期**：宿主机 33.9 MB 内核 **6.4 s**；qemu 模拟 **226 s**；真机（8 核 A 系）预计 **3–10 s**。
   若 >60 s 仍未结束：检查是否 `--workdir` 落在 sdcard（FUSE 慢），应放 `/data/local/tmp`

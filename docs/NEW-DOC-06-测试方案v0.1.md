@@ -7,7 +7,7 @@
 - 项目定位：**从零实现全新 SP 管理器**，仅在安卓手机本地完成 boot 镜像修补，UI 用 miuix，参考 KSU/APatch 交互范式。**旧路线（改造 APatch 管理器 + 手机内调 kptools）已放弃**，旧交付物不再作为被测对象。
 - 读者：leader、架构（architect）、修补（patcher）、客户端（app-client）、系统（sys-guard）
 - 输入依据：
-  - `docs/SPROOT-DOC-A1-SKRoot机制深度分析.md`（SK 机制、五组 hook、48 位密钥、失败不落盘）
+  - `docs/SPROOT-DOC-A1-SKRoot机制深度分析.md`（SK 机制、**五类 hook 机制族／实际织入 11 或 14 组**、48 位密钥、失败不落盘）
   - `docs/SPROOT-DOC-C1-修补引擎IO契约.md`（引擎 CLI/退出码/NDJSON/report/验收必查 7 项）
   - `docs/phase2_skroot_ap_call_contract_draft.md`（已定稿 v1.0：execve 提权判据、方案 B 无状态密钥、日志脱敏）
   - `docs/phase2_boot_sequence_analysis_draft.md`（SK 内核零事件能力 → AP 用户态事件引擎、rc 注入、`/data/adb/sproot/key`）
@@ -270,7 +270,7 @@
 
 ### 3.3 自动化落地方式（可脚本化部分）
 
-`quality/static/verify_error_visibility.sh`（**待研发产物到位后编写**，本方案先固化断言规则）：
+`quality/static/error_visibility.sh`（**计划中，文件尚不存在**；本方案先固化断言规则，与 §3A 脚本计划表的命名统一 —— 2026-11-10 修订：原写作 `verify_error_visibility.sh`，与表中 `error_visibility.sh` 不一致）：
 1. `adb logcat -d` 抓取 → 断言出现期望错误码字符串与 stage 名；
 2. `adb shell pidof <pkg>` 断言 App 存活；
 3. `adb pull` 日志目录 → 断言文件非空、含错误码、含 5 阶段之一；
@@ -287,8 +287,8 @@
 
 | # | 名称 | 对应旧缺陷 | 执行方法 | 判定（阻断） | 自动化 |
 |---|---|---|---|---|---|
-| **T1** | 二进制能力自检 | P0-a / P0-b / F1 / F2 | ①宿主解包 APK：`unzip -l` 断言 `lib/arm64-v8a/` 内引擎与解包器存在；`readelf -h` 断言 `e_machine=0xAARCH64(0xB7)`、无 x86-64 混入；②设备上打开管理器「能力自检」：逐项显示引擎可加载、解包器存在且可执行、ELF 头正确、版本号一致；③**负样本**：从测试包移除引擎/解包器后点修补 | ①APK 内依赖齐全且架构正确；②缺项时 UI **在进入修补前**阻断，文案点名「缺什么、期望放哪、如何安装」（禁止旧版 `prepare()` 静默跳过 symlink）；③负样本错误必须是「缺引擎」而非「Patch failed.」 | `quality/static/check_apk_payload.sh`（待写，T1/T6 静态部分，进 CI） |
-| **T2** | 无网络依赖 | P0-b / P3 / F3 | ①宿主断网（或 Gradle `--offline` + 空缓存）clean 构建；②断言 APK 内全部可执行依赖均来自仓库或本仓构建产物（清单 + sha256 与入库记录一致，构建日志零 http 下载）；③设备飞行模式 + 清 App 数据后完成一次完整修补（B-01 流程） | 构建期零网络依赖（下载仅允许辅助且失败必须 fail build）；设备断网修补成功。任一不满足即 FAIL | 构建日志断言 + `check_apk_payload.sh` |
+| **T1** | 二进制能力自检 | P0-a / P0-b / F1 / F2 | ①宿主解包 APK：`unzip -l` 断言 `lib/arm64-v8a/` 内引擎与解包器存在；`readelf -h` 断言 `e_machine=0xAARCH64(0xB7)`、无 x86-64 混入；②设备上打开管理器「能力自检」：逐项显示引擎可加载、解包器存在且可执行、ELF 头正确、版本号一致；③**负样本**：从测试包移除引擎/解包器后点修补 | ①APK 内依赖齐全且架构正确；②缺项时 UI **在进入修补前**阻断，文案点名「缺什么、期望放哪、如何安装」（禁止旧版 `prepare()` 静默跳过 symlink）；③负样本错误必须是「缺引擎」而非「Patch failed.」 | `quality/static/check_apk_payload.py`（**已落地**，T1/T6 静态部分，进 CI；`--self-test` 用合成 APK 夹具验证断言真实性） |
+| **T2** | 无网络依赖 | P0-b / P3 / F3 | ①宿主断网（或 Gradle `--offline` + 空缓存）clean 构建；②断言 APK 内全部可执行依赖均来自仓库或本仓构建产物（清单 + sha256 与入库记录一致，构建日志零 http 下载）；③设备飞行模式 + 清 App 数据后完成一次完整修补（B-01 流程） | 构建期零网络依赖（下载仅允许辅助且失败必须 fail build）；设备断网修补成功。任一不满足即 FAIL | 构建日志断言 + `check_apk_payload.py` |
 | **T3** | 错误可见性（专项强化） | P1（日志面板卸载、stderr 被注释） | 在 §3 EC-1~EC-8 基础上追加旧缺陷专项：①失败后日志容器**仍存在于 UI 树**（uiautomator dump 断言，不得随 `patching/patchdone` 卸载）；②真实 stderr 内容出现在 UI（禁止只显示 "Patch failed." 之类无信息文案）；③日志**先落盘后更新 UI**（杀进程后文件仍在）；④5 场景：缺引擎 / 引擎 rc=126 / rc=1 / 引擎崩溃 / 超时 | §3 EC-1~EC-8 全通过 + 上述 4 条专项全通过；缺一即 FAIL | `error_visibility.sh`（待写，§3.3） |
 | **T4** | 失败不假成功 | P2 / F6 / F7（`echo; exit $?`、abort 用 `exit 0`、rc 被覆盖、未校验产物即打印 Successfully） | ①**壳层静态审查**：修补执行层（脚本或等价逻辑）无 `exit $?`、无 `; exit 0` 作 abort、存在 `set -eu`、每条外部命令 rc 立即捕获；②**动态注入**：引擎分别返回 {1,126,127,139,255, 超时} → App 必须显示失败、状态为失败、无产物、日志含真实 rc；③成功文案与产物一致性：出现「成功」必须有产物 | 所有注入 rc 如实传播、UI 状态与退出码一致；失败时 `--out`/new-boot.img **不存在**（C1 §3 铁律）；出现「成功文案 + 无产物」即判 **P0 缺陷**（比崩溃更危险） | `rc_fidelity.sh`（待写，壳层 rc 矩阵） |
 | **T5** | 成功校验 | F7（脚本打印 Successfully 与真实产出无关） | 成功路径逐项断言：①`new-boot.img` 存在；②头部魔数 `ANDROID!`；③size ≤ boot 分区 size；④产物 `patched=true` 回读一致（`kptools -l -i` 或引擎 report）；⑤`report.root_key == 传入 key`（防刷入他人密钥）；⑥产物 sha256 写入日志与 UI | 6 项全满足才允许显示「成功」；任一不满足必须转失败态并给原因（防「未刷入当已刷入」） | B-01 断言 + `patched` 回读脚本 |
@@ -300,13 +300,18 @@
 
 **T 组与 B 组映射**：T3 ⊂ B-06（B-06 是产品级验收项，T3 是其旧缺陷专项证据）；T4/T5 ⊂ B-01 失败/成功分支；T1/T2/T6/T7 为独立阻断项，无对应 B 项时单独计门禁。
 
-**T 组脚本计划**（待研发产物到位后补齐，接口先定）：
-| 脚本 | 覆盖 | 输入 | 预计依赖 |
-|---|---|---|---|
-| `quality/static/check_apk_payload.sh` | T1/T2/T6 静态 | APK 文件 + 依赖清单 | `unzip`、`readelf`/`file`、`sha256sum` |
-| `quality/static/rc_fidelity.sh` | T4 | 修补执行层 + 注入桩 | `bash`、引擎桩（返回指定 rc） |
-| `quality/static/error_visibility.sh` | T3/B-06 | 设备 + APK | `adb`、`uiautomator` |
-| `quality/static/path_binding_static.sh` | T7 静态 | 客户端源码 | `grep`/`rg` |
+**T 组脚本计划**（**2026-11-10 修订：`quality/static/` 实况为 10 个脚本，下表区分「已落地」与「计划中」**）：
+
+| 脚本 | 状态 | 覆盖 | 输入 | 依赖 |
+|---|---|---|---|---|
+| `quality/static/check_apk_payload.py` | ✅ **已落地** | T1/T2/T6 静态 | APK 文件 + 依赖清单 | **纯 Python**（`zipfile` + 自解析 ELF 头），不依赖 `unzip`/`readelf`/`sha256sum`；可选 `--lock app/native.lock.json`、`--expect-commit`、`--json`、`--self-test` |
+| `quality/static/check_rc_template.py` | ✅ 已落地 | rc 模板结构化校验（替代 `apk.yml` 里四条子串 grep） | `apd/assets/init.sproot.rc` | 纯 Python（剥注释后按 service 块断言，注释不参与判定） |
+| `quality/static/check_apd_capabilities.py` | ✅ 已落地 | apd 能力门禁（替代 `apd.yml` 的 `grep -aq` 字符串搜索） | `libapd.so` | 纯 Python（符号/串级断言，能对「功能已删但字符串残留」变红） |
+| ~~`rc_fidelity.sh`~~ | ⏳ **计划中，文件尚不存在** | T4 | 修补执行层 + 注入桩 | `bash`、引擎桩（返回指定 rc） |
+| ~~`error_visibility.sh`~~ | ⏳ **计划中，文件尚不存在** | T3/B-06 | 设备 + APK | `adb`、`uiautomator` |
+| ~~`path_binding_static.sh`~~ | ⏳ **计划中，文件尚不存在** | T7 静态 | 客户端源码 | `grep`/`rg` |
+
+> **纪律提示（本表的历史教训）**：本方案曾把 `check_apk_payload.sh`（`.sh`）当作「已落地门禁」引用，但 `quality/static/` 下**从未存在过这个文件** —— 文档承诺的门禁是空的。2026-11-10 已由 ci-dev 补成 `check_apk_payload.py`（真实、可失败、带 `--self-test` 负样本）。**凡在此表标注「计划中」的脚本，正文引用处不得写成「已交付/进 CI」**；反过来，新增脚本须同步本表与本文件 §4 的清单。
 
 ---
 
@@ -332,7 +337,7 @@
 | V-10 | NDJSON 合法 | 每行合法 JSON；`phase` ∈ 固定枚举；终态 `result` 唯一且为最后一条 | 成立 | V6 |
 | V-11 | 失败不落盘 | 构造 E210/E220/E102 负样本 → 退出码对应且 `--out` **不存在**；workdir 保留 | 成立 | 手工 + V2 负样本 |
 | V-12 | 退出码枚举稳定 | 101/102/201/202/210/211/220/230/240 逐类可复现且语义正确 | 成立 | 手工矩阵（附记录表） |
-| V-13 | 改动区域受控 | out 与 in 的差异区段数 ≥5（五个 hook）、单区段 ≤ 512B、总改动 ≤ 256KB；差异区段与 report 地址可对应 | 成立（弱断言，防「大段重写」） | V4 |
+| V-13 | 改动区域受控 | out 与 in 的差异区段数 ≥5（**下限取「五类 hook 机制族」**，非织入组数；实际组数按内核版本 11/14，见 `engine/src/patch_pipeline.h:52-62`）、单区段 ≤ 512B、总改动 ≤ 256KB；差异区段与 report 地址可对应。2026-11-10 修订：此断言**与 §2.3 的「`hook_groups_count == hook_groups_expected` 严格等值」互补**——V-13 是弱下界（防大段重写），§2.3 是强等值（少织一组即红），二者不可互相替代 | 成立（弱断言，防「大段重写」） | V4 |
 | V-14 | SELinux policy 零 diff | policy 数据区定位困难 → 降级为「除 hook 区段外无 diff」（由 V-13 保证），另用 `avc_denied`/`audit_log_start` 符号区仅被跳板重定向做人工复核 | 成立 | V-13 + 人工 |
 | V-15 | 重打包链路无损 | 原厂 boot.img：`magiskboot unpack` → `repack` → 再 `unpack`，vmlinux/ramdisk sha256 与首次一致；产物可被再次解包 | 成立 | 手工脚本（§4.3） |
 | V-16 | APK 内 arm64 产物合规 | APK 解包后 `lib/arm64-v8a/` 含引擎（ELF aarch64）、无 x86_64 残留；`extractNativeLibs` 策略与「可执行化」方案一致；文件非 0 字节 | 成立 | 手工/CI 脚本 |
@@ -340,7 +345,7 @@
 | V-18 | 密钥不入日志/产物 | 全量日志、导出目录、`/sdcard`、report 之外的产物：明文密钥与 key[:16] 零命中（report 允许 `root_key` 字段，但需标注为"含密钥，禁止外发"） | 成立 | grep 脚本 |
 | V-19 | 失败可见性静态部分 | APK 源码/资源中存在 5 阶段 × 错误码映射表；无「catch 后静默 return」路径（代码审查 + 静态扫描 `catch (e) {}` 空块） | 成立 | 代码审查 |
 | V-20 | 引擎版本一致 | APK 内嵌引擎 `--version`/report `engine_version` 与 CI 构建记录一致（防「装的不是打的」） | 成立 | 手工 |
-| V-21 | 构建期无网络依赖（T2 静态部分） | 断网/`--offline` clean 构建；APK 内可执行依赖清单每条均有入库或本仓构建来源 + sha256 | 成立 | `check_apk_payload.sh` |
+| V-21 | 构建期无网络依赖（T2 静态部分） | 断网/`--offline` clean 构建；APK 内可执行依赖清单每条均有入库或本仓构建来源 + sha256 | 成立 | `check_apk_payload.py` |
 | V-22 | release 包可用（T6 静态部分） | release APK 内引擎/解包器与 debug 包 sha256 一致；密钥/修补路径无 `BuildConfig.DEBUG` 门控 | 成立 | CI + grep |
 | V-23 | 单一调用路径与 exec 位置（T7 静态部分） | 全工程仅一条修补调用链；无 `sh -c` 拼串、无位置参数透传；ELF 不在 filesDir 直接 exec | 成立 | `path_binding_static.sh` |
 

@@ -24,8 +24,67 @@ use crate::utils::*;
 use crate::{
     assets,
     defs::{self, MODULE_DIR, MODULE_UPDATE_DIR},
-    metamodule, restorecon,
+    deploy, metamodule, restorecon,
 };
+
+// ---------------------------------------------------------------------------
+// AVB audit fields for the module `--json` contract (2026-11-10 S1b).
+//
+// These three responses used to emit the literal `"avb_untouched": true`: an
+// assertion that the module operation did not touch the boot partition, made
+// without ever looking at it. That is the same self-referential pattern the S1
+// fix removed from `deploy`/`selftest`, and leaving one copy in place would have
+// kept a back door open (Lead ruling, task-12).
+//
+// The replacement is a *measured* observation, but the module path is a hot path
+// where audit information must never decide whether the operation succeeded:
+//   * the probe is read-only and best-effort — any failure yields
+//     `avb_status: "unobservable"` with a reason, and the install/uninstall
+//     still succeeds (exit 0, `"ok": true`);
+//   * it uses the footer-only probe (`probe_avb_footer_only`) to keep the cost to
+//     one 64 B tail read instead of also reading the whole vbmeta section — see
+//     `deploy::observe_avb_footer_only_from_path` for what that trades away.
+// `avb_untouched` is retained as a *derived, measured* boolean so existing
+// consumers (the manager prints it) keep working, but it is now
+// `avb_status == "avb_ok"` — i.e. false (or null) whenever nothing was measured.
+// ---------------------------------------------------------------------------
+
+/// Audit fields shared by every module `--json` response.
+///
+/// Deliberately infallible: it returns a JSON fragment, never a `Result`, so a
+/// broken/unreadable boot partition can never turn a successful module
+/// operation into a failure.
+fn avb_audit_fields() -> serde_json::Value {
+    let observed = deploy::probe_avb_footer_only();
+    let status = observed.code();
+    // Short code without the `avb_` prefix, matching the task's field spec
+    // (`ok|no_footer|unobservable`) while staying 1:1 with `AvbObservation::code`.
+    let short = status.strip_prefix("avb_").unwrap_or(status);
+    serde_json::json!({
+        "avb_status": short,
+        // Derived, not asserted: true only when the footer was actually measured.
+        "avb_untouched": observed.footer_present,
+        // Measured footer digest (absent when nothing was observed).
+        "avb_footer_sha256": observed.footer_sha256,
+        // Why the observation is not `ok` — never omitted silently.
+        "avb_detail": match (short, &observed.problem) {
+            ("ok", _) => observed.source.clone(),
+            (_, Some(problem)) => problem.clone(),
+            (_, None) => observed.source.clone(),
+        },
+    })
+}
+
+fn merge_avb_audit(mut payload: serde_json::Value) -> serde_json::Value {
+    if let (Some(obj), serde_json::Value::Object(audit)) =
+        (payload.as_object_mut(), avb_audit_fields())
+    {
+        for (key, value) in audit {
+            obj.insert(key, value);
+        }
+    }
+    payload
+}
 
 const INSTALLER_CONTENT: &str = include_str!("../assets/installer.sh");
 const INSTALL_MODULE_SCRIPT: &str = concatcp!(
@@ -54,6 +113,74 @@ const MIN_FREE_BYTES: u64 = 64 * 1024 * 1024;
 /// Installer scripts may legitimately take a while (unpacking, patching files),
 /// but must never hang the manager forever.
 const INSTALL_TIMEOUT_SECS: u64 = 300;
+
+// ---------------------------------------------------------------------------
+// Typed install errors (2026-11-10 S1).
+//
+// Before this, `_install_module_inner` returned a plain `anyhow::Error` and the
+// `--json` entry point classified the failure by grepping the formatted message
+// for the words "script"/"installer". Consequences:
+//   * `EXIT_TIMEOUT` (124) was **declared but unreachable** — the timeout path
+//     bailed with a string containing "installer", so it landed on 120
+//     (EXIT_SCRIPT_FAILED), and no caller could ever observe 124;
+//   * rewording an error message silently changed the exit code.
+//
+// The error below carries the classification *by construction*; the message is
+// only for humans. `ModuleError::exit_code` is the single mapping point and is
+// unit-tested (`mod tests`), including a negative sample proving the timeout is
+// no longer confused with a script failure.
+// ---------------------------------------------------------------------------
+#[derive(Debug)]
+pub enum ModuleError {
+    /// The installer script exited non-zero (module rejected the device).
+    ScriptFailed(String),
+    /// The installer exceeded `INSTALL_TIMEOUT_SECS` and was killed (exit 124).
+    Timeout { secs: u64 },
+    /// Anything else on the install path (unpack, permissions, selinux…).
+    Io(String),
+}
+
+impl ModuleError {
+    /// Maps to the contract exit codes (NEW-DOC-05 §3.1.2, documented as
+    /// 110/111/112/113/114/115/116/120/121/122/124).
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            ModuleError::ScriptFailed(_) => EXIT_SCRIPT_FAILED,
+            ModuleError::Timeout { .. } => EXIT_TIMEOUT,
+            ModuleError::Io(_) => EXIT_IO_FAILED,
+        }
+    }
+}
+
+impl std::fmt::Display for ModuleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModuleError::ScriptFailed(msg) => write!(f, "{msg}"),
+            ModuleError::Timeout { secs } => write!(
+                f,
+                "module installer timed out after {secs}s (process group killed)"
+            ),
+            ModuleError::Io(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ModuleError {}
+
+/// Classify an `anyhow::Error` that came out of `_install_module_inner`.
+///
+/// Deliberately *type-first*: the `ModuleError` variant is found by walking the
+/// error chain, never by matching words in the message. The old code did
+/// `msg.contains("script") || msg.contains("installer")`, which both made
+/// `EXIT_TIMEOUT` unreachable and let a message reword change the exit code.
+fn classify_install_error(err: &anyhow::Error) -> i32 {
+    for cause in err.chain() {
+        if let Some(module) = cause.downcast_ref::<ModuleError>() {
+            return module.exit_code();
+        }
+    }
+    EXIT_IO_FAILED
+}
 
 /// Print human-facing progress unless `quiet` (JSON mode keeps stdout pure).
 fn say(quiet: bool, msg: &str) {
@@ -95,16 +222,19 @@ fn exec_install_script(
         }
     }
     let mut child = command.spawn().context("spawn module installer")?;
-    match wait_timeout(
-        &mut child,
-        Duration::from_secs(INSTALL_TIMEOUT_SECS),
-    )? {
-        Some(status) => ensure!(status.success(), "Failed to install module script"),
-        None => bail!(
-            "module installer timed out after {INSTALL_TIMEOUT_SECS}s (process group killed)"
-        ),
+    // Typed outcome: the *classification* is carried by the error variant, not
+    // by the wording of the message (2026-11-10 S1; see `ModuleError`).
+    match wait_timeout(&mut child, Duration::from_secs(INSTALL_TIMEOUT_SECS))? {
+        Some(status) if status.success() => Ok(()),
+        Some(status) => Err(ModuleError::ScriptFailed(format!(
+            "Failed to install module script (exit {status})"
+        ))
+        .into()),
+        None => Err(ModuleError::Timeout {
+            secs: INSTALL_TIMEOUT_SECS,
+        }
+        .into()),
     }
-    Ok(())
 }
 
 pub fn handle_updated_modules() -> Result<()> {
@@ -757,7 +887,10 @@ fn inspect_module_zip(zip_path: &Path) -> Result<ModuleZipInfo, (i32, String)> {
 
 fn write_module_state(id: &str, version: &str, version_code: i64, zip: &str) -> Result<()> {
     ensure_dir_exists(defs::MODULE_STATE_DIR)?;
-    let state = serde_json::json!({
+    // One probe, then merge: `write_module_state` runs on the install path but is
+    // not itself part of a response payload, so the audit is recorded here too
+    // (previously the file simply carried a hardcoded `"avb_untouched": true`).
+    let state = merge_avb_audit(serde_json::json!({
         "id": id,
         "version": version,
         "versionCode": version_code,
@@ -766,8 +899,7 @@ fn write_module_state(id: &str, version: &str, version_code: i64, zip: &str) -> 
             .map(|d| d.as_secs())
             .unwrap_or(0),
         "source_zip": zip,
-        "avb_untouched": true,
-    });
+    }));
     let path = Path::new(defs::MODULE_STATE_DIR).join(format!("{id}.json"));
     fs::write(&path, serde_json::to_string_pretty(&state)?)
         .with_context(|| format!("write {}", path.display()))?;
@@ -818,13 +950,10 @@ pub fn install_module_json(zip: &str) -> ! {
     };
 
     if let Err(e) = _install_module_inner(zip, true) {
-        let msg = format!("{e:#}");
-        let code = if msg.contains("script") || msg.contains("installer") {
-            EXIT_SCRIPT_FAILED
-        } else {
-            EXIT_IO_FAILED
-        };
-        json_fail(code, Some(&info.id), &msg);
+        // Type-based classification (2026-11-10 S1): `EXIT_TIMEOUT` (124) is now
+        // reachable, and no exit code depends on the wording of a message.
+        let code = classify_install_error(&e);
+        json_fail(code, Some(&info.id), &format!("{e:#}"));
     }
 
     // Installing cancels a pending removal; the `disable` flag is user state and
@@ -840,7 +969,7 @@ pub fn install_module_json(zip: &str) -> ! {
     }
     json_emit(
         0,
-        serde_json::json!({
+        merge_avb_audit(serde_json::json!({
             "ok": true,
             "id": info.id,
             "name": info.name,
@@ -853,8 +982,7 @@ pub fn install_module_json(zip: &str) -> ! {
             "changed": changed,
             "previous_version": prev.map(|(v, _)| v),
             "uncompressed_bytes": info.uncompressed,
-            "avb_untouched": true,
-        }),
+        })),
     );
 }
 
@@ -888,13 +1016,12 @@ pub fn uninstall_module_json(id: &str) -> ! {
 
     json_emit(
         0,
-        serde_json::json!({
+        merge_avb_audit(serde_json::json!({
             "ok": true,
             "id": id,
             "remove_pending": active.exists(),
             "applied_after_reboot": active.exists(),
-            "avb_untouched": true,
-        }),
+        })),
     );
 }
 
@@ -1247,4 +1374,257 @@ pub fn list_modules() -> Result<()> {
     let modules = _list_modules(defs::MODULE_DIR);
     println!("{}", serde_json::to_string_pretty(&modules)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The contract table (NEW-DOC-05 §3.1.2) is the source of truth for these
+    /// numbers; a mismatch here means the `--json` exit-code ABI drifted.
+    #[test]
+    fn module_error_codes_match_contract() {
+        assert_eq!(ModuleError::Timeout { secs: 300 }.exit_code(), 124);
+        assert_eq!(
+            ModuleError::ScriptFailed("whatever".into()).exit_code(),
+            120
+        );
+        assert_eq!(ModuleError::Io("whatever".into()).exit_code(), 121);
+        // The constants themselves are the ABI the manager already ships.
+        assert_eq!(EXIT_TIMEOUT, 124);
+        assert_eq!(EXIT_SCRIPT_FAILED, 120);
+        assert_eq!(EXIT_IO_FAILED, 121);
+    }
+
+    /// **Positive proof that 124 is reachable** — the whole point of the S1 fix.
+    /// Before it, a timeout bailed with a message containing "installer" and was
+    /// classified as 120 by the string matcher, so 124 was dead code.
+    #[test]
+    fn installer_timeout_maps_to_124() {
+        let err: anyhow::Error = ModuleError::Timeout {
+            secs: INSTALL_TIMEOUT_SECS,
+        }
+        .into();
+        assert_eq!(classify_install_error(&err), EXIT_TIMEOUT);
+        assert_eq!(classify_install_error(&err), 124);
+    }
+
+    /// Negative sample for the old heuristic: the *message* must not decide the
+    /// code. `ModuleError::Io` carries a timeout-flavoured, "installer"-flavoured
+    /// text and still maps to 121; `ScriptFailed` with no magic words maps to 120.
+    /// Under the old `msg.contains("installer")` matcher both would be 120.
+    #[test]
+    fn exit_code_does_not_depend_on_message_wording() {
+        let io_mentions_installer: anyhow::Error =
+            ModuleError::Io("module installer exploded: must install".into()).into();
+        assert_eq!(classify_install_error(&io_mentions_installer), EXIT_IO_FAILED);
+        assert_ne!(classify_install_error(&io_mentions_installer), EXIT_SCRIPT_FAILED);
+
+        let script_without_magic_words: anyhow::Error =
+            ModuleError::ScriptFailed("process exited 1".into()).into();
+        assert_eq!(
+            classify_install_error(&script_without_magic_words),
+            EXIT_SCRIPT_FAILED
+        );
+        assert_ne!(
+            classify_install_error(&script_without_magic_words),
+            EXIT_IO_FAILED
+        );
+    }
+
+    /// A `ModuleError` nested behind an `anyhow` context must still classify by
+    /// type: adding context is not allowed to reclassify (that was the trap in
+    /// the old string matcher, where `.context("install")` flipped 121 → 120).
+    #[test]
+    fn context_wrapping_preserves_classification() {
+        let wrapped = anyhow::Error::new(ModuleError::Timeout { secs: 7 })
+            .context("while installing module foo");
+        assert_eq!(classify_install_error(&wrapped), EXIT_TIMEOUT);
+    }
+
+    /// Unclassified failures stay 121 (never silently become "script failed"),
+    /// and the timeout detail still mentions the configured budget.
+    #[test]
+    fn unclassified_and_display_paths() {
+        let plain: anyhow::Error = anyhow!("some io problem");
+        assert_eq!(classify_install_error(&plain), EXIT_IO_FAILED);
+        let msg = ModuleError::Timeout {
+            secs: INSTALL_TIMEOUT_SECS,
+        }
+        .to_string();
+        assert!(msg.contains("timed out"), "{msg}");
+        assert!(msg.contains(&INSTALL_TIMEOUT_SECS.to_string()), "{msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // AVB audit fields on the module `--json` contract (2026-11-10 S1b).
+    //
+    // The old code emitted a literal `"avb_untouched": true` from
+    // `install_module_json` / `uninstall_module_json` / `write_module_state`,
+    // i.e. it asserted "the boot partition was not touched" without ever
+    // reading it. These tests pin the measured replacement and are the
+    // regression guard against that constant coming back.
+    // -----------------------------------------------------------------------
+
+    /// Scratch dir that removes itself; also owns the env-var override so tests
+    /// never race each other (`SPROOT_AVB_BOOT_IMAGE` is process-global).
+    struct AvbFixture {
+        dir: PathBuf,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+    impl AvbFixture {
+        fn new(tag: &str) -> Self {
+            // Serialise every test that mutates the process-global override.
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let unique = format!(
+                "sproot-mod-avb-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            );
+            let dir = std::env::temp_dir().join(unique);
+            fs::create_dir_all(&dir).expect("create scratch dir");
+            AvbFixture { dir, _guard: guard }
+        }
+        fn path(&self, name: &str) -> PathBuf {
+            self.dir.join(name)
+        }
+        /// Point the probe at `path` for the lifetime of the fixture.
+        fn point_at(&self, path: &Path) {
+            // SAFETY: guarded by the process-wide mutex above; no read happens
+            // between this write and the probe inside the same test.
+            unsafe { std::env::set_var(defs::AVB_BOOT_OVERRIDE_ENV, path) };
+        }
+    }
+    impl Drop for AvbFixture {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var(defs::AVB_BOOT_OVERRIDE_ENV) };
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Minimal AVB partition: `[payload][vbmeta][zero fill][64 B footer]`,
+    /// big-endian like avbtool (mirrors `deploy::tests::synth_partition`).
+    fn synth_avb_partition(total: u64, payload: &[u8], vbmeta: &[u8]) -> Vec<u8> {
+        let mut img = vec![0u8; total as usize];
+        img[..payload.len()].copy_from_slice(payload);
+        let vo = payload.len() as u64;
+        let vs = vbmeta.len() as u64;
+        img[vo as usize..(vo + vs) as usize].copy_from_slice(vbmeta);
+        let fa = (total - 64) as usize;
+        img[fa..fa + 4].copy_from_slice(b"AVBf");
+        img[fa + 4..fa + 8].copy_from_slice(&1u32.to_be_bytes());
+        img[fa + 12..fa + 20].copy_from_slice(&(vo + vs).to_be_bytes());
+        img[fa + 20..fa + 28].copy_from_slice(&vo.to_be_bytes());
+        img[fa + 28..fa + 36].copy_from_slice(&vs.to_be_bytes());
+        img
+    }
+
+    /// ① A normal device (footer present) reports a measured `ok` status and a
+    /// real footer digest — **not** a hardcoded `true`.
+    #[test]
+    fn avb_audit_reports_measured_status_on_a_real_footer() {
+        let fixture = AvbFixture::new("ok");
+        let img = synth_avb_partition(8192, b"PAYLOAD", b"VBMETA-BYTES");
+        let path = fixture.path("boot.img");
+        fs::write(&path, &img).unwrap();
+        fixture.point_at(&path);
+
+        let fields = avb_audit_fields();
+        assert_eq!(fields["avb_status"], "ok", "fields={fields}");
+        assert_eq!(fields["avb_untouched"], true);
+        let digest = fields["avb_footer_sha256"]
+            .as_str()
+            .expect("a measured footer must expose its digest");
+        assert_eq!(digest.len(), 64, "digest={digest}");
+        // The digest must be of the real footer bytes, not a placeholder.
+        let real = crate::utils::sha256_hex(&img[8192 - 64..]);
+        assert_eq!(digest, real);
+        assert!(fields["avb_detail"].as_str().unwrap_or("").contains("boot.img"));
+    }
+
+    /// ② **The required negative sample**: when the partition cannot be
+    /// observed, the audit says `unobservable` and `avb_untouched` is `false` —
+    /// never `true`. Restoring the hardcoded literal fails this test.
+    #[test]
+    fn avb_audit_reports_unobservable_when_partition_is_unreadable() {
+        let fixture = AvbFixture::new("unreadable");
+        fixture.point_at(&fixture.path("does-not-exist.img"));
+
+        let fields = avb_audit_fields();
+        assert_eq!(fields["avb_status"], "unobservable", "fields={fields}");
+        assert_eq!(
+            fields["avb_untouched"], false,
+            "an unobserved partition must never claim 'untouched': {fields}"
+        );
+        assert!(
+            fields["avb_footer_sha256"].is_null(),
+            "no digest may be invented when nothing was read: {fields}"
+        );
+        // The reason is surfaced, not swallowed.
+        assert!(
+            !fields["avb_detail"].as_str().unwrap_or("").is_empty(),
+            "an unobservable audit must explain itself: {fields}"
+        );
+    }
+
+    /// ③ A partition that genuinely has no AVB footer is `no_footer` and also
+    /// must not claim `avb_untouched: true` (nothing was verified).
+    #[test]
+    fn avb_audit_no_footer_is_not_untouched() {
+        let fixture = AvbFixture::new("nofooter");
+        let mut img = synth_avb_partition(8192, b"PAYLOAD", b"VBMETA");
+        let fa = 8192 - 64;
+        img[fa..fa + 4].copy_from_slice(b"\0\0\0\0");
+        let path = fixture.path("boot.img");
+        fs::write(&path, &img).unwrap();
+        fixture.point_at(&path);
+
+        let fields = avb_audit_fields();
+        assert_eq!(fields["avb_status"], "no_footer", "fields={fields}");
+        assert_eq!(fields["avb_untouched"], false, "fields={fields}");
+        assert!(fields["avb_footer_sha256"].is_null(), "fields={fields}");
+    }
+
+    /// The merge helper must not disturb the operation's own fields: `ok`,
+    /// `id`, `version` etc. survive, and the AVB keys are added alongside.
+    #[test]
+    fn merge_avb_audit_preserves_operation_fields() {
+        let fixture = AvbFixture::new("merge");
+        let path = fixture.path("boot.img");
+        fs::write(&path, synth_avb_partition(8192, b"P", b"V")).unwrap();
+        fixture.point_at(&path);
+
+        let merged = merge_avb_audit(serde_json::json!({
+            "ok": true,
+            "id": "mymod",
+            "version": "1.0",
+        }));
+        assert_eq!(merged["ok"], true);
+        assert_eq!(merged["id"], "mymod");
+        assert_eq!(merged["version"], "1.0");
+        assert_eq!(merged["avb_status"], "ok");
+        assert!(merged.get("avb_footer_sha256").is_some());
+    }
+
+    /// **The audit is decoupled from the operation.** Pointing the probe at an
+    /// unreadable device still yields a well-formed payload with `ok: true`:
+    /// install/uninstall must not fail because the audit could not measure.
+    #[test]
+    fn avb_audit_failure_never_breaks_the_operation() {
+        let fixture = AvbFixture::new("decoupled");
+        fixture.point_at(&fixture.path("absent.img"));
+
+        let merged = merge_avb_audit(serde_json::json!({
+            "ok": true,
+            "id": "mymod",
+            "remove_pending": false,
+        }));
+        assert_eq!(merged["ok"], true, "audit must never flip the operation: {merged}");
+        assert_eq!(merged["avb_status"], "unobservable");
+        assert_eq!(merged["avb_untouched"], false);
+    }
 }

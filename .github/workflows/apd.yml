@@ -16,11 +16,15 @@ on:
     paths:
       - "apd/**"
       - ".github/workflows/apd.yml"
+      # 能力门禁脚本本身改动必须触发重跑：否则把门禁改坏（或改强）不会有任何
+      # 反馈，正是「门禁形同虚设」的成因之一。
+      - "quality/static/check_apd_capabilities.py"
   pull_request:
     branches: [v2]
     paths:
       - "apd/**"
       - ".github/workflows/apd.yml"
+      - "quality/static/check_apd_capabilities.py"
   workflow_dispatch:
 
 permissions:
@@ -157,43 +161,43 @@ jobs:
           print("ELF assertion passed: aarch64 PIE")
           PY
 
+      # ────────────────────────────────────────────────────────────────────
       # Feature-presence gate: the size work (P1 dep removal + P2 opt-level=z)
-      # must never silently drop a capability. Markers are static strings that
-      # only exist when the corresponding code path is compiled in.
+      # must never silently drop a capability.
+      #
+      # 已废弃的旧写法（务必不要恢复）：对 dist/libapd.so 做 `grep -aq -- "<marker>"`。
+      # 两个方向都实测失效：
+      #   ① **假绿**：`grep -a` 只要字节序列出现过一次就算过。从 apd/src/cli.rs
+      #      删掉 `Undeploy`（enum variant + dispatch arm）后重新交叉编译，
+      #      `grep -aq undeploy` 仍然 PASS —— 命中的是 selftest 的状态串
+      #      `"undeployed"`，与子命令无关。功能删除完全检测不到。
+      #   ② **假红**：旧 markers 里的 `vbmeta_untouched` 在当前源码里已不存在
+      #      （AVB 改成实测三态 avb_ok/avb_no_footer/avb_unobservable，旧字面量
+      #      只剩注释 + #[cfg(test)]，不进 release 二进制）→ 门禁在**正确代码**
+      #      上必然红。假红会和假绿一样让人放弃门禁。
+      #
+      # 新判据（见 quality/static/check_apd_capabilities.py）：
+      #   L1 CLI about 契约：14 个子命令的 clap doc-comment 文本必须在场
+      #      （strip 前后都在；删掉子命令 → 其 about 消失 → 变红）；
+      #   L2 能力代号组：AVB 三态必须**三个同时**在场（只留一个 = 三态被削平）；
+      #   L3 过期字面量不得复活（vbmeta_untouched 出现即红）；
+      #   + --verify-vs-source：门禁内嵌契约必须与 apd/src/cli.rs 事实一致，
+      #      从机制上杜绝「门禁与代码脱节」这类事故。
       - name: Capability assertions (no feature loss from size work)
         run: |
           set -euo pipefail
-          F=../dist/libapd.so
-          markers=(
-            daemon deploy undeploy root-exec selftest auth version
-            vbmeta_untouched SPROOT_REQUEST_UID /proc/self/attr/current
-            sproot- allow_list boot_count safemode module
-          )
-          # Conditional capability: only present when the default `resetprop`
-          # feature is enabled (the license-clean build omits it by design).
-          conditional_markers=(resetprop)
+          GATE=../quality/static/check_apd_capabilities.py
+          [ -f "$GATE" ] || { echo "::error::缺 $GATE（能力门禁不可缺）"; exit 1; }
 
-          : > ../dist/apd-capabilities.txt
-          for m in "${markers[@]}"; do
-            if grep -aq -- "$m" "$F"; then
-              echo "OK   $m" >> ../dist/apd-capabilities.txt
-            else
-              echo "MISS $m" >> ../dist/apd-capabilities.txt
-              echo "MISSING CAPABILITY MARKER: $m"
-              cat ../dist/apd-capabilities.txt
-              exit 1
-            fi
-          done
+          # 0) 门禁**自身**先自检：每条断言都必须在合成坏样本上变红。
+          #    否则「门禁永远 PASS」等价于没有门禁（AVB-3 空断言事故防线）。
+          python3 "$GATE" --self-test
 
-          for m in "${conditional_markers[@]}"; do
-            if grep -aq -- "$m" "$F"; then
-              echo "OK   $m (conditional feature present)" >> ../dist/apd-capabilities.txt
-            else
-              echo "SKIP $m (conditional: feature disabled in this build)" >> ../dist/apd-capabilities.txt
-            fi
-          done
+          # 1) 契约必须与源码事实一致（防 vbmeta_untouched 那类脱节）
+          python3 "$GATE" --verify-vs-source . 
 
-          cat ../dist/apd-capabilities.txt
+          # 2) 对真实产物做能力断言（L1 about 契约 + L2 代号组 + L3 过期字面量）
+          python3 "$GATE" ../dist/libapd.so | tee ../dist/apd-capabilities.txt
 
       # Per-commit artifact (immutable, keeps history in the UI).
       - name: Upload artifact (commit-pinned)

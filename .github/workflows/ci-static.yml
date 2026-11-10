@@ -4,7 +4,10 @@
 # 五个工作流不重复：本工作流只做「源码静态一致性」，不构建任何产物、不下载 artifact）：
 #   - check_licenses.py    许可标注漂移（LIC-DRIFT）
 #   - check_error_codes.py 错误码表一致性（docs §6.1 ↔ Models.kt/ApdClient.kt）
-#   - verify_patch.py --help  修补产物校验脚本自检（argparse 契约可用）
+#   - verify_patch.py --help   修补产物校验脚本 argparse 契约可用
+#   - verify_patch.py --self-test  合成夹具自检：V1~V7/BI/RB 每条断言都必须在
+#                               「已知坏样本」上 FAIL、在「已知好样本」上 PASS，
+#                               任一断言退化成永远 PASS → 本工作流红（AVB-3 空断言防线）
 #   - check_kt_syntax.py     Kotlin 字符串/三引号/括号配对 + 嵌套双引号（推前自检 #1）
 #   - check_kt_signatures.py Kotlin 具名参数 vs 函数定义签名（推前自检 #2）
 #   - check_kt_imports.py    Kotlin 跨包缺 import（推前自检 #3）
@@ -82,13 +85,25 @@ jobs:
           python3 quality/static/check_builtin_assets.py
           echo "check_builtin_assets.py PASS"
 
-      - name: verify_patch.py --help (脚本自检)
+      - name: verify_patch.py --help (argparse 契约)
         run: |
           set -e
           [ -f quality/static/verify_patch.py ] || {
             echo "::error::quality/static/verify_patch.py 缺失（产物校验器不可缺）"; exit 1; }
           python3 quality/static/verify_patch.py --help > /dev/null
           echo "verify_patch.py --help PASS"
+
+      # V1~V7 / BI / RB 共 400+ 行断言需要 --in/--out/--report 才会执行；只跑 --help
+      # 等于从未验证过任何一条真实断言（AVB-3 空断言事故的同类风险）。
+      # --self-test 用内存合成夹具把每条断言跑「正样本必须 PASS + 负样本必须变红」，
+      # 任一断言退化成永远 PASS → 本步骤红。这是硬门禁，不可降级为 warn。
+      - name: verify_patch.py --self-test (断言真实性门禁)
+        run: |
+          set -e
+          [ -f quality/static/verify_patch.py ] || {
+            echo "::error::quality/static/verify_patch.py 缺失（产物校验器不可缺）"; exit 1; }
+          python3 quality/static/verify_patch.py --self-test
+          echo "verify_patch.py --self-test PASS（每条断言均在负样本上变红）"
 
       - name: Summary
         if: always()

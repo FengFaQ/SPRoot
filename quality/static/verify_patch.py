@@ -12,11 +12,25 @@ V-12（退出码矩阵）、V-14（SELinux policy 反汇编复核）、
 V-15（magiskboot round-trip）、V-16（APK 内 arm64 产物）、
 V-18（密钥不出日志）、V-19/V-20（代码审查/版本一致）。
 
-另含两项工具模式（NEW-DOC-06 §9 G-02 门禁证据 / task-10 样本加载）：
+另含三项工具模式（NEW-DOC-06 §9 G-02 门禁证据 / task-10 样本加载 / 自检门禁）：
   --elf <path>       ELF 产物断言（AArch64 / 静态性 / 依赖 / 可执行位 / PT_TLS），
                      可重复传入；用于 arm64 引擎产物（exec 与 JNI 两种形态）的 G-02 证据。
   --sample <NAME>    从 samples/manifest.json 加载样本三元组（in/out/report/key/ndjson），
                      NAME=all 时跑全部样本；--list-samples 列出可用样本。
+  --self-test        用**内存中构造的合成夹具**把 V1~V7 / BI / RB 断言真跑一遍：
+                     每条断言都同时配「必须 PASS 的正样本」与「必须变红的负样本」，
+                     任一断言退化成「永远 PASS」→ 本模式退出码非 0。CI 硬门禁。
+
+关于 report 顶层 root_key（密钥权威源）：
+  引擎 build_report **会写** report 顶层 root_key —— 48 字符明文，与 key_spec 同源
+  （engine/src/skroot_patch_main.cpp:420-429，task-8 起；同一份 root_key 派生，绝无第二
+  份密钥），并同时写 root_key_contains_secret=true 标记。stdout 末行 ROOT_KEY=<48字符>
+  只是兜底通道。
+  因此密钥来源优先级为：`--key` 显式传入 > `report.root_key` 回落到自动读取。
+  反之，若 --report 已给出但其中**没有**可用 root_key（旧引擎产物 / 字段丢失），则
+  V2（密钥内嵌）/ V3（root_key 与 --key 一致）/ V6（前缀一致性）**无法校验**：本脚本
+  会把它们记为 WARN 并在汇总里**单列计数**，绝不静默 SKIP 后仍汇总 PASS —— 「什么都没
+  验」必须可见。
 
 用法：
   python3 verify_patch.py --in <原厂内核> --out <修补内核> --report <report.json> \
@@ -24,16 +38,22 @@ V-18（密钥不出日志）、V-19/V-20（代码审查/版本一致）。
   python3 verify_patch.py --elf <arm64 ELF> [--elf <另一个 ELF>]
   python3 verify_patch.py --sample <NAME|all> [--manifest <path>]
   python3 verify_patch.py --list-samples [--manifest <path>]
+  python3 verify_patch.py --self-test
 
 退出码：0=全 PASS；1=存在 FAIL；2=用法/环境错误
 """
 
 import argparse
+import contextlib
 import hashlib
+import io
 import json
 import os
+import shutil
 import struct
 import sys
+import tempfile
+import traceback
 
 VERSION = "0.1"
 
@@ -48,10 +68,19 @@ REQUIRED_HOOKS = ["do_execve", "filldir64", "compat_filldir", "avc_denied", "aud
 KP_RESIDUE_MARKERS = [b"kpimg", b"KernelPatch", b"kpatch", b"supercall"]
 
 results = []  # (check_id, status, message)
+# 「未校验」台账：(check_id, 原因)。与 results 分离存放，便于汇总单列计数——
+# 目的是让「什么都没验」这件事在结论里显形，而不是被 SKIP/PASS 混在一起看不见。
+unverified = []
 
 
 def record(cid, status, msg):
     results.append((cid, status, msg))
+
+
+def record_unverified(cid, msg, reason):
+    """记一条 WARN 并同时登记到未校验台账（供汇总单列计数）。"""
+    record(cid, "WARN", msg)
+    unverified.append((cid, reason))
 
 
 def sha256_file(path):
@@ -191,7 +220,14 @@ def check_report(report, sha_in, size_in, sha_out, size_out, key):
                 record("V6", "FAIL", "hidden_dir_prefix(%r) != root_key[0:16](%r)"
                        % (hidden_prefix, key[:16]))
     else:
-        record("V6", "SKIP", "未提供密钥（--key / report.root_key 均无），跳过前缀一致性")
+        # 引擎 build_report 自 task-8 起会写顶层 root_key，所以「走到这里」=
+        # 要么是旧引擎产物、要么字段被删/为空。此时 V3 的 root_key 一致性与 V6 前缀
+        # 一致性**无从校验**；记 WARN 并登记未校验台账，避免静默 SKIP 后仍整体 PASS。
+        record_unverified(
+            "V6",
+            "无法校验 hidden_dir_prefix：report 缺可用 root_key 且未传 --key"
+            "（report 由 task-8 前的引擎产出或字段丢失；前缀一致性本次未验证）",
+            "report 无可用 root_key → hidden_dir_prefix == root_key[0:16] 未比对")
 
     hooks = report.get("hook_table") or []
     detail = report.get("hooks") or []
@@ -689,9 +725,11 @@ def verify_pair(inp, outp, report_path=None, key=None, ndjson=None, quiet=False)
     # ---- report ----
     hooks = []
     root_region = None
+    report_loaded = False
     if report_path:
         report = load_json(report_path, "V3", "report")
         if report is not None:
+            report_loaded = True
             root_key, _, root_region = check_report(report, sha_in, len(in_bytes), sha_out, len(out_bytes),
                                                     key or report.get("root_key"))
             if not key:
@@ -706,8 +744,17 @@ def verify_pair(inp, outp, report_path=None, key=None, ndjson=None, quiet=False)
             record("V2", "FAIL", "密钥格式应为 [A-Za-z0-9]{48}，实际长度 %d" % len(key))
         else:
             check_key_embedding(out_bytes, key, hooks, root_region)
+    elif report_loaded:
+        # 有 report 却没有可用 root_key：引擎自 task-8 起必写该字段，走到这里说明
+        # report 来自旧引擎或字段被删/为空。V2 密钥内嵌**本次无从校验**，必须可见，
+        # 不能静默 SKIP 后让汇总整体 PASS（空断言隐身）。
+        record_unverified(
+            "V2",
+            "密钥内嵌未校验：report 存在但没有可用 root_key，且未传 --key"
+            "（本次无法确认 48 字节密钥窗口是否落进产物）",
+            "report 无可用 root_key → 产物中 47+NUL 密钥窗口未查找")
     else:
-        record("V2", "SKIP", "无密钥可用（--report 无 root_key 且未传 --key），跳过密钥内嵌检查")
+        record("V2", "SKIP", "未提供 report 也未传 --key，跳过密钥内嵌检查")
 
     # ---- 差异区段 ----
     if len(in_bytes) == len(out_bytes):
@@ -733,9 +780,20 @@ def print_summary(quiet=False):
     skips = [r for r in results if r[1] == "SKIP"]
     print("\n汇总：PASS=%d WARN=%d SKIP=%d FAIL=%d"
           % (len(results) - len(fails) - len(warns) - len(skips), len(warns), len(skips), len(fails)))
+    # 「什么都没验」必须可见：单列未校验断言，避免沉默 SKIP 被汇总 PASS 掩盖。
+    if unverified:
+        ids = sorted({cid for cid, _ in unverified})
+        print("⚠ 未校验断言 %d 项（%s）：以下断言本次**没有执行实质比对**，"
+              "不得据此判定对应契约成立：" % (len(unverified), ", ".join(ids)))
+        for cid, why in unverified:
+            print("   - [%s] %s" % (cid, why))
     if fails:
         print("判定：FAIL（阻断，不可进入刷入序列）")
         return 1
+    if unverified:
+        print("判定：PASS（WARN 项需人工复核后归档；**但上列断言未校验，"
+              "相应证据缺失，不可用于归档 G-02 密钥链结论**）")
+        return 0
     print("判定：PASS（WARN 项需人工复核后归档）")
     return 0
 
@@ -978,6 +1036,675 @@ def _parse_bootimg_header(data):
             "kernel_size": kernel_size, "ramdisk_size": ramdisk_size}
 
 
+# --------------------------------------------------------------------------
+# --self-test：合成夹具自检（门禁的「门禁」）
+#
+# 背景（docs/HANDOFF-2026-11-08.md:153-155）：AVB-3 曾写成永远 PASS 的空断言，
+# 比没有断言更危险——CI 全绿而产线在裸奔。因此本模式的铁律是：
+#   每一条断言都必须同时给出
+#     (a) 正样本：断言必须记 PASS（证明断言真的会绿）
+#     (b) 负样本：断言必须记 FAIL/WARN（证明断言真的会红）
+#   任意一条的负样本没变红 → 该断言已退化成「永远 PASS」→ 本模式退出码非 0。
+# 夹具全部在内存中合成（struct 手工拼 arm64 Image 头 / bootimg 头 / AVB footer），
+# 不依赖 samples/ 里的大文件，CI 上零外部数据即可真跑。
+# --------------------------------------------------------------------------
+SELFTEST_KEY = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcdefghijkl"  # 48 位 [A-Za-z0-9]
+# 注意：这里**不加**模块级 assert——自检常量写错不应让 --help / 真实校验路径也崩。
+# 长度/字符集由自检自身的「夹具健全性」用例把关（见 _self_test_body 开头）。
+
+_IMAGE_MAGIC_BYTES = struct.pack("<I", ARM64_IMAGE_MAGIC)
+
+
+def _mk_image(size=4096, fill=0x00, image_size=None, magic=None):
+    """合成最小 arm64 Image：0x38 魔数 + 0x10 image_size，其余填充。"""
+    buf = bytearray([fill]) * size
+    buf[0:4] = b"\x00\x00\x00\x00"
+    body = image_size if image_size is not None else size
+    if size >= 0x40:
+        buf[IMAGE_SIZE_OFFSET:IMAGE_SIZE_OFFSET + 8] = struct.pack("<Q", body)
+        buf[IMAGE_MAGIC_OFFSET:IMAGE_MAGIC_OFFSET + 4] = (
+            magic if magic is not None else _IMAGE_MAGIC_BYTES)
+    return bytes(buf)
+
+
+def _mk_report(sha_in, size_in, sha_out, size_out, key=SELFTEST_KEY,
+               hidden_prefix=None, resolved_groups=REQUIRED_HOOKS,
+               embed_offset=0x400, extra=None):
+    """合成一份「结构合法」的 report.json（默认全字段自洽）。
+
+    embed_offset 必须与夹具里密钥窗口的真实偏移一致，否则 V2 落位断言会（正确地）FAIL。
+    hidden_prefix 缺省取 key[:16]，与引擎 build_report 的 hidden_dir_prefix 契约一致
+    （否则 V6 正样本会假红——这条默认值本身就是被新加的 V6 正样本用例揪出来的）。
+    """
+    if hidden_prefix is None:
+        hidden_prefix = (key or SELFTEST_KEY)[:16]
+    detail = []
+    off = 0x1000
+    for grp in REQUIRED_HOOKS:
+        if grp in resolved_groups:
+            detail.append({"group": grp, "resolved": True, "hook_addr": "0x%X" % (0x100000 + off),
+                           "bytes": 32, "patch_offset": "0x%X" % off})
+        else:
+            detail.append({"group": grp, "resolved": False, "reason": "kallsyms 未命中"})
+        off += 0x40
+    detail.append({"group": "embed_key", "resolved": True, "hook_addr": "0x%X" % 0x200000,
+                   "bytes": 48, "patch_offset": "0x%X" % embed_offset})
+    report = {
+        "engine_version": "0.1.0-selftest",
+        "input": {"sha256": sha_in, "size": size_in},
+        "output": {"sha256": sha_out, "size": size_out},
+        "key_spec": {"charset": "A-Za-z0-9", "length": 48, "stored_len": 47},
+        "hidden_dir_prefix": hidden_prefix,
+        "hook_table": [{"name": g, "hook_addr": "0x%X" % (0x100000 + i)} for i, g in
+                       enumerate(REQUIRED_HOOKS)],
+        "hooks": detail,
+    }
+    if key is not None:
+        report["root_key"] = key
+    if extra:
+        report.update(extra)
+    return report
+
+
+def _mk_ndjson(events):
+    return "\n".join(json.dumps(e) for e in events) + "\n"
+
+
+def _mk_bootimg(orig_kernel, new_kernel=None, ramdisk=b"", avb=True, page_size=4096,
+                hdr_ver=4, path_size=None):
+    """合成 boot.img（v3/v4 布局）：ANDROID! 头 + kernel 段 + ramdisk 段 + AVB footer。
+
+    new_kernel 为 None 时 orig/new 逐字节相同。返回 bytes。
+    """
+    hdr_size = {3: 0x600, 4: 0x630}.get(hdr_ver, 0x660)
+    kernel = orig_kernel if new_kernel is None else new_kernel
+    n_kernel_pages = (hdr_size + page_size - 1) // page_size
+    n_kpages = (len(kernel) + page_size - 1) // page_size
+    n_rpages = (len(ramdisk) + page_size - 1) // page_size if ramdisk else 0
+    total = (n_kernel_pages + n_kpages + n_rpages) * page_size
+    if avb:
+        total += page_size
+    buf = bytearray(total)
+    buf[0:8] = BOOT_MAGIC
+    struct.pack_into("<I", buf, 0x08, len(kernel))      # kernel_size
+    struct.pack_into("<I", buf, 0x0C, len(ramdisk))     # ramdisk_size
+    struct.pack_into("<I", buf, 0x14, hdr_size)         # header_size
+    struct.pack_into("<I", buf, 0x28, hdr_ver)          # header_version
+    koff = n_kernel_pages * page_size
+    buf[koff:koff + len(kernel)] = kernel
+    roff = (n_kernel_pages + n_kpages) * page_size
+    if ramdisk:
+        buf[roff:roff + len(ramdisk)] = ramdisk
+    if avb:
+        # AVB footer 在**文件末 64 字节**（可能落在末页中间），后面是零填充
+        vbmeta_off = (n_kernel_pages + n_kpages + n_rpages) * page_size
+        vbmeta = b"AVB0" + b"\xAB" * 60
+        buf[vbmeta_off:vbmeta_off + len(vbmeta)] = vbmeta
+        footer = bytearray(64)
+        footer[0:4] = b"AVBf"
+        struct.pack_into(">II", footer, 4, 1, 3)
+        struct.pack_into(">Q", footer, 12, total)
+        struct.pack_into(">QQ", footer, 20, vbmeta_off, len(vbmeta))
+        buf[total - 64:total] = footer
+    return bytes(buf)
+
+
+class _Probe(object):
+    """在隔离的 results / unverified 上跑一段断言，返回 [(cid, status, msg)]。"""
+
+    def __init__(self):
+        self.entries = []
+        self.unverified_entries = []
+
+    def __enter__(self):
+        del results[:]
+        del unverified[:]
+        return self
+
+    def __exit__(self, *exc):
+        self.entries = list(results)
+        self.unverified_entries = list(unverified)
+        del results[:]
+        del unverified[:]
+        return False
+
+    def statuses(self, cid):
+        return [s for c, s, _ in self.entries if c == cid]
+
+    def has(self, cid, status):
+        return status in self.statuses(cid)
+
+    def unverified_ids(self):
+        return [cid for cid, _ in self.unverified_entries]
+
+    def detail(self, cid=None):
+        return ["[%s] %s %s" % (c, s, m) for c, s, m in self.entries
+                if cid is None or c == cid]
+
+
+def _selftest_case(cases, name, want, cid, status, fn, expect_unverified=False):
+    """记录一条自检用例；立即执行并把结果挂到 case 上。
+
+    fn 的标准输出被吞掉（断言实现里有大量 print），失败时随用例一起打印。
+    expect_unverified=True 时额外要求该用例在未校验台账里登记了 cid——
+    这是「静默 SKIP → 汇总仍 PASS」这条空断言通道的门禁。
+    """
+    probe = _Probe()
+    err = None
+    captured = ""
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with probe:
+                fn()
+        captured = buf.getvalue()
+    except Exception:  # noqa: BLE001 - 断言实现抛异常也是自检失败，需原样暴露
+        err = traceback.format_exc()
+    st = probe.statuses(cid)
+    ok = (status in st) and err is None
+    if expect_unverified and cid not in probe.unverified_ids():
+        ok = False  # 未校验没被登记 = 「什么都没验」又会隐身
+    cases.append({"name": name, "want": want, "cid": cid, "want_status": status,
+                  "got": st, "ok": ok, "err": err, "stdout": captured,
+                  "expect_unverified": expect_unverified,
+                  "unverified_ids": probe.unverified_ids(),
+                  "detail": probe.detail()})
+    return ok
+
+
+def run_self_test(quiet=False):
+    """--self-test 主体。返回 0=全部用例符合预期；1=有断言退化/夹具失配。"""
+    tmpdir = tempfile.mkdtemp(prefix="sproot-selftest-")
+    try:
+        return _self_test_body(tmpdir, quiet)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _self_test_body(tmpdir, quiet=False):
+    # 夹具健全性前置闸门：常量本身写错时，后面所有用例都会失去意义（正样本会一起红），
+    # 必须在这里先判死，而不是让「负样本没变红」伪装成通过。
+    fixture_problems = []
+    if len(SELFTEST_KEY) != 48:
+        fixture_problems.append("SELFTEST_KEY 长度 %d != 48" % len(SELFTEST_KEY))
+    if not SELFTEST_KEY.isalnum():
+        fixture_problems.append("SELFTEST_KEY 含非 [A-Za-z0-9] 字符")
+    if fixture_problems:
+        print("判定：SELF-TEST FAIL —— 夹具自身不合法：%s" % fixture_problems)
+        return 1
+
+    cases = []
+
+    def w(name, data):
+        p = os.path.join(tmpdir, name)
+        mode = "wb" if isinstance(data, bytes) else "w"
+        with open(p, mode, **({} if mode == "wb" else {"encoding": "utf-8"})) as f:
+            f.write(data)
+        return p
+
+    # ---------------- V1 等长 / 确实改动 ----------------
+    base = _mk_image(4096)
+    patched = bytearray(base)
+    patched[0x200:0x208] = b"PATCHED!"          # 单处 8B 改动
+    patched = bytes(patched)
+    shorter = base[:-16]
+
+    _selftest_case(cases, "V1 正样本：等长且确有改动", "PASS", "V1", "PASS",
+                   lambda: _run_pair_quiet(base, patched))
+    _selftest_case(cases, "V1 负样本：产物被截断（不等长）", "FAIL", "V1", "FAIL",
+                   lambda: _run_pair_quiet(base, shorter))
+    _selftest_case(cases, "V1 负样本：产物与原厂逐字节相同（无改动）", "FAIL", "V1", "FAIL",
+                   lambda: _run_pair_quiet(base, base))
+
+    # ---------------- V2 密钥内嵌窗口 / V6 前缀 ----------------
+    want_win = SELFTEST_KEY[:47].encode("ascii") + b"\x00"
+    with_key = bytearray(base)
+    with_key[0x400:0x400 + len(want_win)] = want_win
+    with_key = bytes(with_key)
+
+    _selftest_case(cases, "V2 正样本：产物含 key[0:47]+NUL 窗口且落位与 report 一致", "PASS",
+                   "V2", "PASS",
+                   lambda: _run_pair_quiet(with_key, _patch_bytes(with_key, 0x800),
+                                           report=_mk_report_for(with_key, _patch_bytes(with_key, 0x800)),
+                                           key=SELFTEST_KEY))
+    # 负样本：产物里没有密钥窗口（密钥根本没内嵌）→ V2 必须 FAIL
+    _selftest_case(cases, "V2 负样本：产物不含密钥窗口", "FAIL", "V2", "FAIL",
+                   lambda: _run_pair_quiet(base, patched,
+                                           report=_mk_report_for(base, patched),
+                                           key=SELFTEST_KEY))
+    # 负样本：窗口存在但 report.root_key_region 指向别处 → 落位断言必须 FAIL
+    def _v2_bad_region():
+        rep = _mk_report_for(with_key, _patch_bytes(with_key, 0x800))
+        for h in rep["hooks"]:
+            if h["group"] == "embed_key":
+                h["patch_offset"] = "0x9000"   # 与真实 0x400 不符
+        _run_pair_quiet(with_key, _patch_bytes(with_key, 0x800), report=rep, key=SELFTEST_KEY)
+    _selftest_case(cases, "V2 负样本：密钥落位与 report.root_key_region 不符", "FAIL", "V2", "FAIL",
+                   _v2_bad_region)
+    # 负样本：report.hidden_dir_prefix 与 key[:16] 不符 → V6 必须 FAIL
+    def _v6_bad_prefix():
+        rep = _mk_report_for(with_key, _patch_bytes(with_key, 0x800))
+        rep["hidden_dir_prefix"] = "wrong_prefix_xxxx"
+        _run_pair_quiet(with_key, _patch_bytes(with_key, 0x800), report=rep, key=SELFTEST_KEY)
+    _selftest_case(cases, "V6 负样本：hidden_dir_prefix != key[0:16]", "FAIL", "V6", "FAIL",
+                   _v6_bad_prefix)
+    # 负样本：密钥格式非法（长度/字符集）→ V2 必须 FAIL
+    _selftest_case(cases, "V2 负样本：密钥非 [A-Za-z0-9]{48}", "FAIL", "V2", "FAIL",
+                   lambda: _run_pair_quiet(base, patched,
+                                           report=_mk_report_for(base, patched),
+                                           key="short_key"))
+
+    # ---- 密钥来源回落：引擎 task-8 起 report 顶层**有** root_key ----
+    # 正样本：不传 --key，从 report.root_key 回落取到密钥 → V2/V6 必须真跑并 PASS
+    # （这条用例保证「回落路径」不是靠 SKIP 装绿）
+    _selftest_case(cases,
+                   "V2 正样本：不传 --key，回落 report.root_key 后仍真跑密钥断言", "PASS",
+                   "V2", "PASS",
+                   lambda: _run_pair_quiet(with_key, _patch_bytes(with_key, 0x800),
+                                           report=_mk_report_for(with_key, _patch_bytes(with_key, 0x800)),
+                                           key=None))
+    _selftest_case(cases,
+                   "V6 正样本：不传 --key，回落 report.root_key 后前缀一致性 PASS", "PASS",
+                   "V6", "PASS",
+                   lambda: _run_pair_quiet(with_key, _patch_bytes(with_key, 0x800),
+                                           report=_mk_report_for(with_key, _patch_bytes(with_key, 0x800)),
+                                           key=None))
+
+    # 负样本（空断言通道）：report 存在但**没有** root_key 且未传 --key。
+    # 旧行为是静默 SKIP 后汇总整体 PASS —— 等于「什么都没验」却发绿。现在必须
+    # WARN + 登记未校验台账，让汇总显式计数。
+    def _v2_report_no_root_key():
+        rep = _mk_report_for(with_key, _patch_bytes(with_key, 0x800), key=None)  # 顶层无 root_key
+        assert "root_key" not in rep
+        _run_pair_quiet(with_key, _patch_bytes(with_key, 0x800), report=rep, key=None)
+    _selftest_case(cases, "V2 负样本：report 缺 root_key → 必须 WARN 且登记未校验",
+                   "WARN(未校验)", "V2", "WARN", _v2_report_no_root_key,
+                   expect_unverified=True)
+    _selftest_case(cases, "V6 负样本：report 缺 root_key → 必须 WARN 且登记未校验",
+                   "WARN(未校验)", "V6", "WARN", _v2_report_no_root_key,
+                   expect_unverified=True)
+
+    # 负样本：report 的 root_key 若与真实内嵌密钥不同 → 产物里找不到该窗口 → V2 FAIL
+    def _v2_wrong_root_key():
+        rep = _mk_report_for(with_key, _patch_bytes(with_key, 0x800),
+                             key="Zz9" + SELFTEST_KEY[3:])   # 同长度但不同密钥
+        _run_pair_quiet(with_key, _patch_bytes(with_key, 0x800), report=rep, key=None)
+    _selftest_case(cases, "V2 负样本：report.root_key 是另一把密钥（窗口对不上）",
+                   "FAIL", "V2", "FAIL", _v2_wrong_root_key)
+
+    # ---------------- V3 report 自洽 ----------------
+    _selftest_case(cases, "V3 正样本：report sha256/size/key_spec 自洽", "PASS", "V3", "PASS",
+                   lambda: _run_pair_quiet(base, patched, report=_mk_report_for(base, patched),
+                                           key=SELFTEST_KEY))
+
+    def _v3_bad_sha():
+        rep = _mk_report_for(base, patched)
+        rep["output"]["sha256"] = "0" * 64
+        _run_pair_quiet(base, patched, report=rep, key=SELFTEST_KEY)
+    _selftest_case(cases, "V3 负样本：report.output.sha256 与实际产物不符", "FAIL", "V3", "FAIL",
+                   _v3_bad_sha)
+
+    def _v3_bad_size():
+        rep = _mk_report_for(base, patched)
+        rep["input"]["size"] = 999
+        _run_pair_quiet(base, patched, report=rep, key=SELFTEST_KEY)
+    _selftest_case(cases, "V3 负样本：report.input.size 与实际输入不符", "FAIL", "V3", "FAIL",
+                   _v3_bad_size)
+
+    def _v3_missing_field():
+        rep = _mk_report_for(base, patched)
+        del rep["engine_version"]
+        _run_pair_quiet(base, patched, report=rep, key=SELFTEST_KEY)
+    _selftest_case(cases, "V3 负样本：report 缺 engine_version", "FAIL", "V3", "FAIL",
+                   _v3_missing_field)
+
+    def _v3_bad_spec():
+        rep = _mk_report_for(base, patched)
+        rep["key_spec"] = {"charset": "A-Za-z0-9", "length": 40, "stored_len": 39}
+        _run_pair_quiet(base, patched, report=rep, key=SELFTEST_KEY)
+    _selftest_case(cases, "V3 负样本：report.key_spec 违反 48/47 契约", "FAIL", "V3", "FAIL",
+                   _v3_bad_spec)
+
+    # ---------------- V4 / V-08 hook 表 ----------------
+    _selftest_case(cases, "V4 正样本：hooks[] 五组必备 hook 齐全且地址有效", "PASS", "V4", "PASS",
+                   lambda: _run_pair_quiet(base, patched, report=_mk_report_for(base, patched),
+                                           key=SELFTEST_KEY))
+
+    def _v4_missing_hook():
+        rep = _mk_report_for(base, patched)
+        rep["hooks"] = [h for h in rep["hooks"] if h["group"] != "avc_denied"]
+        _run_pair_quiet(base, patched, report=rep, key=SELFTEST_KEY)
+    _selftest_case(cases, "V4 负样本：hooks[] 缺 avc_denied 组", "FAIL", "V4", "FAIL",
+                   _v4_missing_hook)
+
+    def _v4_empty_addr():
+        rep = _mk_report_for(base, patched)
+        for h in rep["hooks"]:
+            if h["group"] == "do_execve":
+                h["hook_addr"] = ""
+        _run_pair_quiet(base, patched, report=rep, key=SELFTEST_KEY)
+    _selftest_case(cases, "V4 负样本：resolved=true 但 hook_addr 为空", "FAIL", "V4", "FAIL",
+                   _v4_empty_addr)
+
+    def _v4_false_no_reason():
+        rep = _mk_report_for(base, patched, resolved_groups=REQUIRED_HOOKS[:-1])
+        for h in rep["hooks"]:
+            if h["group"] == REQUIRED_HOOKS[-1]:
+                h["reason"] = "  "
+        _run_pair_quiet(base, patched, report=rep, key=SELFTEST_KEY)
+    _selftest_case(cases, "V4 负样本：resolved=false 且无故 reason", "FAIL", "V4", "FAIL",
+                   _v4_false_no_reason)
+
+    def _v4_agg_short():
+        rep = _mk_report_for(base, patched)
+        rep["hooks"] = []
+        rep["hook_table"] = [{"name": "hooks_embedded", "blob_count": 2, "root_key_region": "0x400"}]
+        _run_pair_quiet(base, patched, report=rep, key=SELFTEST_KEY)
+    _selftest_case(cases, "V4 负样本：聚合形态 blob_count<5（织入不足）", "FAIL", "V4", "FAIL",
+                   _v4_agg_short)
+
+    def _v4_table_missing():
+        rep = _mk_report_for(base, patched)
+        rep["hooks"] = []
+        rep["hook_table"] = [{"name": g, "hook_addr": 0x1000} for g in REQUIRED_HOOKS[:-1]]
+        _run_pair_quiet(base, patched, report=rep, key=SELFTEST_KEY)
+    _selftest_case(cases, "V4 负样本：hook_table 缺组", "FAIL", "V4", "FAIL", _v4_table_missing)
+
+    # ---------------- V4 改动区段（V-13 受控） ----------------
+    def _v13_seem():
+        big = bytearray(base)
+        big[0x100:0x100 + 2048] = b"\xFF" * 2048     # >512B 连续改动 → 必须 FAIL
+        _run_pair_quiet(base, bytes(big))
+    _selftest_case(cases, "V4 负样本：存在 >512B 连续改动区段（疑似大段重写）", "FAIL", "V4", "FAIL",
+                   _v13_seem)
+
+    # ---------------- V5 arm64 Image 头（V-07） ----------------
+    _selftest_case(cases, "V5 正样本：合法 arm64 Image 头", "PASS", "V5", "PASS",
+                   lambda: check_image_header(_mk_image(4096)))
+    _selftest_case(cases, "V5 负样本：0x38 魔数错误（非 arm64 Image）", "FAIL", "V5", "FAIL",
+                   lambda: check_image_header(_mk_image(4096, magic=b"\x1f\x8b\x08\x00")))
+    _selftest_case(cases, "V5 负样本：文件过短 <64B", "FAIL", "V5", "FAIL",
+                   lambda: check_image_header(b"\x00" * 32))
+    _selftest_case(cases, "V5 负样本：image_size 远超文件（截断镜像）", "FAIL", "V5", "FAIL",
+                   lambda: check_image_header(_mk_image(4096, image_size=1 << 20)))
+
+    # ---------------- V6 NDJSON ----------------
+    good_nd = [{"event": "progress", "phase": "read_input"},
+               {"event": "progress", "phase": "embed_key"},
+               {"event": "result", "code": 0}]
+    _selftest_case(cases, "V6 正样本：合法 NDJSON（终态唯一且在最后）", "PASS", "V6", "PASS",
+                   lambda: check_ndjson(w("good.ndjson", _mk_ndjson(good_nd))))
+    _selftest_case(cases, "V6 负样本：出现未定义 phase", "FAIL", "V6", "FAIL",
+                   lambda: check_ndjson(w("bad_phase.ndjson", _mk_ndjson(
+                       [{"event": "progress", "phase": "no_such_phase"},
+                        {"event": "result", "code": 0}]))))
+    _selftest_case(cases, "V6 负样本：无 result 终态事件", "FAIL", "V6", "FAIL",
+                   lambda: check_ndjson(w("no_result.ndjson", _mk_ndjson([good_nd[0]]))))
+    _selftest_case(cases, "V6 负样本：result 不在最后一条", "FAIL", "V6", "FAIL",
+                   lambda: check_ndjson(w("result_mid.ndjson", _mk_ndjson(
+                       [{"event": "result", "code": 0},
+                        {"event": "progress", "phase": "write_output"}]))))
+    _selftest_case(cases, "V6 负样本：非合法 JSON 行", "FAIL", "V6", "FAIL",
+                   lambda: check_ndjson(w("broken.ndjson", "{not json}\n")))
+
+    # ---------------- V7 KP 残留 ----------------
+    _selftest_case(cases, "V7 正样本：无 KP 特征字串", "PASS", "V7", "PASS",
+                   lambda: check_kp_residue(_mk_image(4096)))
+    _selftest_case(cases, "V7 负样本：命中 kpimg 特征（应 WARN 而非静默 PASS）", "WARN", "V7", "WARN",
+                   lambda: check_kp_residue(_mk_image(4096, fill=0x00) + b"kpimg"))
+
+    # ---------------- BI boot.img 头 ----------------
+    k = _mk_image(2048)
+    good_boot = _mk_bootimg(k)
+    _selftest_case(cases, "BI 正样本：合法 v4 boot.img（kernel 段/对齐/Image 头）", "PASS", "BI3",
+                   "PASS", lambda: check_bootimg(w("boot.img", good_boot)))
+    _selftest_case(cases, "BI 负样本：magic 非 ANDROID!", "FAIL", "BI1", "FAIL",
+                   lambda: check_bootimg(w("bad_magic.img", b"MZ" + b"\x00" * (0x660 - 2))))
+    _selftest_case(cases, "BI 负样本：vendor_boot（VNDRBOOT）", "FAIL", "BI1", "FAIL",
+                   lambda: check_bootimg(w("vendor.img", VENDOR_BOOT_MAGIC + b"\x00" * 0x660)))
+    _selftest_case(cases, "BI 负样本：kernel_size=0 且 ramdisk_size=0", "FAIL", "BI3", "FAIL",
+                   lambda: check_bootimg(w("empty.img", _mk_bootimg(b""))))
+
+    def _bi_kernel_oob():
+        bad = bytearray(good_boot)
+        struct.pack_into("<I", bad, 0x08, len(good_boot) * 2)   # kernel_size 越界
+        check_bootimg(w("oob.img", bytes(bad)))
+    _selftest_case(cases, "BI 负样本：kernel 段越界", "FAIL", "BI3", "FAIL", _bi_kernel_oob)
+
+    def _bi_gzip():
+        gz = _mk_bootimg(b"\x1f\x8b" + b"\x00" * 2046)
+        check_bootimg(w("gzip.img", gz))
+    _selftest_case(cases, "BI 负样本/WARN：kernel 是 gzip 压缩体", "WARN", "BI4", "WARN", _bi_gzip)
+
+    # BI 聚合 id：文件不存在
+    _selftest_case(cases, "BI 负样本：boot.img 文件不存在", "FAIL", "BI", "FAIL",
+                   lambda: check_bootimg(os.path.join(tmpdir, "no_such_boot.img")))
+
+    # BI2：page_size 非法（v0~v2 布局，page_size 取自 0x24）
+    def _bi_bad_page_size():
+        bad = bytearray(0x1000)
+        bad[0:8] = BOOT_MAGIC
+        struct.pack_into("<I", bad, 0x08, 100)       # kernel_size
+        struct.pack_into("<I", bad, 0x10, 0)         # ramdisk_size（v<3 在 0x10）
+        struct.pack_into("<I", bad, 0x24, 1234)      # page_size 非法
+        struct.pack_into("<I", bad, 0x28, 2)         # header_version = 2
+        struct.pack_into("<I", bad, 0x66C, 0x800)    # header_size（v>=1 在 0x66C）
+        check_bootimg(w("bad_page.img", bytes(bad)))
+    _selftest_case(cases, "BI2 负样本：page_size=1234 非法值", "FAIL", "BI2", "FAIL",
+                   _bi_bad_page_size)
+
+    # BI5：文件大小未按 page_size 对齐
+    def _bi_unaligned():
+        check_bootimg(w("unaligned.img", good_boot + b"\x00" * 100))
+    _selftest_case(cases, "BI5 负样本/WARN：文件大小未按 page 对齐", "WARN", "BI5", "WARN",
+                   _bi_unaligned)
+
+    # BI6：正常路径给出的段信息（PASS）
+    _selftest_case(cases, "BI6 正样本：给出 ramdisk/kernel_off/os_version 段信息", "PASS", "BI6",
+                   "PASS", lambda: check_bootimg(w("bi6.img", good_boot)))
+
+    # ---------------- AVB-1/2/3（RB1~RB3 零触碰） ----------------
+    orig_boot = _mk_bootimg(k, ramdisk=b"\x00" * 512)
+    new_k = bytearray(k)
+    new_k[0x200:0x210] = b"SKPATCHED!BYTES!"   # 必须与切片等长（16B），否则内核段会缩短
+    assert len(new_k) == len(k)
+    new_boot = _mk_bootimg(bytes(new_k), ramdisk=b"\x00" * 512)
+    po = w("orig.img", orig_boot)
+    pn = w("new.img", new_boot)
+
+    _selftest_case(cases, "AVB-1 正样本：等长 + footer 保留 + 内嵌 vbmeta 未动 + kernel 有改动", "PASS",
+                   "RB2", "PASS", lambda: check_bootimg_diff(po, pn))
+
+    def _avb_bad_len():
+        check_bootimg_diff(po, w("new_short.img", new_boot[:-4096]))
+    _selftest_case(cases, "AVB-1 负样本：产物与原厂不等长", "FAIL", "RB1", "FAIL", _avb_bad_len)
+
+    def _avb_no_footer():
+        broken = bytearray(orig_boot)
+        broken[-64:] = b"\x00" * 64
+        check_bootimg_diff(w("orig_nofooter.img", bytes(broken)), pn)
+    _selftest_case(cases, "AVB-2 负样本：原厂样本 AVBf footer 缺失", "FAIL", "RB2", "FAIL",
+                   _avb_no_footer)
+
+    def _avb_footer_rewrite():
+        broken = bytearray(new_boot)
+        broken[-60] = (broken[-60] + 1) & 0xFF      # 篡改 footer 一个字节
+        check_bootimg_diff(po, w("new_footer_tamper.img", bytes(broken)))
+    _selftest_case(cases, "AVB-2 负样本：footer 被篡改 1B", "FAIL", "RB2", "FAIL",
+                   _avb_footer_rewrite)
+
+    def _avb_vbmeta_change():
+        fb = _avb_footer(new_boot)
+        broke = bytearray(new_boot)
+        off = fb["vbmeta_offset"]
+        broke[off] ^= 0xFF                            # 改 vbmeta 首字节
+        check_bootimg_diff(po, w("new_vbmeta_tamper.img", bytes(broke)))
+    _selftest_case(cases, "AVB-3 负样本：内嵌 vbmeta 被改动（digest 必变）", "FAIL", "RB3", "FAIL",
+                   _avb_vbmeta_change)
+
+    def _avb_ramdisk_change():
+        broke = bytearray(new_boot)
+        hdrs = _parse_bootimg_header(broke)
+        (_, _), (r0, r1) = _boot_segments(broke, hdrs["page_size"], hdrs["header_size"],
+                                          hdrs["kernel_size"], hdrs["ramdisk_size"])
+        broke[r0] ^= 0xFF
+        check_bootimg_diff(po, w("new_ramdisk_tamper.img", bytes(broke)))
+    _selftest_case(cases, "RB6 负样本：ramdisk 段被改动", "FAIL", "RB6", "FAIL", _avb_ramdisk_change)
+
+    # RB0：输入文件不存在（--bootimg-diff 的前置失败）
+    _selftest_case(cases, "RB0 负样本：boot.img-diff 的 NEW 文件不存在", "FAIL", "RB0", "FAIL",
+                   lambda: check_bootimg_diff(po, os.path.join(tmpdir, "no_such_new.img")))
+
+    # RB4：bootimg 头结构不一致（kernel_size 被改 → 头结构必须报 FAIL）
+    def _rb4_bad_header():
+        broke = bytearray(new_boot)
+        struct.pack_into("<I", broke, 0x08, 1024)   # kernel_size 与原厂不同
+        check_bootimg_diff(po, w("new_bad_header.img", bytes(broke)))
+    _selftest_case(cases, "RB4 负样本：bootimg 头结构不一致", "FAIL", "RB4", "FAIL",
+                   _rb4_bad_header)
+
+    # RB5：kernel 段与原厂逐字节相同 → 应 WARN「根本没 patch 内核」
+    def _rb5_kernel_untouched():
+        same = _mk_bootimg(k, ramdisk=b"\x00" * 512)   # kernel 未改，但仍保留 footer
+        check_bootimg_diff(po, w("new_kernel_same.img", same))
+    _selftest_case(cases, "RB5 负样本/WARN：kernel 段与原厂逐字节相同（未 patch）", "WARN", "RB5",
+                   "WARN", _rb5_kernel_untouched)
+
+    # RB5 正样本：kernel 确有改动 → PASS（与上一条构成正反对照）
+    def _rb5_kernel_changed():
+        check_bootimg_diff(po, pn)
+    _selftest_case(cases, "RB5 正样本：kernel 段等长且确有改动", "PASS", "RB5", "PASS",
+                   _rb5_kernel_changed)
+
+    # ---------------- 输出 ----------------
+    print("== verify_patch.py --self-test（合成夹具自检）==")
+    print("夹具目录：%s" % tmpdir)
+    print("密钥：48 字符合成串（sha256[:8]=%s，明文为公开常量，不涉及真实密钥）"
+          % hashlib.sha256(SELFTEST_KEY.encode()).hexdigest()[:8])
+    print("\n%-4s %-58s %-6s %s" % ("#", "用例", "期望", "结果"))
+    n_bad = 0
+    for i, c in enumerate(cases, 1):
+        mark = "OK" if c["ok"] else "**FAIL**"
+        if not c["ok"]:
+            n_bad += 1
+        if quiet and c["ok"]:
+            continue
+        print("%-4d %-58s %-6s %s" % (i, c["name"][:58], c["want"], mark))
+        if not c["ok"]:
+            if c["err"]:
+                print("     异常：%s" % c["err"].strip().splitlines()[-1])
+                for line in c["err"].strip().splitlines()[-6:]:
+                    print("       | %s" % line)
+            print("     期望 [%s] %s；实得 %s" % (c["cid"], c["want_status"], c["got"] or "（无该断言记录）"))
+            if not c["got"]:
+                print("       → 该断言没有落任何 record()，已退化成「不存在」")
+            elif c["want_status"] not in c["got"]:
+                print("       → 该断言在负样本上没有变红，**已退化为永远 PASS**")
+            if c.get("expect_unverified") and c["cid"] not in c.get("unverified_ids", []):
+                print("       → 未校验台账没有登记 [%s]：**「什么都没验」会静默隐身**"
+                      "（台账实得 %s）" % (c["cid"], c.get("unverified_ids") or "空"))
+            print("     本轮明细：")
+            for line in c["detail"]:
+                print("       %s" % line)
+    total = len(cases)
+    print("\n汇总：用例 %d，符合预期 %d，不符合 %d" % (total, total - n_bad, n_bad))
+    if n_bad:
+        print("判定：SELF-TEST FAIL —— 有断言在负样本上没变红（退化成永远 PASS）"
+              "或断言实现抛异常，禁止合入。")
+        return 1
+    # 覆盖度自检：确保必备断言组都被用例覆盖，防止未来有人删用例或让某组悄悄掉队。
+    # required 必须与脚本里真实存在的 record() id 对齐（28 个）——只写 14 项时，
+    # 未列出的组（如 BI2/RB4/BI5/RB0）退化成永远 PASS 也照样全绿，门禁形同虚设。
+    ALL_CHECK_IDS = {
+        "V1", "V2", "V3", "V4", "V5", "V6", "V7",
+        "BI", "BI1", "BI2", "BI3", "BI4", "BI5", "BI6",
+        "RB0", "RB1", "RB2", "RB3", "RB4", "RB5", "RB6",
+        "ELF", "ELF1", "ELF2", "ELF3", "ELF4", "ELF5", "ELF6",
+    }
+    # 反向闸门①：把本文件里**真实出现**的 record("<ID>") 全抓出来，与清单比对。
+    # 否则「从清单里删掉一组」就能让覆盖度门禁永远通过（auditor 的变异实证正是此类）。
+    import re
+    src = read_bytes(os.path.abspath(__file__)).decode("utf-8", "replace")
+    actual_ids = set(re.findall(r'record(?:_unverified)?\(\s*"([A-Z]+\d*)"', src))
+    ids_not_listed = sorted(actual_ids - ALL_CHECK_IDS)
+    if ids_not_listed:
+        print("判定：SELF-TEST FAIL —— 源码里有这些 check id 未纳入覆盖度清单（新增断言组请同步加用例）：%s"
+              % ids_not_listed)
+        return 1
+    ids_vanished = sorted(ALL_CHECK_IDS - actual_ids)
+    if ids_vanished:
+        print("判定：SELF-TEST FAIL —— 覆盖度清单里的 id 在源码中已不存在（改名/删除需同步更新清单）：%s"
+              % ids_vanished)
+        return 1
+    # ELF 组需要真 arm64 ELF 产物（AArch64/静态性/PT_TLS/导出符号），合成夹具无法替代；
+    # 显式列为「已知未覆盖」，在输出里打印，让缺口可见（而不是假装覆盖了）。
+    KNOWN_UNCOVERED = {"ELF", "ELF1", "ELF2", "ELF3", "ELF4", "ELF5", "ELF6"}
+    covered = {c["cid"] for c in cases}
+    required = ALL_CHECK_IDS - KNOWN_UNCOVERED
+    missed = sorted(required - covered)
+    if missed:
+        print("判定：SELF-TEST FAIL —— 以下断言组没有自检用例（覆盖度闸门）：%s" % missed)
+        print("       （确属无法合成夹具的组请加入 KNOWN_UNCOVERED 并说明理由，"
+              "不得直接删要求）")
+        return 1
+    # 反向闸门：ALL_CHECK_IDS 里出现了脚本已不再 record 的 id（改名/删除）→ 也要提醒
+    stale = sorted(KNOWN_UNCOVERED - ALL_CHECK_IDS)
+    if stale:
+        print("判定：SELF-TEST FAIL —— KNOWN_UNCOVERED 含不存在的 check id：%s" % stale)
+        return 1
+    print("覆盖断言组（%d/%d）：%s"
+          % (len(covered), len(ALL_CHECK_IDS), ", ".join(sorted(covered))))
+    print("已知未覆盖（%d 组，需真实产物，本模式不伪造）：%s"
+          % (len(KNOWN_UNCOVERED), ", ".join(sorted(KNOWN_UNCOVERED))))
+    print("判定：SELF-TEST PASS —— 每条断言都在已知坏样本上 FAIL、在已知好样本上 PASS。")
+    return 0
+
+
+def _selftest_guarded():
+    """--self-test 的入口（夹具由 _run_pair_quiet / run_self_test 各自清理）。"""
+    return run_self_test()
+
+
+def _patch_bytes(data, off):
+    """在 off 处做一个 8B 改动，返回新产物（用于合成「已 patch」样本）。"""
+    b = bytearray(data)
+    b[off:off + 8] = b"SKPATCH!"
+    return bytes(b)
+
+
+def _mk_report_for(inp, out, **kw):
+    return _mk_report(hashlib.sha256(inp).hexdigest(), len(inp),
+                      hashlib.sha256(out).hexdigest(), len(out), **kw)
+
+
+def _run_pair_quiet(inp, out, report=None, key=None, ndjson=None):
+    """内存态跑 verify_pair 的断言链（夹具写临时文件），吞掉正常输出。"""
+    tmpdir = tempfile.mkdtemp(prefix="sproot-selftest-")
+    try:
+        pi = os.path.join(tmpdir, "in.img")
+        po = os.path.join(tmpdir, "out.img")
+        with open(pi, "wb") as f:
+            f.write(inp)
+        with open(po, "wb") as f:
+            f.write(out)
+        rp = None
+        if report is not None:
+            rp = os.path.join(tmpdir, "report.json")
+            with open(rp, "w", encoding="utf-8") as f:
+                json.dump(report, f)
+        nd = None
+        if ndjson is not None:
+            nd = os.path.join(tmpdir, "progress.ndjson")
+            with open(nd, "w", encoding="utf-8") as f:
+                f.write(ndjson)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            verify_pair(pi, po, rp, key, nd)
+        return buf.getvalue()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main(argv):
     ap = argparse.ArgumentParser(
         description="SPRoot 修补产物静态验证（NEW-DOC-06 §4 V 组 / §9 G-02 / task-10 样本）",
@@ -985,7 +1712,12 @@ def main(argv):
     ap.add_argument("--in", dest="inp", help="原厂内核 Image")
     ap.add_argument("--out", dest="outp", help="修补后内核")
     ap.add_argument("--report", help="<out>.report.json")
-    ap.add_argument("--key", help="48 位 Root 密钥（缺省时尝试从 report.root_key 读取）")
+    ap.add_argument("--key",
+                    help="48 位 Root 密钥。优先级：本参数 > report 顶层 root_key 回落。"
+                         "引擎 build_report 会写顶层 root_key（48 字符明文，与 key_spec 同源），"
+                         "故通常无需手传；仅在 report 缺失/字段丢失时才需显式给出。"
+                         "若既有 report 又无可用 root_key，则 V2/V3/V6 记 WARN 并计入"
+                         "「未校验」汇总，不会静默 SKIP 后仍判 PASS")
     ap.add_argument("--ndjson", help="引擎 --json 进度流")
     ap.add_argument("--bootimg", action="append", metavar="PATH",
                     help="原始 Android boot.img 断言（可重复）：样本基线与可解包性")
@@ -1003,8 +1735,15 @@ def main(argv):
                     help="从 samples/manifest.json 加载样本并校验")
     ap.add_argument("--manifest", help="样本清单路径（默认 <repo>/samples/manifest.json）")
     ap.add_argument("--list-samples", action="store_true", help="列出样本清单")
+    ap.add_argument("--self-test", action="store_true",
+                    help="合成夹具自检：逐条断言跑正/负样本，任一断言退化成永远 PASS 则退出码非 0"
+                         "（CI 硬门禁）")
     ap.add_argument("--quiet", action="store_true", help="只输出 FAIL/WARN")
     args = ap.parse_args(argv)
+
+    # 模式 0：自检（CI 硬门禁；必须在其它模式之前，且不依赖 samples/）
+    if args.self_test:
+        return _selftest_guarded()
 
     # 模式 1：样本清单
     manifest_path = args.manifest or default_manifest_path()

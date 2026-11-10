@@ -69,7 +69,7 @@ Lite_version/
     - huawei_kti_addr      : 反汇编 kti_randomize_init 的 ADRP 目标（华为 KTI 缓解）
  4. InitCredSearcher: 用字节模式搜索 init_cred（见 §5）
  5. cfi_bypass / huawei_bypass（见 §6）
- 6. patch_kernel_handler: 依据内核版本选 hook 空间并织入五组 hook（见 §7）
+ 6. patch_kernel_handler: 依据内核版本选 hook 空间并织入五类 hook 函数（上游分类见 §7；SPRoot 引擎实际织入组数按内核版本为 11 或 14，`engine/src/patch_pipeline.h:52-62`）
  7. 交互式生成/输入 48 位 Root 密钥 → 写入 shellcode 头部 48 字节（见 §4）
  8. 把全部补丁逐条写回文件（write_all_patch），打印密钥
 输出: 修改后的内核 Image + 打印在控制台的 48 位密钥
@@ -155,7 +155,9 @@ if (getuid() != 0) return ERR_NO_ROOT;
 
 另：`patch_ret_cmd` 系列对「函数首条指令是 PAC/BTI」的差异化编码、华为 `hkip_check_*_root` 三函数 RET 0、`is_huawei()` 走 KTI 地址换算取 current，都是国产设备兼容性的关键，SPRoot 需原样继承。
 
-## 7. 五组 hook 的落位布局
+## 7. 五类 hook 的落位布局（上游机制分类）
+
+> **术语订正（2026-11-10）：本节「五组」指 SKRoot 上游的 5 类 hook 机制族**（do_execve / filldir64 / compat_filldir / avc_denied+avc_check+audit_log_start / 密钥内嵌），这是**上游机制分类**，不是 SPRoot 引擎的织入组数。SPRoot 引擎在此基础上做逐函数织入，**实际组数按内核版本为 11 或 14 组**（≥6.1 基 14 / <6.1 基 11，+huawei_bypass 符号 +1、+`--launcher rc` 显式开启 +1），唯一来源 `engine/src/patch_pipeline.h:52-62`。见 NEW-DOC-02 §2.3 的 `hooks[]` 逐 hook 落位。
 
 **内核 < 6.1**：shellcode 空间 = `__cfi_check`（若够大）否则固定空隙 `0x200~0x300`，顺序紧密排布：
 ```

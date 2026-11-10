@@ -139,9 +139,23 @@ fun ModulePager(
     isCurrentPage: Boolean = true,
 ) {
     val context = LocalContext.current
-    val key = remember { runCatching { SecretStore.get(context).getOrCreateRootKey() }.getOrNull() }
-    val apdStatus = remember { ApdClient.status(context) }
-    val apdReady = apdStatus.ok
+    // 分层铁律（NEW-DOC-01 §3.1）：组合期不碰 Keystore、不起进程（与 AuthPage/SettingsPage 同一修法）。
+    // getOrCreateRootKey() 会进 Keystore，ApdClient.status() 会做 ELF 探测 —— 都必须在 IO 线程。
+    // probed 记录「探测已完成」，用于驱动 LaunchedEffect 里的首次 refresh()；
+    // 结果与改动前一致（仍然是 apd 就绪 + key 可用才拉列表），只是不再阻塞主线程。
+    var key by remember { mutableStateOf<String?>(null) }
+    var apdReady by remember { mutableStateOf(false) }
+    var probed by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        // 与本文件其它加载逻辑一致：后台线程取 key / 探测 apd，主线程零阻塞。
+        Thread {
+            val loadedKey = runCatching { SecretStore.get(context).getOrCreateRootKey() }.getOrNull()
+            val ready = runCatching { ApdClient.status(context).ok }.getOrDefault(false)
+            key = loadedKey
+            apdReady = ready
+            probed = true
+        }.start()
+    }
 
     var result by remember { mutableStateOf<ModulesResult?>(null) }
     var loading by remember { mutableStateOf(false) }
@@ -231,8 +245,8 @@ fun ModulePager(
         installFromUri(uri)
     }
 
-    LaunchedEffect(isCurrentPage) {
-        if (isCurrentPage && apdReady && key != null && result == null && !loading) refresh()
+    LaunchedEffect(isCurrentPage, probed) {
+        if (isCurrentPage && probed && apdReady && key != null && result == null && !loading) refresh()
     }
 
     // ---------------- 详情页（二级页，KSU ModuleMiuix 的详情等价物） ----------------
@@ -387,7 +401,9 @@ fun ModulePager(
                 ) {
                     item { SearchCard(query = query, onQueryChange = { query = it }) }
 
-                    if (!apdReady) {
+                    // probed 前不画这张卡：apd 探测在 IO 线程，组合期结果尚未就绪，
+                    // 否则会先闪一下「暂不可用」再消失（伪装成状态变化）。
+                    if (probed && !apdReady) {
                         item {
                             WarningCard(
                                 message = "模块功能暂不可用：尚未部署 AP 守护（需先刷入修补后的镜像）；" +
@@ -416,6 +432,12 @@ fun ModulePager(
                     }
 
                     when {
+                        // probed 前（Keystore/apd 探测还在 IO 线程）也按加载中展示：
+                        // 否则会先闪一帧「没有安装任何模块」再变成加载态。
+                        !probed -> {
+                            item { LoadingRow() }
+                        }
+
                         result == null && apdReady && key != null -> {
                             item { LoadingRow() }
                         }

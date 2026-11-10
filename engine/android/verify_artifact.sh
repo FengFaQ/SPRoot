@@ -295,7 +295,12 @@ if [[ -n "$QEMU" && -f "$EXEC" ]]; then
   fi
   for kcase in embed_is_48_bytes last_byte_nul prefix_47_matches escalation_token_is_47 \
                reject_47_chars reject_49_chars spec_abi_47nul spec_bytes_48 \
-               spec_last_byte_is_nul spec_input_len_48; do
+               spec_last_byte_is_nul spec_input_len_48 \
+               report_root_key_present report_root_key_equals_key report_root_key_48_chars \
+               report_root_key_matches_key_spec_len report_root_key_marked_secret \
+               neg_missing_root_key_unusable neg_null_root_key_unusable \
+               neg_empty_root_key_unusable neg_wrong_root_key_detected \
+               neg_nonstring_root_key_unusable; do
     if [[ "$KLOG" == *"KEYCASE $kcase"*"PASS"* ]]; then
       pass "A10-[$kcase]"
     else
@@ -316,6 +321,9 @@ if [[ -n "$QEMU" && -f "$EXEC" ]]; then
   else
     fail "A10r 随机密钥 ABI 自检失败（rc=$krc2）"
   fi
+  KCNT="$(printf '%s\n' "$KLOG" | grep -c '^KEYCASE ' || true)"
+  [[ "${KCNT:-0}" -ge 25 ]] && pass "A10 规模 ${KCNT} 例（>=25，防 root_key 断言被删空）" \
+                             || fail "A10 规模仅 ${KCNT} 例（<25，疑似 root_key/密钥断言被删）"
 else
   echo "SKIP  A10 密钥 ABI 行为自检（需 qemu + exec 产物）"
 fi
@@ -335,7 +343,10 @@ if [[ -n "$QEMU" && -f "$EXEC" ]]; then
   for rcvc in template_top_level_arg_order template_service_line template_oneshot template_disabled \
               template_boot_completed layout_inplace_overwrite_safe cave_scan_split_by_nonzero \
               cave_scan_align_start cave_scan_max_out symbols_match_expected \
-              groups_rc_61 groups_rc_510_huawei; do
+              groups_rc_61 groups_rc_510_huawei \
+              reason_off_nonempty reason_off_explicit reason_rc_not_embedded_nonempty \
+              reason_preserves_precheck_text neg_empty_reason_rejected \
+              reason_enabled_untouched; do
     if [[ "$RLOG" == *"RCVCASE $rcvc"*"PASS"* ]]; then
       pass "A11-[$rcvc]"
     else
@@ -343,8 +354,8 @@ if [[ -n "$QEMU" && -f "$EXEC" ]]; then
     fi
   done
   RCNT="$(printf '%s\n' "$RLOG" | grep -c '^RCVCASE ' || true)"
-  [[ "${RCNT:-0}" -ge 24 ]] && pass "A11 规模 ${RCNT} 例（>=24，防用例被删空）" \
-                             || fail "A11 规模仅 ${RCNT} 例（<24，疑似用例被删）"
+  [[ "${RCNT:-0}" -ge 30 ]] && pass "A11 规模 ${RCNT} 例（>=30，防用例被删空）" \
+                             || fail "A11 规模仅 ${RCNT} 例（<30，疑似用例被删）"
   # 默认 off 的组数不变量（off 时 = 14/15、11/12 的既有口径）
   if [[ "$("$QEMU" "$EXEC" --self-test-groups --assume-kernel-version 6.1.0 2>/dev/null)" == *"hook_groups_expected=14"* ]]; then
     pass "A11b 默认 off 组数不变（6.1.0 → 14）"

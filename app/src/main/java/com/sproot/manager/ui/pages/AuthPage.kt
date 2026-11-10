@@ -126,9 +126,23 @@ fun AuthPager(
     isCurrentPage: Boolean = true,
 ) {
     val context = LocalContext.current
-    val key = remember { runCatching { SecretStore.get(context).getOrCreateRootKey() }.getOrNull() }
-    val apdStatus = remember { ApdClient.status(context) }
-    val apdReady = apdStatus.ok
+    // 分层铁律（NEW-DOC-01 §3.1）：组合期不碰 Keystore、不起进程。
+    // getOrCreateRootKey() 会进 Keystore（首次可能生成/迁移密钥），ApdClient.status() 会做 ELF 探测，
+    // 两者都不能在组合期同步执行（与 SettingsPage 的「密钥读取…绝不在主线程做」一致）。
+    // probed 标记「两者都已就绪」：驱动首次 load()，同时抑制加载/告警卡的一帧闪烁。
+    var key by remember { mutableStateOf<String?>(null) }
+    var apdReady by remember { mutableStateOf(false) }
+    var probed by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        // 与本文件其它加载逻辑一致：后台线程取 key / 做 ELF 探测，主线程零阻塞。
+        Thread {
+            val loadedKey = runCatching { SecretStore.get(context).getOrCreateRootKey() }.getOrNull()
+            val ready = runCatching { ApdClient.status(context).ok }.getOrDefault(false)
+            key = loadedKey
+            apdReady = ready
+            probed = true
+        }.start()
+    }
 
     var snapshot by remember { mutableStateOf<AuthRepository.UnifiedResult?>(null) }
     var loading by remember { mutableStateOf(false) }
@@ -162,8 +176,9 @@ fun AuthPager(
         }.start()
     }
 
-    LaunchedEffect(isCurrentPage) {
-        if (isCurrentPage && snapshot == null) load()
+    // key 仍在 IO 线程解析时不拉列表：否则会带着 null key 白跑一次 apd（与改动前行为不一致）。
+    LaunchedEffect(isCurrentPage, probed) {
+        if (isCurrentPage && probed && snapshot == null) load()
     }
 
     /** 本地更新某 uid 的状态（乐观更新，失败时 load() 回滚）。 */
@@ -336,7 +351,9 @@ fun AuthPager(
                     )
                 }
                 item {
-                    if (!apdReady) {
+                    // probed 前不画这张卡：apd 探测在 IO 线程、组合期结果尚未就绪，
+                    // 否则会先闪一下「尚未部署」再消失（伪装成状态变化）。
+                    if (probed && !apdReady) {
                         WarningCard(
                             message = "尚未部署 AP 守护（需先刷入修补后的镜像）：授权命令走 apd root-exec，" +
                                 "部署完成前开关只更新界面、不会真正生效",
@@ -367,7 +384,9 @@ fun AuthPager(
                     }
                 }
                 when {
-                    loading && apps.isEmpty() -> {
+                    // probed 前也按「加载中」展示：否则会先闪一帧
+                    // 「没有已安装的用户应用」再变成加载态（改动前是组合期同步取 key，没有这一帧）。
+                    (!probed || loading) && apps.isEmpty() -> {
                         item { LoadingText("正在读取已安装应用…") }
                     }
 

@@ -180,7 +180,10 @@ AP 读自己的文件；COUNT-then-LIST 同进程同文件天然一致，无需�
 
 方案 B（无状态传参）**终选**，非偏好而是唯一可行：内核每次提权内联验 key，无会话可缓存。内核失败行为 = 静默拒绝（普通 ENOENT，无计数无告警）。AP 侧日志脱敏见 §2.3。方案 A（常驻缓存）废止。
 
-**密钥文件（v1.1 明确）**：`/data/adb/sproot/key`（0600 root），内容 48 字符原文、无换行；由管理器 `deploy` 写入、rc 以 `--superkey-file` 读取；普通 App 不可读（v1.0 签署栏附加要求，安全测试项）。
+**密钥文件（v1.1 明确；2026-11-10 勘误 E7 修正内容长度）**：`/data/adb/sproot/key`（0600 root），内容 **47 字符纯文本、无 NUL、无换行**（≠ 内核内嵌的「47+NUL」，二者不是同一件事）；由管理器 `deploy` 写入、rc 以 `--superkey-file` 读取；普通 App 不可读（v1.0 签署栏附加要求，安全测试项）。
+
+> **⚠️ 2026-11-10 勘误 E7（本条原文为「48 字符原文」，与实现冲突）**：`apd/src/defs.rs:44-54` 明文规定该文件内容为 47-char escalation token, plain text, **no NUL**；`apd/src/deploy.rs::key_material()` 只接受**恰好 47 字节**（`trimmed.len() == KEY_ABI_LEN`，48/49 直接 `bail!` 拒绝，不再截断），`write_key_file()` 以 tmp→0600→fsync→rename 原子落盘。全链口径见 `docs/ARCHIVE-2026-11-10.md` §3.4 与 `docs/NEW-DOC-05-模块与守护方案.md` §12.1（F1=47 / F2=47+NUL / F3=48 入参）。
+> **反向陷阱（必须知道）**：**不要**"为了对齐内核格式"给该文件写入 NUL —— `read_to_string` 读回会带 `\0`，转 `CString` 时 `CString::new` 因内部 NUL 失败，**反而搞坏提权**（`docs/HANDOFF-2026-11-08.md` §6.8 末「密钥文件格式的正确定义」）。勘误记录见本文 **附件 B**。
 
 ---
 
@@ -214,7 +217,7 @@ APK 部署（打包 `libbusybox.so`，APatchApp.kt:148 模式 `cp -f ${nativeDir
 | `write_key_file(key)` | **AP `deploy` 子命令** | 写 `/data/adb/sproot/key` 0600（§4） |
 | `inject_rc(bootimg_dir)` | **管理器修补流程** | 写 `init.sproot.rc` + `init.rc` 尾部追加 `import`（repack 前） |
 | `uninstall_all(key)` | **AP `undeploy` 子命令** | 逆序清理（链接→隐藏目录→sproot→ap→apd） |
-| （新增）目录/符号链接/busybox/空授权表 | AP `deploy` | 幂等、sha256 校验、失败不留半成品（NEW-DOC-05 §6.2 九步清单） |
+| （新增）目录/符号链接/busybox/空授权表 | AP `deploy` | 幂等、sha256 校验、失败不留半成品（NEW-DOC-05 §6.2 **十步**清单） |
 
 **rc 内容约束**（沿用时序稿 §3.4）：不内联密钥；只引用 `/data` 路径；`seclabel` 不写死。**rc 由管理器注入而非修补引擎注入**——引擎（C1）的输入只有内核 Image、不触碰 ramdisk，职责边界不变。
 
@@ -258,9 +261,9 @@ apd root-exec --superkey-file <PATH> [--uid <N>] [--scontext <CTX>] [--timeout <
 |---|---|---|---|
 | `apd module install/uninstall/undo-uninstall/enable/disable/action/list/config` | 模块管理 | root（经 root-exec 包裹） | 行为同 APatch（NEW-DOC-05 §3.1） |
 | `apd auth list/grant/revoke/exclude/unexclude [--json]` | 授权表 UI 读写 | root | 单写者 + flock；`--json` 供 UI 解析 |
-| `apd deploy --source <nativeLibDir> --superkey-file <P>` | 首装部署（§7） | 自提权 | 幂等；九步清单见 NEW-DOC-05 §6.2 |
+| `apd deploy --source <nativeLibDir> --superkey-file <P>` | 首装部署（§7） | 自提权 | 幂等；**十步**清单见 NEW-DOC-05 §6.2（2026-11-10 修订：实为 10 步，见 `apd/src/deploy.rs` 日志 `step x/10`，原写「九步」） |
 | `apd undeploy [--keep-modules]` | 卸载清理 | root | 逆序 |
-| `apd version --json` | 状态/版本探测 | 任意 | 输出 `{version, deployed, key_prefix_sha256, daemon_pid?}`，**不含密钥明文** |
+| `apd version --json` | 状态/版本探测 | 任意 | 输出 `{version, version_code, commit, deployed, key_prefix_sha256, daemon_pid, boot_stage_done, deployed_at, hidden_file}`（**2026-11-10 修订：按 `apd/src/cli.rs:755-765` 补全字段**；`key_prefix_sha256` 是密钥前 16 字符的 sha256，仅作完整性标记，**不含密钥明文或片段**） |
 | `apd daemon --superkey-file <P>` | 常驻守护（socket/uid-listener/阶段②③） | init（rc） | **仅 rc 调用**，管理器不得拉起 |
 
 ### 8.4 输出约定
@@ -369,3 +372,39 @@ apd root-exec --superkey-file <PATH> [--uid <N>] [--scontext <CTX>] [--timeout <
 | leader | ✅ 2026-11-10 裁决：以勘误形式追加，不改冻结正文 |
 
 > 若后续开 v1.2：应把 E6 合并进 §0 修订明细，并按 §9 重新会签；届时删除本附件。
+
+---
+
+## 附件 B：勘误 E7（errata，2026-11-10 追加）
+
+> **性质**：勘误（errata），与附件 A 同一处置范式 —— **追加内容，不修改冻结正文原样**（正文仍为 v1.1-FROZEN 2026-11-08 21:23 +08；§4 已就地加 E7 指针，正文其余条文未动）。
+> **触发**：文档审计（fix/audit-2026-11-10）发现 §4「密钥文件」条与实现直接冲突 —— 契约写**48 字符**，代码写**47 字符无 NUL**。这是 FROZEN 契约与代码的硬冲突，且方向危险（按契约实现会写出内核无法匹配的密钥）。
+
+### B.1 变更内容（E7）
+
+| 项 | v1.1 正文 §4 口径（原文） | E7 后实现口径 |
+|---|---|---|
+| `/data/adb/sproot/key` 内容 | 「48 字符原文、无换行」 | **47 字符纯文本、无 NUL、无换行**（`docs/NEW-DOC-05` §12.1 F1） |
+| 写入者校验 | 未规定 | `key_material()` **只接受恰好 47 字节**；48/49/非 alnum 一律 `bail!`（**不截断**，截断会写出与内核 token 不符的密钥） |
+| 48 字符的归属 | 被写成文件内容 | 48 是**引擎 `--key` 入参 ABI 与管理器展示长度**，不是文件内容（§12.1 F3）；`deploy` 的 `abi_key()` 兼容历史 48 输入并归一为 47 + `warn!` |
+| NUL 的归属 | 未区分 | NUL **只属内核 shellcode 内嵌格式**（47+NUL，§12.1 F2）；**禁止**写入 AP 侧文件（会令 `CString::new` 失败，反而搞坏提权） |
+
+### B.2 证据
+
+- `apd/src/defs.rs:44-54`：注释逐字规定 "Content = 47-char escalation token, plain text, no NUL"，并明确 "the kernel-side shellcode format (47 chars + NUL) is a different thing and is never this file"。
+- `apd/src/deploy.rs::write_key_file()` / `key_material()` / `abi_key()`（含单测 `abi_key_accepts_exactly_47`、`abi_key_maps_48_and_47_plus_nul_to_47`、`abi_key_rejects_49_short_and_symbols`）：47 严格校验、48 归一+警告、49 拒绝。
+- `docs/NEW-DOC-05-模块与守护方案.md` §12（F1/F2/F3 三条不可混淆的事实 + 五处口径核对表）。
+- `docs/ARCHIVE-2026-11-10.md` §3.4（密钥 ABI 铁律三条）。
+- `docs/HANDOFF-2026-11-08.md` §6.8 末段（NUL 反向陷阱）。
+
+### B.3 行为后果
+
+按 E7 口径实现无行为变化（代码早已如此）；**按原文 §4 实现会出错**：写出 48 字符文件的设备上，daemon 读回后按 47 提权可成功（`abi_key` 兼容分支），但 `selftest` 会报 `legacy48`，且一旦未来收窄兼容分支即静默失效。
+
+### B.4 会签需求
+
+| 方 | 状态 |
+|---|---|
+| apd 实现方（sys-guard） | ✅ 代码即此口径（defs.rs/deploy.rs 单测锁定） |
+| 客户端（app-client / ui-client） | ✅ 已按 47 实现（`SecretStore.KEY_LENGTH = 47`，`5ed19c6`） |
+| leader | ⏳ 待确认（建议与附件 A E6 一并在 v1.2 合并进 §0 修订明细） |
