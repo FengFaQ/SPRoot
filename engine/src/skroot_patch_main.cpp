@@ -548,6 +548,20 @@ static int self_test_rcvirtual_contract() {
               "superkey-file must precede subcommand daemon");
     }
     // ③ 防 bootloop：oneshot + disabled（退出后 init 不 respawn）
+    // ⑤b Zygisk 启动链：post-fs-data 阶段必须阻塞执行 apd post-fs-data
+    //     （缺此行 → zygiskd 晚于 zygote → NeoZygisk 注入必然失败）
+    check("template_post_fs_data_exec", has("exec -- /data/adb/apd post-fs-data"),
+          "missing: exec -- /data/adb/apd post-fs-data (Zygisk injection needs zygiskd before zygote)");
+    // 时机正确性：exec 必须出现在 "on post-fs-data" 段内，不得落在 boot_completed 段
+    {
+        const size_t p_trigger = tmpl.find("on post-fs-data");
+        const size_t p_exec = tmpl.find("exec -- /data/adb/apd post-fs-data");
+        const size_t p_boot = tmpl.find("on property:sys.boot_completed=1");
+        check("template_exec_stage_order",
+              p_trigger != std::string::npos && p_exec != std::string::npos &&
+                  p_boot != std::string::npos && p_trigger < p_exec && p_exec < p_boot,
+              "exec must sit inside the post-fs-data block, before boot_completed");
+    }
     check("template_oneshot", has("oneshot"));
     check("template_disabled", has("disabled"));
     // ④ 触发点：boot_completed 之后 start

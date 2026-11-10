@@ -22,6 +22,22 @@
 on post-fs-data
     mkdir /data/adb/sproot 0700 root root
     # 密钥文件由 apd deploy 写入（0600）。此处只建目录，绝不写密钥。
+    #
+    # Zygisk 启动链（关键）：exec 是 init 的**阻塞**原语 —— init 等其结束才启动 zygote。
+    # apd post-fs-data 会执行所有模块的 post-fs-data.sh（NeoZygisk 起 zygiskd、
+    # Mountify 建 overlay），因此本行保证 **zygiskd 先于 zygote 就绪**。
+    # 缺此行 → Zygisk 注入必然失败（表现为静默无效）。
+    # 风险：apd post-fs-data 卡住会拖慢开机 —— apd 侧需该阶段硬超时。
+    exec -- /data/adb/apd post-fs-data
+    #
+    # Zygisk 启动链（关键）：exec 是 init 的**阻塞**原语 —— init 会等该进程结束
+    # 才继续启动 zygote。apd post-fs-data 会遍历执行所有模块的 post-fs-data.sh，
+    # 其中 NeoZygisk 在此阶段启动 zygiskd、Mountify 在此阶段建立 overlay 挂载。
+    # 因此本行保证：**zygiskd 一定在 zygote 之前就绪**。
+    # 缺这一行 → zygiskd 晚于 zygote → Zygisk 注入必然失败（且表现为静默无效）。
+    # 风险：若 apd post-fs-data 卡住会拖慢开机（不是崩溃，是卡住）—— apd 侧需有
+    #       该阶段的硬超时；C′ rc 虚拟化模板必须与本行保持一致。
+    exec -- /data/adb/apd post-fs-data
 
 # ⚠️ 参数顺序（clap）：--superkey-file 是 apd 的**顶层**参数，必须写在子命令 daemon 之前。
 #    写成 `apd daemon --superkey-file ...` 会被 clap 判为 unexpected argument（rc=2），

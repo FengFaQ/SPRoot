@@ -51,6 +51,11 @@ std::string rc_virt_template() {
 		"\n"
 		"on post-fs-data\n"
 		"    mkdir /data/adb/sproot 0700 root root\n"
+		// Zygisk 启动链关键行：init 在 post-fs-data 阶段**阻塞**执行本命令
+		// （exec 是 init 的阻塞原语），从而保证所有模块的 post-fs-data.sh
+		// （含 NeoZygisk 启动 zygiskd、Mountify 建立 overlay）在 zygote 启动**之前**
+		// 全部完成。缺这一行 → zygiskd 晚于 zygote 启动 → 注入必然失败。
+		"    exec -- /data/adb/apd post-fs-data\n"
 		"service sproot-apd /data/adb/apd --superkey-file /data/adb/sproot/key daemon\n"
 		"    class late_start\n"
 		"    user root\n"
