@@ -11,6 +11,8 @@
 规则：
   A. 大写类型/Composable 定义在别的包、使用点未 import（同包/全限定名/注释内除外）；
   B. 已知库扩展函数（KNOWN_EXTENSION_IMPORTS）被使用但缺对应 import；
+  D. **本项目自有扩展函数**（`fun Context.xxx(...)` 等）跨包使用必须 import
+     （真实事故：ModulesPage 用 `context.copyToClipboard(...)` 却删掉了 import）；
   C. 源码出现 `Icons.Rounded|Filled|Outlined|Default|AutoMirrored` 或 import
      `androidx.compose.material.icons.*` → 直接失败（改用 `MiuixIcons.*`）。
 字符串/注释内容不参与匹配（避免文档示例误报）。
@@ -182,6 +184,7 @@ def main():
                 sources[p] = open(p, encoding="utf-8").read()
 
     defs = {}  # name -> set(package)
+    own_extensions = {}  # name -> set(package)（本项目自有扩展函数，必须显式 import）
     for path, s in sources.items():
         masked = mask_code(s)
         m = re.search(r"^\s*package\s+([\w.]+)", s, re.M)
@@ -200,6 +203,15 @@ def main():
             re.M,
         ):
             defs.setdefault(m2.group(1), set()).add(pkg)
+        for m2 in re.finditer(
+            r"^[ \t]*(private\s+|internal\s+|public\s+)?(?:suspend\s+|inline\s+)*"
+            r"fun\s+[A-Za-z0-9_<>?, ]+?\.([a-z_]\w*)\s*\(",
+            masked,
+            re.M,
+        ):
+            if (m2.group(1) or "").strip() == "private":
+                continue
+            own_extensions.setdefault(m2.group(2), set()).add(pkg)
 
     bad = 0
     for path, s in sources.items():
@@ -230,6 +242,17 @@ def main():
                 bad += 1
                 print("%s:%d: uses '%s' defined in %s but no import" % (path, idx, name, sorted(pkgs)))
                 break
+
+        # D) 本项目自有扩展函数跨包缺 import
+        for name, pkgs in own_extensions.items():
+            if pkg in pkgs or name in imports:
+                continue
+            if re.search(r"\.\s*" + re.escape(name) + r"\s*\(", masked):
+                bad += 1
+                print(
+                    "%s: uses own extension '%s' defined in %s but no import"
+                    % (path, name, sorted(pkgs))
+                )
 
         # B) 已知库扩展函数缺 import
         for name, full in KNOWN_EXTENSION_IMPORTS.items():

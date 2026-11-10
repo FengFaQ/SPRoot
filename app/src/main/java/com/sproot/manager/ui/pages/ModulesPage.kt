@@ -66,6 +66,7 @@ import com.sproot.manager.ui.components.ConfirmDialog
 import com.sproot.manager.ui.components.StatusTag
 import com.sproot.manager.ui.components.WarningCard
 import com.sproot.manager.ui.components.WarningLevel
+import com.sproot.manager.ui.components.copyToClipboard
 import com.sproot.manager.ui.components.rememberBlurBackdrop
 import com.sproot.manager.ui.theme.LocalEnableBlur
 import top.yukonga.miuix.kmp.basic.Card

@@ -555,7 +555,7 @@ python3 quality/static/check_kt_imports.py
 |---|---|---|
 | `check_kt_syntax.py` | 字符串/三引号/字符字面量闭合、`()[]{}` 配对、块注释闭合；**字符串闭合后紧邻 `$`/ASCII 标识符**（嵌套双引号）；支持 `${...}` 模板嵌套（不误报） | `RcInject` 嵌套双引号（run 42636829029） |
 | `check_kt_signatures.py` | 具名参数必须在定义中；**唯一签名时校验必填参数是否缺失**（支持尾随 lambda）；忽略字符串/注释里的伪调用 | `FlashGuide` 参数改名未同步 + 漏传 `onCopy`（run 42637756697） |
-| `check_kt_imports.py` | ① 跨包缺 import；② **已知库扩展函数缺 import**（drawIntoCanvas/nativeCanvas/graphicsLayer/clip/nestedScroll/scrollEndHaptic/layerBackdrop… 白名单可逐轮扩充）；③ **禁用 `Icons.Rounded|Filled|Outlined|Default|AutoMirrored` 与 `androidx.compose.material.icons.*`**（图标统一 miuix-icons / 自绘 ImageVector） | `WarningCard` 漏 import（run 42637756697）；`drawIntoCanvas` 漏 import（run 42722204812）；material-icons 体积/不存在图标问题 |
+| `check_kt_imports.py` | ① 跨包缺 import（类型/Composable）；② **已知库扩展函数缺 import**（drawIntoCanvas/nativeCanvas/graphicsLayer/clip/nestedScroll/scrollEndHaptic/layerBackdrop… 白名单可逐轮扩充）；③ **禁用 `Icons.Rounded|Filled|Outlined|Default|AutoMirrored` 与 `androidx.compose.material.icons.*`**（图标统一 miuix-icons / 自绘 ImageVector） | `WarningCard` 漏 import（run 42637756697）；`drawIntoCanvas` 漏 import（run 42722204812）；material-icons 体积/不存在图标问题 |
 
 ### 10.1 已知踩坑表（红一次 → 工具强一次）
 
@@ -565,6 +565,7 @@ python3 quality/static/check_kt_imports.py
 | 2 | 42637756697 | 跨包用 Composable 漏 import；函数形参改名后调用点未同步 + 漏必填参数 | ✅ `check_kt_imports` A / `check_kt_signatures` 覆盖 |
 | 3 | 42722204812 | Compose 扩展函数 `drawIntoCanvas` 漏 import（扩展函数写在别的包） | ✅ `check_kt_imports` B 覆盖（扩展名白名单） |
 | 4 | 42721703071 | `Icons.Rounded.*` / miuix 图标名不存在或依赖已移除 | ✅ `check_kt_imports` C 全面禁用 material `Icons.*`；miuix 图标名仍需编译校验（白名单暂不含图标名） |
+| 5 | 42805281686 | **本项目自有扩展函数**跨包使用却删掉了 import（`context.copyToClipboard(...)`；旧检查器只查"定义在别的包的大写类型/Composable"，漏了小写扩展） | ✅ `check_kt_imports` 新增规则 D（自动收集 `fun Receiver.name(...)`，非 private 的跨包使用必须 import）；负样本已验证 FAIL |
 
 ### 10.2 推送流程约定（硬规则）
 
