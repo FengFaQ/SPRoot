@@ -76,6 +76,25 @@ bool SymbolAnalyze::find_symbol_offset() {
 		});
 	
 	m_sym_offset.prctl_get_seccomp = find_region({{"prctl_get_seccomp", false}});  // backup: seccomp_filter_release
+
+	// rc 虚拟化（--launcher rc）：这些符号在 4.14+ 才齐全；缺失只影响该可选组，不影响主链路
+	m_sym_offset._etext = find_addr({{"_etext", false}});
+	m_sym_offset.openat_sys = find_region({
+		{"__arm64_sys_openat", false},
+		{"sys_openat", false},
+		});
+	m_sym_offset.str_cmp = find_region({{"strcmp", false}});
+	m_sym_offset.strncpy_from_user_fn = find_region({{"strncpy_from_user", false}});
+	m_sym_offset.filp_open_fn = find_region({{"filp_open", false}});
+	m_sym_offset.kernel_read_fn = find_region({{"kernel_read", false}});
+	m_sym_offset.kernel_write_fn = find_region({{"kernel_write", false}});
+	m_sym_offset.filp_close_fn = find_region({{"filp_close", false}});
+	m_sym_offset.vmalloc_fn = find_region({{"vmalloc", false}});
+	m_sym_offset.vfree_fn = find_region({{"vfree", false}});
+	m_sym_offset.copy_to_user_fn = find_region({
+		{"__arch_copy_to_user", false},
+		{"copy_to_user", false},
+		});
 	
 	m_sym_offset.__cfi_check = find_region({{"__cfi_check", false}});
 	m_sym_offset.__cfi_check_fail = find_addr({{"__cfi_check_fail", false}});
@@ -118,6 +137,10 @@ void SymbolAnalyze::printf_symbol_offset() {
 
 	std::cout << "sys_getuid:" << m_sym_offset.sys_getuid.offset << ", size:" << m_sym_offset.sys_getuid.size << std::endl;
 	std::cout << "prctl_get_seccomp:" << m_sym_offset.prctl_get_seccomp.offset << ", size:" << m_sym_offset.prctl_get_seccomp.size << std::endl;
+	std::cout << "_etext:" << m_sym_offset._etext << std::endl;
+	std::cout << "__arm64_sys_openat:" << m_sym_offset.openat_sys.offset << ", size:" << m_sym_offset.openat_sys.size << std::endl;
+	std::cout << "kernel_read:" << m_sym_offset.kernel_read_fn.offset << " kernel_write:" << m_sym_offset.kernel_write_fn.offset
+	          << " filp_open:" << m_sym_offset.filp_open_fn.offset << " __arch_copy_to_user:" << m_sym_offset.copy_to_user_fn.offset << std::endl;
 
 	// bypass cfi
 	std::cout << "__cfi_check:" << m_sym_offset.__cfi_check.offset << ", size:" << m_sym_offset.__cfi_check.size << std::endl;

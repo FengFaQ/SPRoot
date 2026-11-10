@@ -75,6 +75,9 @@ struct EngineOptions {
     bool self_test_groups = false;       // --self-test-groups
     bool self_test_workdir = false;      // --self-test-workdir（workdir 所有权判定矩阵）
     bool self_test_keyabi = false;       // --self-test-keyabi（密钥 47+NUL ABI 闭环）
+    bool self_test_rcvirtual = false;    // --self-test-rcvirtual（rc 虚拟化纯逻辑/布局/洞扫描）
+    // 可选启动器：off（默认）| rc（rc 虚拟化，见 NEW-DOC-02 §11）| umh（B 方案，未实现）
+    std::string launcher_mode = "off";
 };
 
 static std::ofstream g_ndjson;
@@ -293,6 +296,7 @@ struct EngineState {
     std::vector<size_t> patch_addrs;            // vec_patch[i].write_addr 镜像
     std::vector<size_t> patch_lens;             // 每处补丁字节数
     std::vector<std::string> patch_hex;          // 每处补丁 bytes（大写 hex）
+    RcVirtInfo launcher;                         // rc 虚拟化结果（--launcher rc）
 };
 
 // 十六进制小写化（vec_patch 内部为大写 hex；orig_bytes 由镜像读出，统一小写便于比对）
@@ -329,6 +333,28 @@ static J build_report(const EngineOptions& opt, const EngineState& st, const std
             .set("input_len", static_cast<int>(root_key.size()))
             .set("abi", "47+nul")         // P0：与 Skroot-Next 的 48 字节无 NUL ABI 不兼容
             .set("source", opt.key_from_user ? "user" : "gen");
+    // rc 虚拟化结果（--launcher rc；off 时 mode=off/enabled=false）。caves/symbols 供真机排障。
+    J launcher;
+    launcher.set("mode", st.launcher.mode)
+            .set("enabled", st.launcher.enabled)
+            .set("reason", st.launcher.reason)
+            .set("hook_addr", static_cast<long long>(st.launcher.hook_addr))
+            .set("cave_offset", static_cast<long long>(st.launcher.cave_offset))
+            .set("cave_size", static_cast<long long>(st.launcher.cave_size))
+            .set("shellcode_bytes", static_cast<long long>(st.launcher.shellcode_bytes))
+            .set("template_bytes", static_cast<long long>(st.launcher.template_bytes));
+    {
+        J caves = J::array();
+        for (const auto& c : st.launcher.caves) {
+            J one;
+            one.set("offset", static_cast<long long>(c.offset)).set("size", static_cast<long long>(c.size));
+            caves.push(std::move(one));
+        }
+        launcher.set("caves", std::move(caves));
+        J syms;
+        for (const auto& p : st.launcher.symbols) syms.set(p.first, static_cast<long long>(p.second));
+        launcher.set("symbols", std::move(syms));
+    }
     J errors = J::array();
     for (auto& e : st.errors) errors.push(e);
     J rep;
@@ -344,6 +370,7 @@ static J build_report(const EngineOptions& opt, const EngineState& st, const std
        .set("output", std::move(output))
        .set("kernel_version", st.kernel_version)
        .set("key_spec", std::move(key_spec))
+       .set("launcher", std::move(launcher))
        .set("hook_table", std::move(hooks))
        .set("hooks", [&st]() -> J {
             // C1 §2.3 五组逐 hook 落位（非破坏性新增）：每组含 group/name/resolved/
@@ -353,9 +380,15 @@ static J build_report(const EngineOptions& opt, const EngineState& st, const std
                 J h;
                 size_t n = (g.last > g.first) ? (g.last - g.first) : 0;
                 h.set("group", g.group ? g.group : "").set("name", g.symbol ? g.symbol : "");
-                if (n == 0) {
-                    // 未解析组也输出统一字段（空值 + reason），便于 qa 按固定 schema 断言
-                    h.set("resolved", false).set("reason", "no_patch_bytes_symbol_missing_or_not_used")
+                // 失败路径保护：st.patch_addrs/lens/hex 只在「成功收尾前」才回填，
+                // 而 fail() 也会构建 report。若不校验下标就会越界读（曾在本轮 launcher
+                // 的 E202 失败路径上触发段错误）。缺失时不冒充"已落位"。
+                const bool have_bytes = n > 0 && g.last <= st.patch_addrs.size()
+                    && g.last <= st.patch_lens.size() && g.last <= st.patch_hex.size();
+                if (!have_bytes) {
+                    h.set("resolved", false)
+                     .set("reason", n == 0 ? "no_patch_bytes_symbol_missing_or_not_used"
+                                           : "patch_bytes_not_filled_yet_failure_path")
                      .set("hook_addr", std::string("")).set("trampoline", std::string(""))
                      .set("bytes", 0);
                 } else {
@@ -489,6 +522,122 @@ static int self_test_keyabi_contract(const std::string& cli_key) {
     return failures == 0 ? OK : 1;
 }
 
+// 隐藏自检（--self-test-rcvirtual）：rc 虚拟化的**纯逻辑层**（模板/布局/符号表/洞扫描/组数矩阵）。
+// 不需要内核镜像 ⇒ CI 每次必跑（A11）。真内核相关部分（符号解析/实际织入）由 Tier B B11 覆盖。
+static int self_test_rcvirtual_contract() {
+    int failures = 0, total = 0;
+    auto check = [&](const char* name, bool ok, const std::string& detail = "") {
+        ++total; if (!ok) ++failures;
+        std::cout << "RCVCASE " << name << (ok ? " PASS" : " FAIL");
+        if (!ok && !detail.empty()) std::cout << " (" << detail << ")";
+        std::cout << "\n";
+    };
+    const std::string tmpl = rc_virt_template();
+    auto has = [&](const char* needle) { return tmpl.find(needle) != std::string::npos; };
+
+    // ① 模板：自启链语义（与 apd/assets/init.sproot.rc 等价的关键行）
+    check("template_post_fs_data", has("on post-fs-data"));
+    check("template_service_line",
+          has("service sproot-apd /data/adb/apd --superkey-file /data/adb/sproot/key daemon"));
+    // ② clap 顶层参数序：--superkey-file 必须在子命令 daemon 之前（§6.8 教训 #2）
+    {
+        const size_t p_flag = tmpl.find("--superkey-file");
+        const size_t p_cmd = tmpl.rfind(" daemon");
+        check("template_top_level_arg_order", p_flag != std::string::npos &&
+              p_cmd != std::string::npos && p_flag < p_cmd,
+              "superkey-file must precede subcommand daemon");
+    }
+    // ③ 防 bootloop：oneshot + disabled（退出后 init 不 respawn）
+    check("template_oneshot", has("oneshot"));
+    check("template_disabled", has("disabled"));
+    // ④ 触发点：boot_completed 之后 start
+    check("template_boot_completed", has("on property:sys.boot_completed=1") && has("start sproot-apd"));
+    // ⑤ 模板里不得出现密钥原文 / 不得异常膨胀
+    check("template_no_key_material", tmpl.find("ROOT_KEY") == std::string::npos && tmpl.size() < 2048);
+
+    // ⑥ 数据区布局
+    const RcVirtDataLayout l = rc_virt_data_layout();
+    check("layout_ok", l.ok, l.reason);
+    check("layout_monotonic", l.off_orig[0] < l.off_orig[1] && l.off_orig[1] < l.off_replace &&
+          l.off_replace < l.off_template && l.off_template < l.data_len);
+    check("layout_aligned", (l.off_orig[0] % 4) == 0 && (l.off_orig[1] % 4) == 0 &&
+          (l.off_replace % 4) == 0 && (l.off_template % 4) == 0 && (l.data_len % 4) == 0);
+    // ⑦ 原地覆写安全性：替换串必须严格短于每个原路径（否则会越界写用户内存）
+    {
+        bool safe = true;
+        for (const char* p : RC_VIRT_ORIG_PATHS)
+            if (strlen(RC_VIRT_REPLACE_PATH) >= strlen(p)) safe = false;
+        check("layout_inplace_overwrite_safe", safe);
+    }
+
+    // ⑧ 符号清单（防被删空 / 防漂移）
+    const std::vector<const char*> req = rc_virt_required_symbols();
+    const std::vector<std::string> expect = {
+        "__arm64_sys_openat", "strncpy_from_user", "strcmp", "filp_open", "kernel_read",
+        "kernel_write", "filp_close", "vmalloc", "vfree", "__arch_copy_to_user"
+    };
+    check("symbols_count", req.size() >= 10, "count=" + std::to_string(req.size()));
+    {
+        std::vector<std::string> got;
+        for (auto n : req) got.push_back(n ? n : "");
+        std::sort(got.begin(), got.end());
+        auto uniq = got; uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+        check("symbols_unique", uniq.size() == got.size());
+        std::vector<std::string> exp_sorted = expect;
+        std::sort(exp_sorted.begin(), exp_sorted.end());
+        check("symbols_match_expected", got == exp_sorted);
+    }
+
+    // ⑨ 洞扫描（纯函数；合成缓冲，覆盖边界/分裂/对齐/上限）
+    {
+        std::vector<char> z(4096, 0);
+        auto c1 = rc_virt_scan_caves(z, 0, z.size(), 1024);
+        check("cave_scan_all_zero", c1.size() == 1 && c1[0].offset == 0 && c1[0].size == 4096);
+
+        std::vector<char> z2(4096, 0);
+        z2[2048] = 1;
+        auto c2 = rc_virt_scan_caves(z2, 0, z2.size(), 1024);
+        check("cave_scan_split_by_nonzero", c2.size() == 2 && c2[0].offset == 0 && c2[0].size == 2048 &&
+              (c2[1].offset % 4) == 0 && c2[1].size >= 1024);
+        // 分裂点落在 "洞内填 1 字节非零" → 必须不再是一整块（负样本语义）
+        check("cave_scan_nonzero_breaks", !(c2.size() == 1 && c2[0].size == 4096));
+
+        std::vector<char> z3(4096, 0);
+        z3[0] = 0x7f;
+        auto c3 = rc_virt_scan_caves(z3, 3, z3.size(), 1024);   // lo 非对齐 → 起点对齐到 4
+        check("cave_scan_align_start", c3.size() == 1 && (c3[0].offset % 4) == 0 && c3[0].offset == 4);
+
+        std::vector<char> z4(4096, 0);
+        for (size_t i = 0; i < z4.size(); i += 1024) z4[i] = 0x11;   // 10 个 1023B 的洞
+        auto c4 = rc_virt_scan_caves(z4, 0, z4.size(), 512, 3);
+        check("cave_scan_max_out", c4.size() == 3, "got=" + std::to_string(c4.size()));
+
+        std::vector<char> z5(512, 0);
+        auto c5 = rc_virt_scan_caves(z5, 0, z5.size(), 1024);
+        check("cave_scan_min_filter", c5.empty());
+
+        auto c6 = rc_virt_scan_caves(z, 0, z.size() + 16, 1024);
+        check("cave_scan_bounds_guard", c6.empty());
+    }
+
+    // ⑨b 读取上限（防截断）：必须 >= 256 KB（init.rc 实测 60–100 KB；截断=开机事故）
+    check("read_limit_sane", RC_VIRT_READ_MAX_BYTES >= 256 * 1024, "RC_VIRT_READ_MAX_BYTES=" + std::to_string(RC_VIRT_READ_MAX_BYTES));
+    check("min_cave_sane", RC_VIRT_MIN_CAVE_BYTES >= 2048 && RC_VIRT_MIN_CAVE_BYTES <= 65536,
+          "RC_VIRT_MIN_CAVE_BYTES=" + std::to_string(RC_VIRT_MIN_CAVE_BYTES));
+
+    // ⑩ 组数矩阵（默认 off 不变；rc on 时 +1）
+    check("groups_off_61", hook_groups_expected_count(true, false, false) == 14);
+    check("groups_off_510", hook_groups_expected_count(false, false, false) == 11);
+    check("groups_rc_61", hook_groups_expected_count(true, false, true) == 15);
+    check("groups_rc_61_huawei", hook_groups_expected_count(true, true, true) == 16);
+    check("groups_rc_510", hook_groups_expected_count(false, false, true) == 12);
+    check("groups_rc_510_huawei", hook_groups_expected_count(false, true, true) == 13);
+
+    std::cout << "RCVRESULT " << (failures == 0 ? "PASS" : "FAIL")
+              << " " << (total - failures) << "/" << total << " cases\n";
+    return failures == 0 ? OK : 1;
+}
+
 // ---------------------------------------------------------------- bootimg 模式
 // 内置 boot.img 解析/重打包（不依赖 magiskboot/kptools，见 bootimg.h 决策说明）
 // 用法：
@@ -614,6 +763,8 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
         else if (a == "--self-test-groups") { opt.self_test_groups = true; }
         else if (a == "--self-test-workdir") { opt.self_test_workdir = true; }
         else if (a == "--self-test-keyabi") { opt.self_test_keyabi = true; }
+        else if (a == "--self-test-rcvirtual") { opt.self_test_rcvirtual = true; }
+        else if (a == "--launcher") { opt.launcher_mode = need("--launcher"); }
         else if (a == "--gen-key") { have_key = true; }
         else if (a == "--json") { opt.json_sink = need("--json"); }
         else if (a == "--workdir") { opt.workdir = need("--workdir"); opt.workdir_from_user = true; }
@@ -621,7 +772,8 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
         else if (a == "--help" || a == "-h") {
             std::cout << "SPRoot patch engine v1.0.0 (contract SPROOT-DOC-C1 v1.0)\n"
                       << "usage: skroot-patch --in <kernel_image> --out <patched_kernel> (--gen-key|--key <48ch>)\n"
-                      << "       [--json <ndjson_sink>] [--workdir <dir>] [--quiet]\n";
+                      << "       [--json <ndjson_sink>] [--workdir <dir>] [--launcher off|rc|umh] [--quiet]\n"
+                      << "       --launcher rc: 用 rc 虚拟化接管 AP 自启（免 init_boot；默认 off，见 NEW-DOC-02 §11)\n";
             return OK;
         }
         else { std::cerr << "unknown arg: " << a << "\n"; return E_USAGE; }
@@ -639,10 +791,17 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
                   << " base=" << (ge61 ? 14 : 11)
                   << " huawei=" << (opt.assume_huawei ? "yes" : "no")
                   << " hook_groups_expected=" << exp << "\n";
+        // --launcher rc 维度（A8 矩阵扩到 8 例：off 6 例 + rc 2 例）
+        const bool lrc = (opt.launcher_mode == "rc");
+        const size_t exp_launcher = hook_groups_expected_count(ge61, opt.assume_huawei, lrc);
+        std::cout << "launcher=" << opt.launcher_mode
+                  << " hook_groups_expected_with_launcher=" << exp_launcher << "\n";
         J extra;
         extra.set("branch_ge_6_1", ge61)
              .set("huawei", opt.assume_huawei)
-             .set("hook_groups_expected", static_cast<long long>(exp));
+             .set("hook_groups_expected", static_cast<long long>(exp))
+             .set("launcher", opt.launcher_mode)
+             .set("hook_groups_expected_with_launcher", static_cast<long long>(exp_launcher));
         emit_result(OK, std::move(extra));
         if (g_ndjson.is_open()) g_ndjson.close();
         return OK;
@@ -665,6 +824,16 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
         int rc = self_test_keyabi_contract(opt.key_from_user ? opt.key : std::string());
         J extra;
         extra.set("key_abi", rc == OK ? "PASS" : "FAIL");
+        emit_result(rc == OK ? OK : E_USAGE, std::move(extra));
+        if (g_ndjson.is_open()) g_ndjson.close();
+        return rc;
+    }
+
+    // 隐藏自检：rc 虚拟化纯逻辑层（模板/布局/符号表/洞扫描/组数矩阵），CI 每次必跑（A11）
+    if (opt.self_test_rcvirtual) {
+        int rc = self_test_rcvirtual_contract();
+        J extra;
+        extra.set("rc_virtualize", rc == OK ? "PASS" : "FAIL");
         emit_result(rc == OK ? OK : E_USAGE, std::move(extra));
         if (g_ndjson.is_open()) g_ndjson.close();
         return rc;
@@ -693,6 +862,22 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
     }
     if (opt.key_from_user && !valid_key(opt.key)) {
         J e; e.set("error", "E101: --key must match ^[A-Za-z0-9]{48}$");
+        emit_result(E_USAGE, std::move(e));
+        return E_USAGE;
+    }
+    // --launcher 取值校验：off|rc|umh；umh（B 方案）尚未实现 → 显式 E101，绝不静默忽略
+    if (opt.launcher_mode != "off" && opt.launcher_mode != "rc" && opt.launcher_mode != "umh") {
+        std::string msg = "E101: --launcher must be one of off|rc|umh, got '" + opt.launcher_mode + "'";
+        std::cerr << msg << "\n";
+        J e; e.set("error", msg);
+        emit_result(E_USAGE, std::move(e));
+        return E_USAGE;
+    }
+    if (opt.launcher_mode == "umh") {
+        std::string msg = "E101: --launcher umh is NOT implemented yet (B 方案，见 NEW-DOC-02 §9.4; "
+                          "当前实现只有 off|rc)";
+        std::cerr << msg << "\n";
+        J e; e.set("error", msg);
         emit_result(E_USAGE, std::move(e));
         return E_USAGE;
     }
@@ -790,7 +975,8 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
                 st.groups_expected_source = "assume";
             }
             if (opt.assume_huawei) { st.has_huawei = true; st.groups_expected_source = "assume"; }
-            st.groups_expected = hook_groups_expected_count(st.branch_ge_6_1, st.has_huawei);
+            st.groups_expected = hook_groups_expected_count(st.branch_ge_6_1, st.has_huawei,
+                                                            opt.launcher_mode == "rc");
         }
         {   // C1 §2.3：kernel_version 必须是真实版本串（qa/审计依赖），解析失败才回落 unknown
             std::string ver = kv.get_kernel_version();
@@ -860,9 +1046,16 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
     emit_progress("patch_hooks", 50, "...");
     {
         st.orig_buf = st.file_buf;   // 备份：hooks[].orig_bytes 用原始字节
-        pr = patch_kernel_handler(st.file_buf, off, sym, vec_patch, &st.groups);
+        LauncherOptions launcher_opt;
+        launcher_opt.mode = opt.launcher_mode;
+        pr = patch_kernel_handler(st.file_buf, off, sym, vec_patch, &st.groups, launcher_opt);
         if (!pr.patched)
             return fail(E_NO_HOOK_SPACE, "E220: failed to find hook start addr / not enough kernel space", "-");
+        st.launcher = pr.launcher;
+        // 显式 --launcher rc 但前置不满足（符号缺失/无洞/洞非法）→ E202 且不产出 --out（绝不静默降级）
+        if (opt.launcher_mode == "rc" && !pr.launcher.enabled)
+            return fail(E_SYMBOL_MISSING, "E202: --launcher rc preconditions not met",
+                        pr.launcher.reason.empty() ? "unknown" : pr.launcher.reason);
         J hooks; hooks.set("name", "hooks_embedded").set("blob_count", static_cast<int>(vec_patch.size()))
                       .set("root_key_region", "0x" + [&]{ std::ostringstream o; o << std::hex << pr.root_key_start; return o.str(); }());
         st.hook_table.push(std::move(hooks));

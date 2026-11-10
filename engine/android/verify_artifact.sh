@@ -188,6 +188,21 @@ if [[ -n "$QEMU" && -f "$EXEC" ]]; then
   a8_expect 6.1.0 "" 14
   a8_expect 6.1.0 "--assume-huawei-symbols" 15
   a8_expect 6.6.30 "" 14
+  # A8-rc：--launcher rc 维度（默认 off 时上面 6 例保持不变；这里 2 例验 +1）
+  a8_expect_launcher() {
+    local ver="$1" extra="$2" expect="$3"
+    local out
+    out=$("$QEMU" "$EXEC" --self-test-groups --assume-kernel-version "$ver" $extra --launcher rc 2>/dev/null)
+    local got
+    got=$(echo "$out" | sed -n 's/.*hook_groups_expected_with_launcher=\([0-9]*\).*/\1/p' | head -1)
+    if [[ "$got" == "$expect" ]]; then
+      pass "A8-rc ${ver}${extra:+ +$extra} +--launcher rc → hook_groups_expected=$expect"
+    else
+      fail "A8-rc ${ver}${extra:+ +$extra} +--launcher rc → 期望 $expect 实得 '${got}'（组数契约/launcher 维度错误）"
+    fi
+  }
+  a8_expect_launcher 6.1.0 "" 15
+  a8_expect_launcher 5.10.0 "" 12
 else
   echo "SKIP  A8 期望组数分支自检（需 qemu）"
 fi
@@ -303,6 +318,48 @@ if [[ -n "$QEMU" && -f "$EXEC" ]]; then
   fi
 else
   echo "SKIP  A10 密钥 ABI 行为自检（需 qemu + exec 产物）"
+fi
+
+# ---------------- A11：rc 虚拟化纯逻辑自检（--launcher rc，默认 off）----------------
+# 空间/符号/模板/洞扫描/组数矩阵全部在**不依赖内核镜像**的纯逻辑层断言 ⇒ CI 每次必跑。
+# 负样本已验（本地，2026-11-10）：改坏洞扫描器 → 3 例 FAIL；模板参数序写反 → 2 例 FAIL；
+# 替换串过长 → 3 例 FAIL（并让真内核 --launcher rc 变 E202 + 无产物）。
+if [[ -n "$QEMU" && -f "$EXEC" ]]; then
+  RLOG="$("$QEMU" "$EXEC" --self-test-rcvirtual 2>&1)"; rcvrc=$?
+  if [[ $rcvrc -eq 0 && "$RLOG" == *"RCVRESULT PASS"* ]]; then
+    pass "A11 rc 虚拟化纯逻辑自检全绿（--self-test-rcvirtual）"
+  else
+    fail "A11 rc 虚拟化纯逻辑自检失败（rc=$rcvrc）"
+    printf '%s\n' "$RLOG" | grep -E 'FAIL$|^RCVRESULT' | sed 's/^/       /'
+  fi
+  for rcvc in template_top_level_arg_order template_service_line template_oneshot template_disabled \
+              template_boot_completed layout_inplace_overwrite_safe cave_scan_split_by_nonzero \
+              cave_scan_align_start cave_scan_max_out symbols_match_expected \
+              groups_rc_61 groups_rc_510_huawei; do
+    if [[ "$RLOG" == *"RCVCASE $rcvc"*"PASS"* ]]; then
+      pass "A11-[$rcvc]"
+    else
+      fail "A11-[$rcvc] 用例缺失或未 PASS（断言被削弱成空断言）"
+    fi
+  done
+  RCNT="$(printf '%s\n' "$RLOG" | grep -c '^RCVCASE ' || true)"
+  [[ "${RCNT:-0}" -ge 24 ]] && pass "A11 规模 ${RCNT} 例（>=24，防用例被删空）" \
+                             || fail "A11 规模仅 ${RCNT} 例（<24，疑似用例被删）"
+  # 默认 off 的组数不变量（off 时 = 14/15、11/12 的既有口径）
+  if [[ "$("$QEMU" "$EXEC" --self-test-groups --assume-kernel-version 6.1.0 2>/dev/null)" == *"hook_groups_expected=14"* ]]; then
+    pass "A11b 默认 off 组数不变（6.1.0 → 14）"
+  else
+    fail "A11b 默认 off 组数被改动（6.1.0 期望 14）"
+  fi
+  # CLI 显式拒绝：未实现的 umh / 非法取值 → E101（绝不静默忽略）
+  "$QEMU" "$EXEC" --in /x --out /y --gen-key --launcher umh >/dev/null 2>&1; rc=$?
+  [[ $rc -eq 101 ]] && pass "A11c --launcher umh → rc=101（B 方案未实现，显式拒绝）" \
+                    || fail "A11c --launcher umh rc=$rc（期望 101）"
+  "$QEMU" "$EXEC" --in /x --out /y --gen-key --launcher bogus >/dev/null 2>&1; rc=$?
+  [[ $rc -eq 101 ]] && pass "A11d --launcher bogus → rc=101（取值校验）" \
+                    || fail "A11d --launcher bogus rc=$rc（期望 101）"
+else
+  echo "SKIP  A11 rc 虚拟化纯逻辑自检（需 qemu + exec 产物）"
 fi
 
 # ---------------- Tier B：真修补产物字节级断言（需一份真 arm64 内核 Image）-----
@@ -429,6 +486,89 @@ PY
   [[ ! -e "$B/d2/kernel.patched.work" ]] \
     && pass "B10c 默认 workdir（<out>.work）已由引擎回收（C1 §3 / NEW-DOC-02 §8.1）" \
     || fail "B10c 默认 workdir 未回收（契约另一半失效：应回收却没回收）"
+  # ---- B11 rc 虚拟化（--launcher rc）：真内核上的织入/字节级/失败降级 ----
+  # 只在有真内核时跑；CI 无 samples 会跳过（CI 门槛由 A11 纯逻辑自检承担）。
+  RCD="$B/rcvirt"; mkdir -p "$RCD"
+  $RUN "$EXEC" --in "$KERNEL_IMAGE" --out "$RCD/k.patched" --key "$KEY" --launcher rc \
+      >"$RCD/o.txt" 2>"$RCD/e.txt"; rc3=$?
+  [[ $rc3 -eq 0 ]] && pass "B11a --launcher rc rc=0" \
+                   || fail "B11a --launcher rc rc=$rc3（$(tail -1 "$RCD/e.txt")）"
+  if [[ -f "$RCD/k.patched.report.json" ]] && command -v python3 >/dev/null; then
+    python3 - "$RCD/k.patched.report.json" "$KERNEL_IMAGE" "$RCD/k.patched" <<'PYRCV' \
+      && pass "B11b rc 虚拟化字节级自证（洞全零/入口跳转/13 处 BL 命中符号/组数 15）" \
+      || fail "B11b rc 虚拟化字节级自证失败"
+import json, struct, sys
+rep = json.load(open(sys.argv[1])); img = open(sys.argv[2],'rb').read(); out = open(sys.argv[3],'rb').read()
+L = rep.get("launcher") or {}
+sym = L.get("symbols") or {}
+ok = True
+def fail(m):
+    global ok
+    ok = False; print("       B11b-FAIL:", m)
+if not (L.get("mode") == "rc" and L.get("enabled") is True): fail("launcher.mode/enabled 不对: %r" % (L.get("mode"), L.get("enabled")))
+cave = int(L.get("cave_offset") or 0); size = int(L.get("cave_size") or 0); blob_n = int(L.get("shellcode_bytes") or 0)
+if cave <= 0 or size < 2048 or blob_n == 0 or blob_n > size: fail("cave 参数非法: cave=%d size=%d blob=%d" % (cave, size, blob_n))
+if len(out) != len(img): fail("产物长度 != 输入长度")
+if out == img: fail("产物未改动（未织入）")
+if cave + blob_n > len(img): fail("blob 越界")
+if any(img[cave:cave+blob_n]): fail("洞内原始字节并非全 0（违反『洞合法性』铁律）")
+tmpl_b = int(L.get("template_bytes") or 0)
+blob = out[cave:cave+blob_n]
+if tmpl_b <= 0 or blob.find(b"on post-fs-data") < 0 or blob.find(b"start sproot-apd") < 0: fail("blob 内未找到模板")
+for pth in (b"/system/etc/init/hw/init.rc\x00", b"/vendor/etc/init/hw/init.target.rc\x00", b"/dev/user_init.rc\x00"):
+    if blob.find(pth) < 0: fail("blob 内缺少路径串 %r" % pth)
+hook = int(L.get("hook_addr") or 0)
+if hook <= 0 or hook + 4 > len(img): fail("hook_addr 非法")
+else:
+    w = struct.unpack('<I', out[hook:hook+4])[0]
+    imm = w & 0x03FFFFFF
+    if imm & (1 << 25): imm -= (1 << 26)
+    tgt = hook + imm*4
+    restore_off = tgt - cave
+    if not (0 <= restore_off < blob_n - 4): fail("入口跳转目标不在 blob 内: tgt=0x%x" % tgt)
+    elif blob[restore_off:restore_off+4] != img[hook:hook+4]: fail("restored insn 槽位 != 原首指令")
+    hits = set(sym.values())
+    nbl, bad = 0, []
+    for i in range(0, blob_n-3, 4):
+        w = struct.unpack('<I', blob[i:i+4])[0]
+        if (w >> 26) == 0b100101:
+            imm = w & 0x03FFFFFF
+            if imm & (1 << 25): imm -= (1 << 26)
+            t = cave + i + imm*4
+            nbl += 1
+            if t not in hits: bad.append(hex(t))
+    if nbl < 13: fail("BL 数量异常: %d" % nbl)
+    if bad: fail("BL 目标未命中已解析符号: %s" % bad[:4])
+cnt = int(rep.get("hook_groups_count") or 0); exp = int(rep.get("hook_groups_expected") or 0)
+if not (cnt == exp == 15): fail("组数应严格等值且含 rc_virtualize: count=%d expected=%d" % (cnt, exp))
+if "rc_virtualize" not in [h.get("group") for h in rep.get("hooks", [])]: fail("hooks[] 缺少 rc_virtualize 组")
+sys.exit(0 if ok else 1)
+PYRCV
+  fi
+  # B11c 默认 off 不变量：B1（事故现场形态）与 B10（默认 workdir 形态）产物必须逐字节相同
+  if [[ -f "$OUT" && -f "$OUT2" && "$(sha256sum < "$OUT")" == "$(sha256sum < "$OUT2")" ]]; then
+    pass "B11c 默认 off 不变量：两次独立的 off 运行产物逐字节相同"
+  else
+    fail "B11c 默认 off 不变量被破坏（off 时产物应与既有行为一致）"
+  fi
+  # B11d 失败降级（负样本）：把所有洞填成非零 → --launcher rc 必须 E202 且不产出 --out
+  if command -v python3 >/dev/null; then
+    python3 - "$KERNEL_IMAGE" "$RCD/k.patched.report.json" "$RCD/nocave.bin" <<'PYNOCAVE'
+import json, sys
+img = bytearray(open(sys.argv[1],'rb').read())
+L = json.load(open(sys.argv[2])).get("launcher") or {}
+for c in (L.get("caves") or []):
+    off, end = int(c["offset"]), int(c["offset"]) + int(c["size"])
+    for a in range(off, end, 1024): img[a] = 0x01
+open(sys.argv[3],'wb').write(bytes(img))
+PYNOCAVE
+    $RUN "$EXEC" --in "$RCD/nocave.bin" --out "$RCD/nocave.patched" --key "$KEY" --launcher rc \
+        >"$RCD/no.txt" 2>"$RCD/no.err"; rc4=$?
+    [[ $rc4 -eq 202 && ! -e "$RCD/nocave.patched" ]] \
+      && pass "B11d 无合法洞时 --launcher rc → rc=202 且不产出 --out（失败降级）" \
+      || fail "B11d 无洞降级异常（rc=$rc4，out 存在=$([[ -e "$RCD/nocave.patched" ]] && echo yes || echo no)）"
+  fi
+
   echo "诊断目录保留：$B"
 else
   echo "SKIP  Tier B 字节级断言（设置 KERNEL_IMAGE=<boot.img unpack 出的 arm64 Image> 后重跑）"

@@ -37,6 +37,7 @@ LIBS := -ldl -pthread
 SPROOT_SRCS := \
   skroot_patch_main.cpp \
   patch_pipeline.cpp \
+  patch_rc_virtualize.cpp \
   bootimg.cpp
 
 # 引擎核心（vendor 副本，已修上游 Linux 移植 bug: cstdint/cstring include）

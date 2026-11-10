@@ -79,7 +79,7 @@ void huawei_bypass(const std::vector<char>& file_buf, KernelSymbolOffset &sym, s
 	patch_ret_0_cmd(file_buf, sym.hkip_check_xid_root, vec_patch_bytes_data);
 }
 
-PatchKernelResult patch_kernel_handler(const std::vector<char>& file_buf, const PatchKernelOffset& off, KernelSymbolOffset& sym, std::vector<patch_bytes_data>& vec_patch_bytes_data, std::vector<PatchGroupSpan>* groups) {
+PatchKernelResult patch_kernel_handler(const std::vector<char>& file_buf, const PatchKernelOffset& off, KernelSymbolOffset& sym, std::vector<patch_bytes_data>& vec_patch_bytes_data, std::vector<PatchGroupSpan>* groups, const LauncherOptions& launcher) {
 	auto mark = [&](const char* group, const char* symbol, size_t target_addr, size_t first) {
 		if (!groups) return;
 		groups->push_back({ group, symbol, target_addr, first, vec_patch_bytes_data.size() });
@@ -172,6 +172,29 @@ PatchKernelResult patch_kernel_handler(const std::vector<char>& file_buf, const 
 	} else {
 		patched = false;
 	}
+
+	// ---- 可选：rc 虚拟化（--launcher rc，默认 off）----
+	// 失败一律降级（enabled=false + reason），**不影响**上面已织入的组；显式开启但失败由 main 报 E202。
+	if (launcher.rc()) {
+		size_t g0 = vec_patch_bytes_data.size();
+		PatchRcVirtualize pv(patchBase, sym);
+		RcVirtInfo info;
+		info.mode = "rc";
+		if (pv.precheck(off.cred_offset, info)) {
+			RcVirtInfo out_info;
+			if (pv.weave(off.cred_offset, off.cred_uid_offset, info, vec_patch_bytes_data, out_info)) {
+				r.launcher = out_info;
+				mark("rc_virtualize", "__arm64_sys_openat", out_info.hook_addr, g0);
+			} else {
+				r.launcher = out_info;
+				std::cout << "[rc_virtualize] weave failed: " << out_info.reason << std::endl;
+			}
+		} else {
+			r.launcher = info;
+			std::cout << "[rc_virtualize] precheck failed: " << info.reason << std::endl;
+		}
+	}
+
 	r.patched = patched;
 	return r;
 }

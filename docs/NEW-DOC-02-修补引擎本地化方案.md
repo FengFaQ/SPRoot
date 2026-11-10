@@ -21,8 +21,8 @@
 | **`--workdir` 所有权契约（2026-11-09 真机事故后）** | **显式传入 `--workdir` ⇒ 目录及内容生命周期归调用方，引擎不得删除其中任何内容；只有默认 workdir（`<out>.work`）由引擎成功收尾时回收**（§8.1）。行为证据：A9d `--self-test-workdir` 13 例矩阵（CI 必跑）+ Tier B B9 事故现场回归 / B10 默认回收正控。 |
 | **密钥 ABI 契约（P0，提权链）** | CLI `--key` **严格 48 字符**（47/49/非 alnum → E101）；内核只写 **`key[0:47]` + NUL = 48 字节**（`embed_key_bytes()`，内联断言）；`report.key_spec` 输出 `abi="47+nul"/bytes=48/last_byte_is_nul=true/input_len=48`（§7.5）。行为证据：A10 `--self-test-keyabi` 17 例（CI 必跑）+ Tier B B7。**用户态提权串必须 47 字符**。 |
 | **用户态 daemon 启动方式（2026-11-10 评估）** | SK 引擎**无任何内核态拉起用户态的能力**（`call_usermodehelper`/`kernel_thread`/`kthread_run`/`init_task` 全零命中）；KSU 亦需改 ramdisk/init_boot，APatch 靠常驻内核运行时做 init.rc 虚拟化才不需要。**选型：A（App 自引导）先落地 → B（提权时内核顺带拉起）作兜底 → C（init hook + umh）不建议**。详见 §9。 |
-| **模块卸载 umount modules（2026-11-10 评估）** | 符号可用（`path_umount`/`kern_path`/`path_put` 实测在 kallsyms），setuid hook 结构可行；但静态 shellcode 无运行时数据 → 只能「固定挂载点 + 全局」，**做不出 per-app 开关**；且模块挂载由 metamodule 决定 → 覆盖率不可控。**建议方案 ③（不做，UI 不出该开关）**；`filldir64` 只挡列目录、挡不住 `mountinfo`/`statfs`/已知路径 `open`。**⚠️ 本评估只完成了符号级与代码级验证，真机 `path_umount` 调用未验证**（见 §10「验证边界」）。详见 §10。 |
-| **rc 虚拟化（APatch 路线，2026-11-10 复核）** | hook `__arm64_sys_openat` → 把 init 的 rc 打开重定向到 `/dev/user_init.rc`（原 rc + 追加模板）→ **init 自己在正确时机 `exec` apd**，可**彻底免 init_boot**；空间实测 `.text` 零洞 7 处共 **63.8 KB**（单洞 53.6 KB）→ 判据通过；所需符号真机全部可解析；比 APatch 少一个 `su -Z` 依赖。**结论：可立项（默认 off 可选组）**。详见 §11。 |
+| **模块卸载 umount / APatch「排除修改 exclude」（两轮评估）** | 第一轮"建议不做"的 3 条理由中**体积/无运行时数据/固定挂载点**均已被推翻（`.text` 洞 63.8 KB；可"apd 写文件 + 内核按需读"；D 路线可动态遍历 vfsmount 链表）。APatch 的 exclude 消费点绑死在其内核文件重定向子系统，我们模块挂载在外部 metamodule → **不能照抄**。新结论：**可做但有前置条件**（P1–P4 PoC，尤其 P3 只读探针可零风险证伪识别准确性；新增 setresuid hook 组；默认 off；C′ 真机通过后再立项）。详见 §10.8/§10.9。 |
+| **rc 虚拟化（APatch 路线）— 已落地（默认 off）** | hook `__arm64_sys_openat` → 把 init 的 rc 打开重定向到 `/dev/user_init.rc`（原 rc + 追加模板）→ **init 自己在正确时机 `exec` apd**，可**彻底免 init_boot**。`--launcher off\|rc\|umh`（默认 off；umh 未实现→E101）。空间实测 `.text` 零洞 7 处 **63.8 KB**（单洞 53.6 KB），真机 blob 836 B 放入 `0xf937d4`；**off 产物与旧版逐字节一致**（sha256 `399ac479…`），rc on 时组数 15/15；5 组负样本全部打红。**待真机 S3 验证 5 项**。详见 §11（含 §11.8 实现状态）。 |
 | 推荐集成 | **主形态 JNI（`libskrootpatch.so` + `System.loadLibrary("skrootpatch")`）**，次形态静态 exec（`skroot-patch` 从 `nativeLibraryDir` 真实路径 exec，**禁止** symlink 到 `filesDir`；该可执行件默认不进 APK）。 |
 | 实测编译耗时 | 全量 100+ TU，12 核并行 **18 秒**（`make objs`，见 §3.4）。 |
 | 打包工具 | **magiskboot v31.1 ARM64**（SKRoot 官方路径；988,984 B，静态 AArch64，sha256 `97e9ec75…bb54`），CI 内固定版本+哈希校验并随 artifact 分发；自研 bootimg 保留为交叉校验/回退（§7）。**禁止 AIK**。 |
@@ -869,7 +869,7 @@ init_boot.img: ramdisk=2,131,370 B     ← rc 只能注进这里
 4. **对外口径**：「我们要修 init_boot」的准确表述是——**本机 ramdisk 在 init_boot（GKI 布局），而我们的守护自启走 ramdisk rc（KSU 走 ramdisk `/init`，同一层级）**；APatch 不需要 ramdisk 是因为它有常驻内核运行时做 rc 虚拟化，不是因为我们漏了什么。
 5. **C′（rc 虚拟化）已具备立项条件**（2026-11-10 复核）：`.text` 零洞 **63.8 KB（单洞 53.6 KB）**；§9.5 对 C 的两条硬否决（时机 / 可写标志）**都不适用于 C′** → "彻底免 init_boot"的正解是 C′（见 §11.7）；B 降为 C′ 真机失败时的兜底。
 
-## 10. 模块卸载（umount modules）可行性评估（2026-11-10）
+## 10. 模块卸载（umount modules / APatch「排除修改 exclude」）可行性评估（2026-11-10，两轮）
 
 > **本节结论先行**：
 > 1. **符号可用**：`path_umount` / `kern_path` / `path_put` 在真机 kallsyms 中全部可解析（实测地址见 §10.1），`do_umount`/`ksys_umount` 不存在（已内联）——与 KSU 依赖同一原语。
@@ -1039,24 +1039,217 @@ zygote fork → unshare(CLONE_NEWNS) → mount 私有化(/storage,/mnt 等)
 - 连续 30 次冷启动 app 无 panic、无 `avc` 风暴、`/data/system/dropbox` 无 NativeCrash；
 - 系统 uid（1000/1001…）进程行为不变（确认守卫没误伤）。
 
-### 10.8 给人类的选择题（建议原文转述）
+### 10.8 结论（第二轮重评，2026-11-10：人类提供新线索后）
 
-| 方案 | 能力 | 引擎改动 | 风险 | 诚实度 |
-|---|---|---|---|---|
-| **① 仅 `filldir64` 软隐藏（含扩展成按名字隐藏 `/data/adb/modules`）** | 只能挡“列目录”；`mountinfo`/`statfs`/已知路径 `open` **仍可见** | 零（现有能力）+ 可选 +~30 B | 低 | ✅ 如实标注“仅目录名隐藏” |
-| **② `setuid` hook + `path_umount`（照 KSU）** | **能过 mountinfo/statfs 类检测**；但只能**全局**（无 per-app）、只能**固定挂载点**（≤3），且覆盖率取决于 metamodule 挂载方式 | 大（新 hook 组 + 4 符号 + 400–460 B + 组数契约扩展） | **高**（热路径 + 命名空间作用域，真机不可测部分最大） | ⚠️ 若 UI 出 per-app 开关而内核不支持 = 假功能 |
-| **③ 先不做，UI 不出现该开关** | 无 | 零 | 无 | ✅ |
+**人类提供的新线索（关键）**：APatch 的这个功能不叫 "umount modules"，叫「**排除修改（exclude）**」。其实现是**三部件**：
 
-**我的建议：③（本轮）**，理由按重要性排序：
-1. **UI 语义无法诚实落地**：人类要的是“每个应用一个开关”，而内核侧最简方案只有全局；做 per-app 需要位图文件（+150–250 B、`kernel_read` 版本风险、每 app 启动一次文件读）——这不是“顺手加个 hook”。
-2. **覆盖率不可控**：模块挂载由第三方 metamodule 决定（§10.5），固定路径列表在 bind-mount 型 metamodule 上会漏；先做会得到“有时有效”的功能，比没有更难排查。
-3. **风险等级最高**：这是目前唯一会**改动每个 app 进程创建路径**、且失败可能波及整个 zygote 命名空间的改法；静态断言只能覆盖字节级，作用域语义只能真机验证。
-4. **依赖顺序**：② 的正确前提是“模块挂载收归自有（固定单一 overlay）”，这与“沿用 metamodule 生态”的 D1 决策冲突，需人类先裁决模块方案，再谈 umount。
+| 部件 | APatch 实现 | 位置 |
+|---|---|---|
+| 存储 | 内核持久存储 kstorage，per-uid 一个 int（内存态，不落盘） | `KernelPatch/kernel/patch/common/sucompat.c:511 set_ap_mod_exclude / get_ap_mod_exclude` |
+| 写入 | apd → supercall → `supercmd.c` 派发 | `APatch/apd/src/supercall.rs:98 sc_set_ap_mod_exclude` |
+| **消费点** | **在 APatch 自己的「supercall 文件访问重定向」入口按 uid 短路**：`if (get_ap_mod_exclude(uid)) return;` | `KernelPatch/kernel/patch/common/supercall.c:421` |
 
-**若人类坚持要 ②，前置条件（建议写进任务书）**：
-- 先定“模块挂载方案”（是否放弃第三方 metamodule、固定单一挂载点）；
-- 接受“全局开关”（授权页不做 per-app umount 开关，或明确标注 per-app 仅为记录、不影响内核行为——**不推荐**）；
-- 单列一轮真机验证（S3-umount），未过真机前不进入发布门禁。
+> 旁证：我们的 apd `package.rs` CSV header 与 APatch **完全一致**（`pkg,exclude,allow,uid,to_uid,sctx`）——说明血统相同，`exclude` 字段一直存在但**我们从未实现语义**。
+
+**为什么不能照抄**：APatch 的消费点绑死在**它自己的内核文件重定向子系统**上；我们的模块挂载由**外部 metamodule 的 shell 脚本**完成（`apd/src/metamodule.rs` 只做元模块管理，`grep mount|MS_BIND|overlay` 零命中），内核里根本不存在"模块挂载"这个对象 → **没有可短路的消费点**。
+
+**第一轮否决理由的现状（逐条更新）**：
+
+| 第一轮理由 | 现状 |
+|---|---|
+| "体积不够" | **已失效**：§11.1 实测 `.text` 零洞 63.8 KB（单洞 53.6 KB）；umount 组估算 ≈1.2 KB（§10.9.9） |
+| "静态 shellcode 无运行时数据 → 做不出 per-app" | **部分失效**：可绕开——apd 写 `/data/adb/sproot/exclude` 文件，内核按需 `filp_open`+`kernel_read`（§10.9.6），仍是"零内核可写状态" |
+| "只能固定挂载点" | **被 §10.9 推翻**：D 路线可动态遍历 namespace 内的 vfsmount 链表发现挂载点 |
+| "UI 语义无法诚实落地" | 仍成立，但**有解**：数据层复用现有 `exclude` 列，per-app 语义可诚实实现 |
+| "覆盖率不可控/误伤风险" | **仍是最大障碍**：识别规则（bind vs overlay）必须做到零误伤，且需要 allowlist 兜底（§10.9.5） |
+| "时机" | **新增硬事实**：`path_umount` 要求 `CAP_SYS_ADMIN`，app 在 `execve` 时已降权 → 必须在 `setresuid` 时机（§10.9.7） |
+
+**新结论**：从"**建议不做**"改为"**可做，但有前置条件**"。
+
+| 前置条件 | 说明 |
+|---|---|
+| P1–P4 PoC 通过（§10.9.10） | 尤其 **P3 只读探针**：不 umount 就能证伪"识别准确性"这条最大风险 |
+| 新增 `setresuid` hook 组 | 组数契约再 +1；必须默认 off，且 `--launcher`/feature 开关显式开启 |
+| 识别 allowlist | 系统挂载点硬黑名单 + 可选 allowlist；识别不确定时**不卸** |
+| 真机 S3 验证 #6 | zygote 在 `setresuid` 之前已 `unshare(CLONE_NEWNS)`（否则卸载会波及全局） |
+| 排期 | **C′（§11）真机 S3 通过之前不立项**；C′ 是当前主线 |
+
+> 本轮已完成的技术验证见 **§10.9（D 路线可行性，反汇编实证）**：三个天真做法的否决点（kCFI 间接调用 / path_umount 自取写锁导致自死锁 / `dget` 不在 kallsyms）与对应工程解法、10 个结构体偏移的实测值、锁顺序分析、识别策略、以及可在 qemu + 真内核上"零风险先证伪"的 4 步 PoC。
+
+### 10.9 D 路线可行性：动态发现挂载点 + mount namespace 内卸载（2026-11-10 第三轮，反汇编实证）
+
+> **路线定义**：不预知挂载点，在进程上下文（hook 点）里**遍历该进程 mount namespace 的 vfsmount 链表**，按"源路径/文件系统类型"特征识别出模块挂载点，再用 `path_umount()` 在**该进程的命名空间内**卸载。
+> 它是唯一同时满足「不重构模块挂载」+「兼容任意 metamodule 后端」的路线。本节全部结论都来自对真机 Image 的**反汇编实证**（`samples/meizu21`，6.1 内核，符号来自引擎 `--dump-symbols`）。
+
+#### 10.9.1 先说三个"本轮实测发现"的关键否决点
+
+| # | 天真的做法 | 实测结果 | 后果 |
+|---|---|---|---|
+| 1 | 直接调 `iterate_mounts(f, arg, root)` 让内核帮我们遍历 | 该函数在 +0x24 处做 **kCFI 间接调用检查**：`ldur w16,[x20,#-4]; movk w17,#0xb562,lsl#16; movk w17,#0x6e2; cmp; b.eq; brk #0x8228` → 再 `blr x20` | 手写 shellcode 作为回调：**必须伪造 4 字节 kCFI 哈希放在函数前 + BTI `bti c` 目标**，且 `blr` 受 BTI 约束。可行但脆弱（哈希随原型/编译器变）→ **不用它，改手动走链表** |
+| 2 | 遍历后直接 `path_umount()`（以为它不管锁） | `path_umount` 内部 **自己取 `namespace_sem` 写锁**：末尾 +0x4c0 `bl namespace_unlock`（`namespace_lock` 无符号=内联 `down_write(&namespace_sem)`） | 若遍历时持 `namespace_sem`（哪怕读锁）再调它 → **自死锁**。必须两阶段：持读锁收集 → 释放 → 再逐条卸载 |
+| 3 | 用 `mntget()`/`dget()` 给收集到的 mount 加引用防 UAF | `mntget` 有符号（0x3b4d80）、**`dget` 在 kallsyms 里不存在**（inline，`lockref_get_not_dead` 被内联） | 引用计数路线需要自己拼 `lockref`（还要 dentry 内偏移）→ 改用 **"只收集路径字符串，事后 `kern_path()` 重新解析"**（二次解析天然处理竞态，KSU 同款思路） |
+
+#### 10.9.2 遍历路径（伪代码，非真实代码）
+
+```
+Phase 0  快速过滤（热路径第一道闸）
+  cred = current->cred
+  if (!(cred->uid==0 && 即将降权到非0)) return;      // 只在 setresuid 时机进入
+  if (uid 在排除表内) return;                         // 数据层见 10.9.6
+
+Phase 1  持读锁收集"候选挂载点的全路径字符串"
+  ns = current->nsproxy->mnt_ns                      // 偏移 0x888 / 0x18（实测）
+  down_read(&namespace_sem)                           // namespace_sem 是数据符号
+  mnt = ns->root                                      // struct mount*
+  for (mnt = list_first(ns->list); ...; mnt = list_next) {      // 手走 mnt_list，不用 iterate_mounts
+      vfs      = &mnt->mnt                             // = mnt - 0x20
+      sb       = vfs->mnt_sb
+      devname  = mnt->mnt_devname                      // bind mount = 源路径字符串
+      if (devname 前缀 == "/data/adb/")                → 候选（bind，强特征）
+      else if (sb->s_type->name == "overlay"           // overlay，中特征
+               && mnt 挂载点路径 not in 系统黑名单)     → 候选
+      if (候选) {
+          path = dentry_path_raw(mnt->mnt_mountpoint, buf, 4096)   // 内核符号存在
+          if (path 命中黑名单) skip
+          push 到固定数组（上限 32 项，栈上 32×256 B 或 vmalloc）
+      }
+  }
+  up_read(&namespace_sem)
+
+Phase 2  逐条卸载（此时不再持 namespace_sem）
+  for (each 收集到的路径字符串) {
+      if (kern_path(str, LOOKUP_FOLLOW, &path)) continue;          // 已消失 → 跳过
+      if (path.dentry != path.mnt->mnt_root) { path_put; continue; } // 只卸整挂载点
+      path_umount(&path, MNT_DETACH);                              // 内部自己取 namespace_sem 写锁
+      path_put(&path);
+  }
+  return;   // 无论成败都返回原流程（失败静默）
+```
+
+**为什么是"两阶段 + 路径字符串"而不是"持锁直接卸"**：
+1. `path_umount` 自取写锁 → 持读锁调用必死锁；
+2. 释放锁后 mount 树可能变化 → 用 `kern_path` 重新解析字符串，得到"当下"的 `struct path`，把竞态交给 VFS（找不到就跳过）；这避免了 `dget` 缺失导致的引用计数地狱；
+3. `path_umount` 自身要求 `path.dentry == path.mnt->mnt_root`（实测 +0x60/+0x64 校验），所以只能整挂载点卸载——这正好符合"卸模块挂载"的需求。
+
+#### 10.9.3 符号清单（真机 kallsyms 逐个实测）
+
+| 符号 | 真机地址 | 用途 | 有无 |
+|---|---|---|---|
+| `namespace_sem`（数据） | 0x01f49990 | 读锁/写锁对象 | ✅ |
+| `namespace_unlock` | 0x003b5d08 | 仅用于**确认** path_umount 自取写锁 | ✅ |
+| `down_read` / `up_read` | 0x00f8a898 / 0x00129668 | Phase 1 读锁 | ✅ |
+| `down_write` / `up_write` | 0x00f8c1c8 / 0x001297a4 | 备用（不自持调用 path_umount） | ✅ |
+| `path_umount` | 0x003b5e64 | **卸载核心**（自锁，导出给 vendor） | ✅ |
+| `kern_path` | 0x00393e50 | 字符串 → struct path（重新解析） | ✅ |
+| `path_put` / `path_get` | 0x0039352c / 0x003934ec | 释放/持有 path | ✅ |
+| `dentry_path_raw` | 0x003d3ca8 | dentry → 全路径字符串（Phase 1 识别用） | ✅ |
+| `d_path` | 0x003d385c | 备选（需 seq buffer） | ✅ |
+| `ns_capable` / `capable` | 0x000c01cc / 0x000c031c | path_umount 内部用（我们不需要调） | ✅ |
+| `security_sb_umount` | 0x005d9e44 | path_umount 内部 LSM 钩子（SELinux 可能在这里拒） | ✅ |
+| `umount_tree` / `propagate_mount_busy` | 0x003b5990 / 0x003ce654 | path_umount 内部 | ✅ |
+| `__arm64_sys_setresuid` | 0x000d03fc | 建议 hook 点（ACL：见 10.9.7） | ✅ |
+| `override_creds` / `revert_creds` / `init_cred` | 0x000e7470 / 0x000e74e4 / 0x01ea2930 | 仅在"必须在 execve 时卸"的备选方案里用（高风险，不建议） | ✅ |
+| `dget` | — | **不存在**（inline）→ 引用计数路线被否 | ❌ |
+| `iterate_mounts` | 0x003b69cc | 存在但**不可用**（kCFI 间接调用，见 10.9.1） | ⚠️ |
+
+#### 10.9.4 结构体偏移（本轮反汇编实测，6.1 meizu21；其它版本需同一方法重推）
+
+| 含义 | 值 | 证据（反汇编来源） |
+|---|---|---|
+| `current->nsproxy` | **0x888** | `path_umount` +0x40：`ldr x8,[x26,#0x888]` → `[x8,#0x18]`(mnt_ns) → `[+0x38]`(user_ns) → `ns_capable` |
+| `current->fs` | **0x870** | `path_umount` +0xe8：`[x26+0x870]+0x18` 与 path->mnt 比较（禁止卸 cwd） |
+| `fs->pwd.mnt` | **0x18** | 同上 |
+| `nsproxy->mnt_ns` | **0x18** | `path_umount` +0x48 |
+| `mnt_namespace->user_ns` | **0x38** | `path_umount` +0x50 |
+| `mnt_namespace->list` | **0x20**（待 PoC 复核） | `alloc_mnt_ns`：`add x9,x20,#0x20` 后写自指针（INIT_LIST_HEAD 形态）；`sizeof(mnt_namespace)=0x78`（`kmalloc(0x78)`） |
+| `mount->mnt`（vfsmount 内嵌于 mount 的偏移） | **0x20** | `path_umount` +0x4c：`sub x20,x21,#0x20`（real_mount） |
+| `&mount->mnt_list`（相对 vfsmount） | **+0x90**（即 mount+0xB0） | `iterate_mounts` +0x44 `add x21,x21,#0x90`；+0x58 `sub x0,x22,#0x90` |
+| `vfsmount->mnt_root` | **0x0** | `path_umount` +0x60 `ldr x8,[x8]` 与 path->dentry 比较 |
+| `vfsmount->mnt_sb` | **0x8** | `path_umount` +0xa0 `ldr x22,[x21,#0x8]` 传给 `security_sb_umount` |
+| `mount->mnt_ns`（相对 vfsmount） | **+0xE8**（mount+0x108） | `path_umount` +0x70 `ldr x9,[x21,#0xe8]` 与 `nsproxy->mnt_ns` 比较 |
+| `mount->mnt_devname` / `mount->mnt_mountpoint` | **待推**（PoC P1 用 `show_mountinfo`/`d_path` 反推） | — |
+| `super_block->s_type` / `s_type->name` | **待推**（PoC P1 用 `path_umount` 附近 `[sb+0x30]+0x78` 之类线索） | — |
+
+> **无 BTF 怎么办**：kallsyms 只给"函数/数据地址"，**不给结构体偏移**。我们的做法是**在 patch 时用引擎内置 capstone 反汇编"锚点函数"**（`path_umount`/`iterate_mounts`/`alloc_mnt_ns`/`show_mountinfo`），从固定的指令模式里提取常量（`sub xN,xM,#imm`、`add xN,xM,#imm`、`ldr xN,[xM,#imm]`），并 **断言"提取值 + 已知锚点"自洽**（例如：`real_mount = vfsmount - off` 必须与 `&mnt_list = vfsmount + k` 出现在同一函数里，且两值差 = `offsetof(mnt_list)-offsetof(mnt)`）。这套"偏移探针"可复用引擎已有的 `find_*` 基础设施，**不需要 BTF、不需要调试符号**。
+
+#### 10.9.5 锁顺序与死锁分析
+
+| 场景 | 结论 |
+|---|---|
+| execve/setresuid hook 入口是否已持 `namespace_sem` | **否**：实测 `do_execveat_common` 全函数无 `namespace_sem` 引用；setresuid 路径取的是 `cred_guard_mutex`（另一把锁） |
+| 持 `namespace_sem` 读锁时调 `path_umount` | **必死锁**（它内部 `down_write(&namespace_sem)`）→ 禁止 |
+| 两阶段之间 mount 树变化 | 用字符串 + `kern_path` 重解析，找不到即跳过；无 UAF（不持裸指针跨越临界区） |
+| 与 `mount` 系统调用并发 | `mount` 取写锁；我们 Phase 1 取读锁 → 阻塞但不死锁；Phase 2 不持锁 |
+| 与 execve 内部锁（`cred_guard_mutex`、`mmap_lock`） | 我们在入口取读锁、返回前释放；execve 后续才取这些锁 → 无环等待 |
+| 递归/重入（我们在 umount 期间又被 execve 触发） | hook 只在 setresuid 入口，且 filter 要求 "cred->uid==0 且 target uid != 0"；重复触发时路径已不存在 → `kern_path` 失败即返回 |
+
+#### 10.9.6 per-uid 排除数据：**绕开"内核可写状态"**
+
+`.text` 洞在运行期是 **RO+X**（GKI `CONFIG_STRICT_KERNEL_RWX`），不能做可写表；`.data/.bss` 里没有我们的变量槽。三种选择：
+
+| 方案 | 体积 | 风险 | 结论 |
+|---|---|---|---|
+| 内核内静态 uid 数组（放 .data 空槽） | 表 64×4 B + 查找 40 B | 需要"找可写空槽 + 保证无引用"，与硬编码地址同类风险 | ❌ 不推荐 |
+| `vmalloc` + 指针存 .data | 同上 + 指针槽 | 仍需可写槽 | ❌ |
+| **用户态文件 + 内核按需读取** | `filp_open`+`kernel_read`+解析 ≈ **210 B** | 无内核可写状态；page cache 命中，单次 ~µs | ✅ **推荐** |
+
+- 文件：`/data/adb/sproot/exclude`（apd 写；每行一个 uid 或 `pkg` 由 apd 解析成 uid 后写入）
+- 内核：`cred->uid==0 且 target_uid!=0` 时读一次文件、线性扫描命中即短路；**不缓存**（缓存就需要可写内存）
+- 与 APatch 的差别：APatch 用内核 kstorage（`sucompat.c:511` 的 `write_kstorage/read_kstorage`，per-uid 一个 int，内存态）；我们用**用户态文件**替代，等价语义、零可写内核状态、可被 apd 统一管理（`apd/src/package.rs` 的 `exclude` 列终于有语义）
+- 与"daemon 写内核可读文件 + shellcode 读"的设想一致 —— **该设想成立**，且是唯一不与"无可写内核状态"铁律冲突的方案
+
+#### 10.9.7 时机：`setresuid` 优于 `execve`（关键 ACL 事实）
+
+`path_umount` 第一道检查是 `ns_capable(mnt_ns->user_ns, CAP_SYS_ADMIN)`（实测 +0x50/+0x54）。而 SKRoot 的 app 进程：
+
+| 时机 | 当前 cred | `ns_capable(CAP_SYS_ADMIN)` | 结果 |
+|---|---|---|---|
+| `execve` 进入时 | app uid（无 caps） | ❌ | `path_umount` 直接 **-EPERM** |
+| `setresuid` 进入时（zygote 子进程从 uid0 降权） | **uid 0 + full caps**（zygote 的 cred） | ✅ | 允许，KSU 正是选这个时机 |
+
+- 所以"在 execve 里 umount"要么失败，要么必须 `override_creds(&init_cred)` → 一旦中途异常，**app 进程会带着 root cred 继续跑**（灾难级）→ **不推荐**。
+- 但 setresuid 时机的前提是：**该进程的 mount namespace 已是私有副本**（否则卸载会波及全局）。Android zygote 在 `forkAndSpecialize` 早期做 `unshare(CLONE_NEWNS)`（需真机验证顺序：unshare 必须先于 setresuid）。这条是 **S3 真机验证项 #6**。
+- "每个进程只做一次且不引入可写内核状态"：用**状态机式过滤**——`cred->uid == 0 && *(regs[0] /*新 uid*/) != 0`；一个 app 进程从 zygote 降权只发生一次；重复调用时路径已被卸掉，`kern_path` 失败即返回（幂等、无状态）。
+
+#### 10.9.8 失败回退（铁律）
+
+1. 任何一步失败 → **立即返回原流程**（execve/setresuid 语义不变），不 printk、不 panic、不改 errno；
+2. `kern_path`/`dentry_path_raw`/`path_umount` 失败 → **跳过该条**（"收集失败列表但静默继续"），失败信息只进 report 的调试字段（用户态 apd 侧可统计）；
+3. 遍历上限（32 个候选 / 256 个 mount）防跑飞；
+4. 识别不确定 → **不卸**（宁可漏卸，不可误伤）；系统核心挂载点硬黑名单 + 可选 allowlist 双重保险。
+
+#### 10.9.9 体积估算（可放进 63.8 KB 任一洞，实际会选 ≥2 KB 的洞）
+
+| 模块 | 估算 |
+|---|---|
+| uid 过滤 + 排除表读取解析 | ≈ 210 B |
+| Phase 1：取 ns、读锁、手走 mnt_list（含偏移探针结果内联） | ≈ 260 B |
+| `dentry_path_raw` 调用 + 黑名单前缀比较（8–12 条） | ≈ 220 B |
+| 收集数组管理（上限 32，栈上） | ≈ 80 B |
+| Phase 2：`kern_path` + 校验 + `path_umount` + `path_put` | ≈ 180 B |
+| 错误分支/恢复/跳回 | ≈ 150 B |
+| **合计** | **≈ 1.1–1.3 KB**（+ 偏移探针代码在 patch 时执行，不进 blob） |
+
+结论：体积不再是障碍（§11.1 实测 63.8 KB 可用，最大单洞 53.6 KB）。
+
+#### 10.9.10 PoC 最小验证实验设计（qemu + 真内核 + 现有引擎，逐步证伪）
+
+| 步骤 | 做什么 | 通过标准 | 风险 |
+|---|---|---|---|
+| **P1 偏移探针（无真机）** | 用真机 Image + 引擎 capstone 反汇编，提取 10.9.4 的偏移；写成隐藏自检 `--self-test-nsoffsets`（断言"提取值 == 已知锚点推导值"，如 `real_mount = vfsmount-0x20` 与 `&mnt_list` 差 = 0x90 自洽） | 全部偏移断言 PASS；负样本：改 1 个偏移 → 必须红 | 零 |
+| **P2 识别策略离线验证（无内核代码）** | 用户态脚本：`adb shell cat /proc/self/mountinfo`，用与内核相同的规则（devname 前缀 `/data/adb/`、overlay + 黑名单）挑出模块挂载点 | 与"人工已知的模块挂载点集合"**完全一致**（零误伤、零漏判） | 零 |
+| **P3 内核侧只读探针（真机，不 umount）** | 在 setresuid hook 里只做 Phase 1（遍历+识别），把"mount 总数/候选数/候选路径哈希"写进 report 调试字段（不 umount） | ①遍历数 == 用户态 mountinfo 条数；②候选集合 == P2 预测集合；③系统稳定、无 panic、avc 无风暴 | 中（只读遍历，风险可控） |
+| **P4 真机开卸（MNT_DETACH）** | 打开 Phase 2，仅对 allowlist 内 uid 生效 | ①`adb shell cat /proc/<app_pid>/mountinfo` 看不到模块挂载；②未排除 uid 仍可见；③app 启动/运行正常、无 SELinux 拒绝风暴；④反复开关 20 次无泄漏 | 高（需回滚预案） |
+
+> **P3 的价值**：D 路线最大的风险不是遍历（可证伪），而是**识别准确性**（误伤系统挂载 = 灾难）。P3 用"只读"就把识别准确性验证掉，成本极低——这是本方案能"先证伪再实现"的关键。
+
+#### 10.9.11 结论
+
+1. **技术可行性：成立**。三个否决点（kCFI 间接调用 / 自死锁 / `dget` 缺失）都已找到工程解法（手走链表 + 两阶段 + 字符串重解析），且不需要 BTF。
+2. **代价**：≈1.2 KB 新 shellcode + 10 个偏移探针 + **新增 setresuid hook 组**（组数契约再 +1）+ 4 步 PoC（其中 P3 可全离线）。
+3. **仍不建议现在立项**：C′（rc 虚拟化）刚落地、真机未验；D 路线引入"新的 hook 点 + per-uid 语义 + 误伤风险"，必须等 C′ S3 通过后再排期。
+4. **与 APatch「排除修改（exclude）」的关系**：数据层可以直接复用 apd 现有 `package.rs` 的 `exclude` 列（写 `/data/adb/sproot/exclude` 文件），不需要照抄 kstorage；消费层因为"模块挂载不在内核"而必须走 D 路线（或 KSU 式预知挂载点）。
+5. **前置条件（硬性）**：①zygote 在 setresuid 之前已 `unshare(CLONE_NEWNS)`（真机验证）；②P2/P3 识别零误伤；③回滚预案（关开关即恢复原行为，必须只依赖"默认 off 的可选组"）。
 
 ## 11. rc 虚拟化（APatch 路线）：可行性与最小设计（2026-11-10 复核）
 
@@ -1226,14 +1419,89 @@ on property:sys.boot_completed=1
 | 方案 | 免 init_boot | 开机自启 | 引擎改动 | 真机风险 | 备注 |
 |---|---|---|---|---|---|
 | 现状：ramdisk rc 注入 | ❌ | ✅ | 0（客户端已实现） | 低 | 还需 ramdisk unpack/repack + T-12/AVB 一整套 |
-| **C′：rc 虚拟化（本节）** | ✅ **彻底** | ✅ | +1 可选组、≈800 B、新代码洞 | **中高**（5 项真机验证） | 需 clean-room；同时消掉 ramdisk 链 |
+| **C′：rc 虚拟化（本节）** | ✅ **彻底** | ✅ | +1 可选组、实测 blob 836 B、新代码洞 | **中高**（5 项真机验证） | **已实现（默认 off）**，见 §11.8；同时消掉 ramdisk 链 |
 | B：内核 launcher（§9.4） | ✅ | ❌（需先提权一次） | +≈422 B、并入 do_execve 组 | 中 | 作为 A 的兜底 |
 | C：init exec + umh（§9.5） | ❌ 不可行 | — | — | — | 时机不成立（已否决） |
 
 **建议（供 Lead 拍板）**：
 1. **空间判据已过**（实测 53.6 KB 单洞 + 6.3 KB 其它洞）→ 若人类接受"引擎新增一个默认 off 的可选组 + 一轮真机验证"，**C′ 是"彻底免 init_boot"的正解**，且顺带把 ramdisk 侧整条风险链（unpack/repack/T-12/AVB/rc 文件冲突）一起消掉。
-2. 实施顺序建议：**A 真机验证照旧先做**（成本最低、能先打通"App 自引导"这条最短链）→ **C′ 立项**（先按 §11.5 造负样本，再实现 `--launcher rc`，默认 off）→ B 降为 C′ 的兜底层。
+2. 实施顺序（**已按此执行**）：A 真机验证照旧先做 → **C′ 已落地**（先造负样本再实现，`--launcher rc` 默认 off，见 §11.8）→ B 降为 C′ 真机失败时的兜底层（`umh` 仍为未实现的 E101 占位）。
 3. **不变量**：无论 C′ 是否落地，`--workdir` 所有权、密钥 47+NUL、组数严格等值这三条既有契约都不能破；C′ 必须作为"默认 off 的可选组"接入，**默认产物与当前逐字节一致**（用组数断言 + Tier B 字节比对兜住）。
+
+### 11.8 实现状态（2026-11-10 落地：默认 off，可开）
+
+**结论**：C′ 已按"默认 off、可选开"的最小实现落地；off 时产物与旧版**逐字节一致**（实测证明见下）；显式 `--launcher rc` 时在真内核上完成织入并通过字节级自证。
+
+#### 11.8.1 变更清单（文件级）
+
+| 文件 | 变更 |
+|---|---|
+| `engine/src/patch_rc_virtualize.{h,cpp}`（新增） | 纯逻辑层（模板唯一来源、数据布局、洞扫描、必需符号清单）+ asmjit 生成的 openat hook shellcode；**clean-room 自研**（仅参考 APatch 机制，未复制代码） |
+| `engine/src/analyze/symbol_analyze.{h,cpp}` | 新增 `_etext` 与 10 个符号解析（`__arm64_sys_openat`/`strncpy_from_user`/`strcmp`/`filp_open`/`kernel_read`/`kernel_write`/`filp_close`/`vmalloc`/`vfree`/`__arch_copy_to_user`） |
+| `engine/src/patch_pipeline.{h,cpp}` | `LauncherOptions{mode}`；`hook_groups_expected_count(ge61, huawei, launcher_rc)`（三参，默认第三参 false）；handler 末尾按需织入并 `mark("rc_virtualize", ...)`；`PatchKernelResult.launcher` |
+| `engine/src/skroot_patch_main.cpp` | `--launcher off\|rc\|umh`（默认 off；`umh` 未实现 → E101）；`--self-test-rcvirtual`（29 例）；`--self-test-groups` 增加 launcher 维度；report 增加 `launcher{}`；显式 rc 前置不满足 → **E202 且不产出 `--out`**；**修复失败路径 report 越界读 bug**（见 §11.8.5） |
+| `engine/src/Makefile` | `SPROOT_SRCS` 增加 `patch_rc_virtualize.cpp` |
+| `engine/android/verify_artifact.sh` | **A8-rc**（组数矩阵扩到 8 例：off 6 + rc 2）；**A11/A11b/A11c/A11d**（纯逻辑自检 29 例 + off 组数不变 + `umh`/非法取值 → E101）；**Tier B B11a~d**（真内核 rc 织入自证、off 不变量、无洞降级负样本） |
+| `engine/android/build_arm64.sh` | ENGINE-META 增加 `launcher_modes` / `launcher_cave_scanner` / `launcher_report_fields`；`report_fields` 补 `launcher{...}` |
+
+**CLI 契约**：`--launcher off|rc|umh`，**默认 `off`**。`umh`（B 方案）尚未实现——显式传 `umh` 返回 **E101** 并在 stderr 写明"未实现"，**绝不静默忽略**。
+
+#### 11.8.2 report 新增 `launcher{}`（真机排障入口）
+
+```json
+"launcher": {
+  "mode": "rc", "enabled": true, "reason": "",
+  "hook_addr": 3675528, "cave_offset": 16332756, "cave_size": 2092,
+  "shellcode_bytes": 836, "template_bytes": 278,
+  "caves": [{"offset":16332756,"size":2092},{"offset":16455192,"size":2536},{"offset":16460136,"size":54936}],
+  "symbols": {"__arm64_sys_openat":3675524,"strncpy_from_user":7568708,"...":"..."}
+}
+```
+- `caves[]` = **本次 patch 时在输入镜像里实测扫到的全部洞**（≥2048 B，最多 16 个）——不同机型不同，真机排障看这里；
+- `cave_offset/size` = 实际选用的洞；`hook_addr` = PAC/BTI 之后的 openat 入口；
+- `enabled=false` 时 `reason` 必填（如 `symbol missing: kernel_write` / `no zero-filled cave >= 2048 B in .text`）。
+
+#### 11.8.3 真内核实测（`samples/meizu21` 抽出的 33,892,864 B Image）
+
+| 项 | 实测 |
+|---|---|
+| 洞扫描 | 3 处 ≥2048 B：`0xf937d4`(2092)、`0xfb1618`(2536)、`0xfb2968`(54936)；与 §11.1 的 7 处 ≥1 KB 清单一致（小的 4 处 <2048 不入选） |
+| 选用洞 | `0xf937d4`（首个能容纳 blob 的洞），blob **836 B**（数据区 364 + 原指令槽 4 + 代码 468；含"读到上限即放弃"的截断安全闸） |
+| 入口 | `__arm64_sys_openat=0x381584`，跳过 BTI 后 hook 在 `0x381588`；入口被改为 `b 0xf93940`（= cave+364） |
+| 原指令还原 | blob 中 restore 槽 `0xffc300d1` == 输入镜像 `0x381588` 处的 `sub sp,sp,#0x30` ✔ |
+| 数据区 | `orig1@0`(28+1)、`orig2@28`(35+1)、`/dev/user_init.rc@64`(18)、模板`@84`(278 B) —— 逐字节核对通过 |
+| 调用 | blob 内 **13 处 BL**，解算后全部命中 report.launcher.symbols 中的符号地址（3×strcmp 路径 2 + strncpy 1 + filp_open 2 + vmalloc 1 + kernel_read 1 + kernel_write 2 + filp_close 2 + vfree 1 + copy_to_user 1 = 13） |
+| 组数 | off：14/14；rc：**15/15**（`hooks[]` 含 `rc_virtualize` 组） |
+| 产物 | 等长（33,892,864 B）；与输入不同；`--launcher rc` 与 off 产物差异仅在 do_execve/die 区与所选洞 |
+
+**默认 off 不变量（硬证据）**：用 `git worktree` 在**未含本特性的 HEAD** 上编译旧引擎，与本版本用同一密钥/同一镜像跑 `--launcher off`：
+`sha256 = 399ac4797e6ab2ae5700cc21350676daf7b89fe397e473ef24ae32cb9cce3f2f`，**两者逐字节相同**（`cmp` 通过）；默认（不传 `--launcher`）与显式 `off` 亦逐字节相同。
+
+#### 11.8.4 断言与负样本（先证伪，全部实测打红）
+
+| # | 负样本（在临时副本上故意改坏） | 期望/实测 |
+|---|---|---|
+| N1 | 洞扫描器不再检查"字节为 0" | `--self-test-rcvirtual`：`cave_scan_split_by_nonzero` / `cave_scan_nonzero_breaks` / `cave_scan_max_out` **3 例 FAIL**，rc=1 |
+| N2 | 把镜像里所有洞按每 1024 B 填 1 个非零字节 | `--launcher rc` → **rc=202 且无 `--out`**（reason=`no zero-filled cave >= 2048 B in .text`）；默认 off 仍 rc=0（降级正常） |
+| N3 | 把 `kernel_write` 符号名拼错成 `kernel_writeX` | `--launcher rc` → **rc=202**（reason=`symbol missing: kernel_write`）+ 无产物；off 降级产物仍与基线逐字节相同 |
+| N4a | 模板里把 `--superkey-file` 挪到子命令 `daemon` 之后 | `--self-test-rcvirtual`：`template_service_line` + `template_top_level_arg_order` **2 例 FAIL** |
+| N4b | 替换串改成 30 B（长于 `/system/.../init.rc` 的 27 B） | `--self-test-rcvirtual`：`layout_ok`/`layout_monotonic`/`layout_inplace_overwrite_safe` **3 例 FAIL**；真内核 `--launcher rc` → **rc=202**（reason=`data layout unsafe`） |
+
+CI 门槛（无内核镜像时不跑 Tier B）：**A11（29 例）+ A8-rc（2 例）+ A11b~d**，每次 CI 必跑；Tier B **B11a~d** 在有 `KERNEL_IMAGE` 时覆盖真内核字节级与降级路径。
+
+#### 11.8.5 附带修复：失败路径 report 越界读（既有 bug，非本次引入）
+
+构建 report 的 `hooks[]` 会按组取 `st.patch_addrs/lens/hex`，但这三个数组**只在"成功收尾前"才回填**——而 `fail()` 也会构建 report。旧代码在 `pr.patched==false`（E220 无 hook 空间）路径上同样会越界读（本机 ASAN 复现为段错误，见负样本 N2 的首轮现象）。
+
+修法：组循环前计算 `have_bytes`（`g.last <= 三个数组长度` 且 `n>0`），不满足时输出 `resolved:false + reason:"patch_bytes_not_filled_yet_failure_path"`，**不冒充"已落位"**。修复后 E202/E220 失败路径均能正常写 report 并返回错误码。
+
+#### 11.8.6 明确未做（本版本边界）
+
+1. `--launcher umh`（B 方案内核启动器）**未实现**，显式传参返回 E101；
+2. `/init.rc`（9 B）**不处理**（替换串更长；GKI 机型无此文件）——处理它需要"改用户栈指针"，多一条链与真机风险；
+3. 只支持单份模板/单次重写（幂等）；不做"是否已替换"缓存标志（不需要内核可写状态）；
+4. 洞扫描只认"连续 0x00"，不做跨洞分片拼接（blob 836 B 远小于最小洞 2092 B，暂无必要）；
+5. **真机未验证**（下一步 S3）：`/dev` 挂载时机、PAN/UAO uaccess、SELinux（init 域写 /dev + exec apd）、init 解析"原文+模板"拼接、开机稳定性——见 §11.4 末尾 5 项。
 
 ## 12. 包体与体积
 
@@ -1283,6 +1551,7 @@ on property:sys.boot_completed=1
 | 文件 | 说明 |
 |---|---|
 | `engine/src/Makefile` | `?=` 化 + `OBJDIR` 树外目标文件 + `objs` 目标（宿主构建行为不变） |
+| `engine/src/patch_rc_virtualize.{h,cpp}`（新增，2026-11-10） | rc 虚拟化：模板唯一来源 / 数据布局 / 洞扫描 / 10 符号 / asmjit openat hook shellcode（clean-room 自研） |
 | `engine/src/skroot_patch_main.cpp` | 入口改 `extern "C" spr_engine_run()`，`main()` 转发（`SPROOT_NO_CLI_MAIN` 可裁）；**workdir 所有权判定收进纯函数 `should_reclaim_workdir()` + `path_within_dir()`，新增隐藏自检 `--self-test-workdir`（§8.1）**；**密钥内嵌统一走 `embed_key_bytes()`（47+NUL/48 字节，内联断言）+ `--self-test-keyabi`（§7.5）** |
 | `engine/android/build_arm64.sh` | arm64 交叉编译（exec / jni / both） |
 | `engine/android/verify_artifact.sh` | Tier A/B 验证（qemu 契约自检）；**A9d `--self-test-workdir` 13 例行为矩阵（CI 必跑）**、**Tier B B9 事故现场回归 / B10 默认 workdir 回收正控**；**A6g/A6h 密钥长度严格 48 + A10 `--self-test-keyabi` 17 例（CI 必跑）+ Tier B B7 强化（new_bytes=96 hex + key_spec 六字段）** |

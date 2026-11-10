@@ -24,6 +24,19 @@ struct KernelSymbolOffset {
 	SymbolRegion sys_getuid = { 0 };
 	SymbolRegion prctl_get_seccomp = { 0 };
 
+	// rc 虚拟化（--launcher rc，见 patch_rc_virtualize.h / NEW-DOC-02 §11）
+	size_t _etext = 0;
+	SymbolRegion openat_sys = { 0 };
+	SymbolRegion str_cmp = { 0 };
+	SymbolRegion strncpy_from_user_fn = { 0 };
+	SymbolRegion filp_open_fn = { 0 };
+	SymbolRegion kernel_read_fn = { 0 };
+	SymbolRegion kernel_write_fn = { 0 };
+	SymbolRegion filp_close_fn = { 0 };
+	SymbolRegion vmalloc_fn = { 0 };
+	SymbolRegion vfree_fn = { 0 };
+	SymbolRegion copy_to_user_fn = { 0 };
+
 	SymbolRegion __cfi_check = { 0 };
 	size_t __cfi_check_fail = 0;
 	size_t __cfi_slowpath_diag = 0;

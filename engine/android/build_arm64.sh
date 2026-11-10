@@ -108,7 +108,12 @@ write_meta() {
     [[ -f "$exe" ]] && echo "exec_sha256=$(sha256sum "$exe" | cut -d' ' -f1)" && echo "exec_size=$(stat -c%s "$exe")"
     echo "hooks_schema_version=2"
     echo "hook_groups_expected_min=11   # 跨分支下界（<6.1=11/**>=6.1=14**，+huawei 各 +1）；真正判据在运行期 report.hook_groups_expected（严格等值）"
-    echo "report_fields=hooks[],hook_groups_count,hook_groups_resolved,key_spec.abi"
+    echo "report_fields=hooks[],hook_groups_count,hook_groups_resolved,key_spec.abi,launcher{...}"
+    # rc 虚拟化（--launcher rc，默认 off，见 NEW-DOC-02 §11）：洞由 patch 时扫描得到，
+    # 故这里只固化扫描器参数与契约，具体洞清单写在每次的 <out>.report.json 的 launcher.caves[]。
+    echo "launcher_modes=off|rc   # umh（B 方案）未实现，显式 E101"
+    echo "launcher_cave_scanner=zero-run-v1 min_bytes=2048 align=4 range=[_stext,_etext)"
+    echo "launcher_report_fields=launcher{mode,enabled,reason,hook_addr,cave_offset,cave_size,shellcode_bytes,template_bytes,caves[],symbols{}}"
     echo "--- jni: libskrootpatch.so (System.loadLibrary(\"skrootpatch\")) ---"
     if [[ -f "$so" ]]; then
       echo "jni_sha256=$(sha256sum "$so" | cut -d' ' -f1)"
