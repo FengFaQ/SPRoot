@@ -55,7 +55,6 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.sproot.manager.core.ApdClient
-import com.sproot.manager.core.ApdSelfTest
 import com.sproot.manager.core.AppLog
 import com.sproot.manager.core.Capabilities
 import com.sproot.manager.core.ModuleInfo
@@ -67,7 +66,6 @@ import com.sproot.manager.ui.components.ConfirmDialog
 import com.sproot.manager.ui.components.StatusTag
 import com.sproot.manager.ui.components.WarningCard
 import com.sproot.manager.ui.components.WarningLevel
-import com.sproot.manager.ui.components.copyToClipboard
 import com.sproot.manager.ui.components.rememberBlurBackdrop
 import com.sproot.manager.ui.theme.LocalEnableBlur
 import top.yukonga.miuix.kmp.basic.Card
@@ -144,11 +142,8 @@ fun ModulePager(
     val apdStatus = remember { ApdClient.status(context) }
     val apdReady = apdStatus.ok
 
-    var selfTest by remember { mutableStateOf(ApdSelfTest.load(context)) }
     var result by remember { mutableStateOf<ModulesResult?>(null) }
     var loading by remember { mutableStateOf(false) }
-    var actionMsg by remember { mutableStateOf<String?>(null) }
-    var showRaw by remember { mutableStateOf(false) }
 
     var zipName by remember { mutableStateOf<String?>(null) }
     var installing by remember { mutableStateOf(false) }
@@ -206,7 +201,6 @@ fun ModulePager(
                 installRaw = "exit=${r.exitCode}：${r.message}\n" +
                     (r.rawStdout.takeIf { it.isNotBlank() }?.let { "[stdout]\n$it" } ?: "") +
                     (r.rawStderr.takeIf { it.isNotBlank() }?.let { "\n[stderr]\n$it" } ?: "")
-                actionMsg = r.message
                 if (r.ok) {
                     target.delete()
                     zipName = null
@@ -252,7 +246,6 @@ fun ModulePager(
                 if (key == null) return@ModuleDetailPager
                 Thread {
                     val r = ModuleRepository.setEnabled(context, key, detail.id, enable)
-                    actionMsg = r.message
                     if (r.ok) {
                         refresh()
                         detailModule = detail.copy(enabled = enable)
@@ -276,7 +269,6 @@ fun ModulePager(
                 if (target != null && key != null) {
                     Thread {
                         val r = ModuleRepository.uninstall(context, key, target.id)
-                        actionMsg = r.message
                         if (r.ok) {
                             detailModule = null
                             refresh()
@@ -422,38 +414,6 @@ fun ModulePager(
                         }
                     }
 
-                    if (actionMsg != null || result?.hints?.isNotEmpty() == true) {
-                        item {
-                            ResultCard(
-                                result = result,
-                                actionMsg = actionMsg,
-                                showRaw = showRaw,
-                                onToggleRaw = { showRaw = !showRaw },
-                                onCopyRaw = {
-                                    val raw = buildString {
-                                        append("--- apd module 原始输出 ---\n")
-                                        append(result?.rawStdout ?: "<未执行>")
-                                        if (!result?.rawStderr.isNullOrBlank()) {
-                                            append("\n--- stderr ---\n").append(result?.rawStderr)
-                                        }
-                                    }
-                                    context.copyToClipboard("模块原始输出", raw)
-                                },
-                            )
-                        }
-                    }
-
-                    selfTest?.let { test ->
-                        item {
-                            Text(
-                                text = "AP 自检：${test.stageLabel} · exit=${test.exitCode}",
-                                fontSize = 12.sp,
-                                color = colorScheme.onSurfaceVariantSummary,
-                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
-                            )
-                        }
-                    }
-
                     when {
                         result == null && apdReady && key != null -> {
                             item { LoadingRow() }
@@ -488,7 +448,6 @@ fun ModulePager(
                                             if (key == null) return@ModuleItemCard
                                             Thread {
                                                 val r = ModuleRepository.setEnabled(context, key, module.id, enable)
-                                                actionMsg = r.message
                                                 if (r.ok) refresh() else AppLog.error("Modules", r.message)
                                             }.start()
                                         },
@@ -510,7 +469,6 @@ fun ModulePager(
                                             if (key == null) return@ModuleItemCard
                                             Thread {
                                                 val r = ModuleRepository.setEnabled(context, key, module.id, enable)
-                                                actionMsg = r.message
                                                 if (r.ok) refresh() else AppLog.error("Modules", r.message)
                                             }.start()
                                         },
@@ -983,73 +941,6 @@ private fun InstallResultCard(
                     )
                 }
                 TextButton(text = "复制原始输出", onClick = onCopyRaw)
-            }
-        }
-    }
-}
-
-@Composable
-private fun ResultCard(
-    result: ModulesResult?,
-    actionMsg: String?,
-    showRaw: Boolean,
-    onToggleRaw: () -> Unit,
-    onCopyRaw: () -> Unit,
-) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(bottom = 12.dp),
-        colors = CardDefaults.defaultColors(
-            color = colorScheme.surfaceContainer,
-            contentColor = colorScheme.onSurface,
-        ),
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            actionMsg?.let {
-                Text(
-                    text = "操作结果：$it",
-                    fontSize = 13.sp,
-                    color = if (result?.ok == false) colorScheme.error else colorScheme.onSurface,
-                )
-            }
-            result?.hints?.takeIf { it.isNotEmpty() }?.let { hints ->
-                Spacer(Modifier.height(6.dp))
-                hints.forEachIndexed { index, hint ->
-                    Text(
-                        text = "可能原因 ${index + 1}：${hint.cause}\n建议：${hint.action}\n依据：${hint.basis}",
-                        fontSize = 12.sp,
-                        color = colorScheme.onSurface,
-                        modifier = Modifier.padding(vertical = 2.dp),
-                    )
-                }
-            }
-            result?.takeIf { !it.ok }?.let {
-                Spacer(Modifier.height(4.dp))
-                Text(text = "错误：${it.message}", fontSize = 13.sp, color = colorScheme.error)
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    TextButton(
-                        text = if (showRaw) "收起原始输出" else "查看原始输出",
-                        onClick = onToggleRaw,
-                    )
-                    TextButton(text = "复制原始输出", onClick = onCopyRaw)
-                }
-                if (showRaw) {
-                    Card(modifier = Modifier.fillMaxWidth()) {
-                        Text(
-                            text = (it.rawStdout.ifBlank { "(stdout 为空)" }) +
-                                if (it.rawStderr.isNotBlank()) "\n[stderr]\n" + it.rawStderr else "",
-                            fontSize = 12.sp,
-                            fontFamily = FontFamily.Monospace,
-                            color = colorScheme.onSurface,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .heightIn(max = 300.dp)
-                                .verticalScroll(rememberScrollState())
-                                .padding(12.dp),
-                        )
-                    }
-                }
             }
         }
     }
