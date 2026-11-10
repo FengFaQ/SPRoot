@@ -177,10 +177,12 @@ fun ModulePager(
     val pullState = rememberPullToRefreshState()
 
     fun refresh() {
-        if (loading || key == null) return
+        // 委托属性（var key by remember）无法智能转换，先取局部快照再判空。
+        val k = key ?: return
+        if (loading) return
         loading = true
         Thread {
-            val r = ModuleRepository.list(context, key)
+            val r = ModuleRepository.list(context, k)
             result = r
             loading = false
             if (!r.ok) AppLog.error("Modules", "模块列表失败：${r.message}")
@@ -189,7 +191,7 @@ fun ModulePager(
 
     /** 选 zip → 复制到私有 cache → 校验 PK 头/大小 → apd module install（与旧逻辑一致）。 */
     fun installFromUri(uri: Uri) {
-        if (key == null) {
+        val k = key ?: run {
             installError = "Root 密钥不可用：请到「设置 → Root 密钥」重新生成"
             return
         }
@@ -212,7 +214,7 @@ fun ModulePager(
                     return@Thread
                 }
                 AppLog.info("Modules", "已选择模块包：$name（${Capabilities.formatBytes(target.length())}）")
-                val r = ModuleRepository.install(context, key, target)
+                val r = ModuleRepository.install(context, k, target)
                 installRaw = "exit=${r.exitCode}：${r.message}\n" +
                     (r.rawStdout.takeIf { it.isNotBlank() }?.let { "[stdout]\n$it" } ?: "") +
                     (r.rawStderr.takeIf { it.isNotBlank() }?.let { "\n[stderr]\n$it" } ?: "")
@@ -258,9 +260,9 @@ fun ModulePager(
             enabled = apdReady && key != null && !loading && !installing,
             onBack = { detailModule = null },
             onToggle = { enable ->
-                if (key == null) return@ModuleDetailPager
+                val k = key ?: return@ModuleDetailPager
                 Thread {
-                    val r = ModuleRepository.setEnabled(context, key, detail.id, enable)
+                    val r = ModuleRepository.setEnabled(context, k, detail.id, enable)
                     if (r.ok) {
                         refresh()
                         detailModule = detail.copy(enabled = enable)
@@ -281,9 +283,10 @@ fun ModulePager(
             onConfirm = {
                 val target = confirmUninstall
                 confirmUninstall = null
-                if (target != null && key != null) {
+                val k = key
+                if (target != null && k != null) {
                     Thread {
-                        val r = ModuleRepository.uninstall(context, key, target.id)
+                        val r = ModuleRepository.uninstall(context, k, target.id)
                         if (r.ok) {
                             detailModule = null
                             refresh()
@@ -468,9 +471,9 @@ fun ModulePager(
                                         enabled = apdReady && key != null && !loading && !installing,
                                         onOpenDetail = { detailModule = module },
                                         onToggle = { enable ->
-                                            if (key == null) return@ModuleItemCard
+                                            val k = key ?: return@ModuleItemCard
                                             Thread {
-                                                val r = ModuleRepository.setEnabled(context, key, module.id, enable)
+                                                val r = ModuleRepository.setEnabled(context, k, module.id, enable)
                                                 if (r.ok) refresh() else AppLog.error("Modules", r.message)
                                             }.start()
                                         },
@@ -489,9 +492,9 @@ fun ModulePager(
                                         enabled = apdReady && key != null && !loading && !installing,
                                         onOpenDetail = { detailModule = module },
                                         onToggle = { enable ->
-                                            if (key == null) return@ModuleItemCard
+                                            val k = key ?: return@ModuleItemCard
                                             Thread {
-                                                val r = ModuleRepository.setEnabled(context, key, module.id, enable)
+                                                val r = ModuleRepository.setEnabled(context, k, module.id, enable)
                                                 if (r.ok) refresh() else AppLog.error("Modules", r.message)
                                             }.start()
                                         },
