@@ -21,8 +21,8 @@
 | **`--workdir` 所有权契约（2026-11-09 真机事故后）** | **显式传入 `--workdir` ⇒ 目录及内容生命周期归调用方，引擎不得删除其中任何内容；只有默认 workdir（`<out>.work`）由引擎成功收尾时回收**（§8.1）。行为证据：A9d `--self-test-workdir` 13 例矩阵（CI 必跑）+ Tier B B9 事故现场回归 / B10 默认回收正控。 |
 | **密钥 ABI 契约（P0，提权链）** | CLI `--key` **严格 48 字符**（47/49/非 alnum → E101）；内核只写 **`key[0:47]` + NUL = 48 字节**（`embed_key_bytes()`，内联断言）；`report.key_spec` 输出 `abi="47+nul"/bytes=48/last_byte_is_nul=true/input_len=48`（§7.5）。行为证据：A10 `--self-test-keyabi` 17 例（CI 必跑）+ Tier B B7。**用户态提权串必须 47 字符**。 |
 | **用户态 daemon 启动方式（2026-11-10 评估）** | SK 引擎**无任何内核态拉起用户态的能力**（`call_usermodehelper`/`kernel_thread`/`kthread_run`/`init_task` 全零命中）；KSU 亦需改 ramdisk/init_boot，APatch 靠常驻内核运行时做 init.rc 虚拟化才不需要。**选型：A（App 自引导）先落地 → B（提权时内核顺带拉起）作兜底 → C（init hook + umh）不建议**。详见 §9。 |
-| **模块卸载 umount / APatch「排除修改 exclude」（两轮评估）** | 第一轮"建议不做"的 3 条理由中**体积/无运行时数据/固定挂载点**均已被推翻（`.text` 洞 63.8 KB；可"apd 写文件 + 内核按需读"；D 路线可动态遍历 vfsmount 链表）。APatch 的 exclude 消费点绑死在其内核文件重定向子系统，我们模块挂载在外部 metamodule → **不能照抄**。新结论：**可做但有前置条件**（P1–P4 PoC，尤其 P3 只读探针可零风险证伪识别准确性；新增 setresuid hook 组；默认 off；C′ 真机通过后再立项）。详见 §10.8/§10.9。 |
-| **rc 虚拟化（APatch 路线）— 已落地（默认 off）** | hook `__arm64_sys_openat` → 把 init 的 rc 打开重定向到 `/dev/user_init.rc`（原 rc + 追加模板）→ **init 自己在正确时机 `exec` apd**，可**彻底免 init_boot**。`--launcher off\|rc\|umh`（默认 off；umh 未实现→E101）。空间实测 `.text` 零洞 7 处 **63.8 KB**（单洞 53.6 KB），真机 blob 836 B 放入 `0xf937d4`；**off 产物与旧版逐字节一致**（sha256 `399ac479…`），rc on 时组数 15/15；5 组负样本全部打红。**待真机 S3 验证 5 项**。详见 §11（含 §11.8 实现状态）。 |
+| **模块卸载 umount / APatch「排除修改 exclude」（三轮评估）** | 第一轮"建议不做"的体积/无运行时数据/固定挂载点三条理由已被推翻；APatch 的 exclude 消费点绑死在其内核文件重定向子系统，**不能照抄**。**第三轮决定性线索**：Mountify 的 `MOUNT_DEVICE_NAME="APatch"` + NeoZygisk 的 `info.source=="APatch"` 判定 → "挂载点未知"由**生态解决**，无需内核遍历。**结论：走生态方案（apd 兼容信号 + exclude 开关，已落地），D 路线（内核遍历 + ns 内卸载）降级为备选、暂不立项**。详见 §10.8/§10.9/§10.10。 |
+| **rc 虚拟化（APatch 路线）— 已落地（默认 off）** | hook `__arm64_sys_openat` → 把 init 的 rc 打开重定向到 `/dev/user_init.rc`（原 rc + 追加模板）→ **init 自己在正确时机 `exec` apd**，可**彻底免 init_boot**。`--launcher off\|rc\|umh`（默认 off；umh 未实现→E101）。空间实测 `.text` 零洞 7 处 **63.8 KB**（单洞 53.6 KB），真机 blob 836 B 放入 `0xf937d4`；**off 产物与旧版逐字节一致**（sha256 `399ac479…`），rc on 时组数 15/15；5 组负样本全部打红。**待真机 S3 验证 5 项**；下一步 = 模板对齐 Zygisk 启动链（§11.5）。详见 §11（含 §11.9 实现状态）。 |
 | 推荐集成 | **主形态 JNI（`libskrootpatch.so` + `System.loadLibrary("skrootpatch")`）**，次形态静态 exec（`skroot-patch` 从 `nativeLibraryDir` 真实路径 exec，**禁止** symlink 到 `filesDir`；该可执行件默认不进 APK）。 |
 | 实测编译耗时 | 全量 100+ TU，12 核并行 **18 秒**（`make objs`，见 §3.4）。 |
 | 打包工具 | **magiskboot v31.1 ARM64**（SKRoot 官方路径；988,984 B，静态 AArch64，sha256 `97e9ec75…bb54`），CI 内固定版本+哈希校验并随 artifact 分发；自研 bootimg 保留为交叉校验/回退（§7）。**禁止 AIK**。 |
@@ -723,7 +723,7 @@ init_boot.img: ramdisk=2,131,370 B     ← rc 只能注进这里
 - A 能让“首版不注入 rc 也能跑通全链”（App 打开即可用），代价是**第三方 App 的 root 依赖用户先打开 SPRoot Manager**（daemon 未起时无 socket 授权），且模块开机挂载/`bootloop` 计数时机会后移；
 - 因此 A/B 都是“**免 init_boot 但放弃开机自启**”；要在免 init_boot 的同时保留开机自启，只有 **C′（rc 虚拟化）**——它**不需要常驻内核运行时**（静态 shellcode + 文件 IO 即可，与 APatch 的实现形态不同但机制等价，见 §11）；C（init exec + umh）不可行。
 
-**C′（rc 虚拟化）补充（2026-11-10 复核）**：机制 = hook `__arm64_sys_openat`，把 init 对 `/system/etc/init/hw/init.rc` 的打开重定向到 `/dev/user_init.rc`（内容 = 原 rc + `apd/assets/init.sproot.rc` 的等价模板）→ **init 自己在 `post-fs-data`/`boot_completed` 时机 exec apd**；我们比 APatch 少一个 `su -Z` 依赖（init 本身 uid0+满cap，`avc_denied` 会放行）。空间与符号均已实测通过（§11.1/§11.3），**结论：可立项，是"彻底免 init_boot"的正解**（详见 §11.7）。
+**C′（rc 虚拟化）补充（2026-11-10 复核）**：机制 = hook `__arm64_sys_openat`，把 init 对 `/system/etc/init/hw/init.rc` 的打开重定向到 `/dev/user_init.rc`（内容 = 原 rc + `apd/assets/init.sproot.rc` 的等价模板）→ **init 自己在 `post-fs-data`/`boot_completed` 时机 exec apd**；我们比 APatch 少一个 `su -Z` 依赖（init 本身 uid0+满cap，`avc_denied` 会放行）。空间与符号均已实测通过（§11.1/§11.3），**结论：可立项，是"彻底免 init_boot"的正解**（详见 §11.8）。
 
 **我们的 avc 绕过使 A 在技术上可行**（关键前提）：`avc_check` 的放行判据是「uid=0 + 满 cap + securebits=0」，而提权后进程恰好满足 → 其后续 `exec /data/adb/apd`、写 `/data/adb` 的 AVC 拒绝会被改为放行（`patch_current_avc_check.cpp:20-50` + `patch_avc_denied.cpp:25-41`）。**残留风险**：进程 SELinux **域**仍是 `untrusted_app`（改的是 cred 不是 sid），apd 在该域下的 socket/模块/setcon 行为与 init 拉起时不同，**必须真机实测**。
 
@@ -867,9 +867,9 @@ init_boot.img: ramdisk=2,131,370 B     ← rc 只能注进这里
 2. **B 暂不排期，等 A 的真机结论**：若 A 的失败点正是“提权进程 exec/写 `/data/adb` 被拒”，则 B 的价值成立（由内核代为拉起），再按 §9.4 实施；若 A 顺利，**B 无必要**（A 已能拉起 daemon）。
 3. **C 不做**；若未来确实要实现“免 ramdisk 且开机自启”，应单独立项评估 **C′（rc 虚拟化）**——需明确“引入常驻内核运行时”这一架构变更，并做许可与真机风险双重评审，**不要**以“加个 hook”的名义低估工程量。
 4. **对外口径**：「我们要修 init_boot」的准确表述是——**本机 ramdisk 在 init_boot（GKI 布局），而我们的守护自启走 ramdisk rc（KSU 走 ramdisk `/init`，同一层级）**；APatch 不需要 ramdisk 是因为它有常驻内核运行时做 rc 虚拟化，不是因为我们漏了什么。
-5. **C′（rc 虚拟化）已具备立项条件**（2026-11-10 复核）：`.text` 零洞 **63.8 KB（单洞 53.6 KB）**；§9.5 对 C 的两条硬否决（时机 / 可写标志）**都不适用于 C′** → "彻底免 init_boot"的正解是 C′（见 §11.7）；B 降为 C′ 真机失败时的兜底。
+5. **C′（rc 虚拟化）已具备立项条件**（2026-11-10 复核）：`.text` 零洞 **63.8 KB（单洞 53.6 KB）**；§9.5 对 C 的两条硬否决（时机 / 可写标志）**都不适用于 C′** → "彻底免 init_boot"的正解是 C′（见 §11.8）；B 降为 C′ 真机失败时的兜底。
 
-## 10. 模块卸载（umount modules / APatch「排除修改 exclude」）可行性评估（2026-11-10，两轮）
+## 10. 模块卸载（umount modules / APatch「排除修改 exclude」）可行性评估（2026-11-10，四轮）
 
 > **本节结论先行**：
 > 1. **符号可用**：`path_umount` / `kern_path` / `path_put` 在真机 kallsyms 中全部可解析（实测地址见 §10.1），`do_umount`/`ksys_umount` 不存在（已内联）——与 KSU 依赖同一原语。
@@ -1074,9 +1074,11 @@ zygote fork → unshare(CLONE_NEWNS) → mount 私有化(/storage,/mnt 等)
 | 真机 S3 验证 #6 | zygote 在 `setresuid` 之前已 `unshare(CLONE_NEWNS)`（否则卸载会波及全局） |
 | 排期 | **C′（§11）真机 S3 通过之前不立项**；C′ 是当前主线 |
 
-> 本轮已完成的技术验证见 **§10.9（D 路线可行性，反汇编实证）**：三个天真做法的否决点（kCFI 间接调用 / path_umount 自取写锁导致自死锁 / `dget` 不在 kallsyms）与对应工程解法、10 个结构体偏移的实测值、锁顺序分析、识别策略、以及可在 qemu + 真内核上"零风险先证伪"的 4 步 PoC。
+> **第三轮（同日，Lead 提供生态线索）**：Mountify 的 `MOUNT_DEVICE_NAME` + NeoZygisk 的 `info.source` 判定，已让"挂载点未知"由**生态**解决 → **D 路线降级为备选、暂不立项**（§10.10）；§10.9 保留为备选路线图。
 
-### 10.9 D 路线可行性：动态发现挂载点 + mount namespace 内卸载（2026-11-10 第三轮，反汇编实证）
+> 第二轮的技术验证见 **§10.9（D 路线可行性，反汇编实证）**：三个天真做法的否决点（kCFI 间接调用 / path_umount 自取写锁导致自死锁 / `dget` 不在 kallsyms）与对应工程解法、10 个结构体偏移的实测值、锁顺序分析、识别策略、以及可在 qemu + 真内核上"零风险先证伪"的 4 步 PoC。
+
+### 10.9 D 路线可行性：动态发现挂载点 + mount namespace 内卸载（2026-11-10 第三轮，反汇编实证；现为备选）
 
 > **路线定义**：不预知挂载点，在进程上下文（hook 点）里**遍历该进程 mount namespace 的 vfsmount 链表**，按"源路径/文件系统类型"特征识别出模块挂载点，再用 `path_umount()` 在**该进程的命名空间内**卸载。
 > 它是唯一同时满足「不重构模块挂载」+「兼容任意 metamodule 后端」的路线。本节全部结论都来自对真机 Image 的**反汇编实证**（`samples/meizu21`，6.1 内核，符号来自引擎 `--dump-symbols`）。
@@ -1245,11 +1247,60 @@ Phase 2  逐条卸载（此时不再持 namespace_sem）
 
 #### 10.9.11 结论
 
+> **2026-11-10 后续（Lead 拍板）**：生态方案（§10.10，Mountify `MOUNT_DEVICE_NAME` + NeoZygisk `info.source`）已消掉"挂载点未知"死结，**本路线降级为备选、暂不立项 P1/P2**；本节保留为"生态方案不可用时的现成路线图"。
+
 1. **技术可行性：成立**。三个否决点（kCFI 间接调用 / 自死锁 / `dget` 缺失）都已找到工程解法（手走链表 + 两阶段 + 字符串重解析），且不需要 BTF。
 2. **代价**：≈1.2 KB 新 shellcode + 10 个偏移探针 + **新增 setresuid hook 组**（组数契约再 +1）+ 4 步 PoC（其中 P3 可全离线）。
 3. **仍不建议现在立项**：C′（rc 虚拟化）刚落地、真机未验；D 路线引入"新的 hook 点 + per-uid 语义 + 误伤风险"，必须等 C′ S3 通过后再排期。
 4. **与 APatch「排除修改（exclude）」的关系**：数据层可以直接复用 apd 现有 `package.rs` 的 `exclude` 列（写 `/data/adb/sproot/exclude` 文件），不需要照抄 kstorage；消费层因为"模块挂载不在内核"而必须走 D 路线（或 KSU 式预知挂载点）。
 5. **前置条件（硬性）**：①zygote 在 setresuid 之前已 `unshare(CLONE_NEWNS)`（真机验证）；②P2/P3 识别零误伤；③回滚预案（关开关即恢复原行为，必须只依赖"默认 off 的可选组"）。
+
+### 10.10 生态方案（Mountify + NeoZygisk）：D 路线降级为备选（2026-11-10，Lead 线索）
+
+**决定性线索**：Mountify（`backslashxx/mountify`，**The Unlicense / 公有领域**）的 `config.sh` 自带注释：
+
+```sh
+# this one below is its device name
+# you can put "KSU", "APatch" here so a zygisk provider can umount
+# e.g. NeoZygisk, NoHello, ReZygisk, Shamiko, Zygisk Assistant, ZygiskNext-UM/DE
+MOUNT_DEVICE_NAME="overlay"
+```
+
+即：**MetaModule 作者已经预留了"让 Zygisk provider 卸载"的开关**。NeoZygisk（GPL-3.0）的卸载判定是 `info.source == "APatch"` —— Mountify 把 `MOUNT_DEVICE_NAME` 作为挂载源名传出，配成 `"APatch"` 后 provider 就会识别并卸载。
+
+**这直接消掉了 D 路线要解决的核心问题**（"模块挂载点未知"）：不需要内核遍历 vfsmount、不需要按源路径特征猜测，provider 会在自己的注入路径里按 uid 卸载——**生态已经解决了**。
+
+**我方要做的事（全部非内核）**：
+
+| # | 事 | 状态 |
+|---|---|---|
+| 1 | apd 发出 APatch 兼容信号：`-V` → `apd 10762`；派生 `/data/adb/ap/package_config`（含 `exclude` 列、0644） | **已完成**（apd-dev，NEW-DOC-05 §14） |
+| 2 | App 授权页的"排除"开关 → `apd auth set --exclude`（写权威表 + 派生 csv） | **已完成**（同上 §14.3） |
+| 3 | 用户侧文档：在 Mountify `config.sh` 设 `MOUNT_DEVICE_NAME="APatch"` | 待写（UI/文档） |
+| 4 | 安装/检测提示：`apd selftest --json` 的 `zygisk` 检查显示 provider 是否在跑 | Phase 1 占位已完成 |
+
+**与 D 路线对比**：
+
+| 维度 | 生态方案（Mountify + provider） | D 路线（内核遍历 + ns 内卸载） |
+|---|---|---|
+| 引擎改动 | **0** | ≈1.2 KB shellcode + 10 个偏移探针 + 新增 setresuid hook 组 |
+| 依赖 | 用户配置 `MOUNT_DEVICE_NAME` + provider 版本支持 `info.source` | 无外部依赖（自研） |
+| 风险 | 低（用户态/provider 内部，出错只影响 Zygisk 自身） | 高（内核热路径 + 命名空间作用域 + 误伤系统挂载） |
+| 覆盖 | 仅支持该配置的 metamodule；provider 决定卸载时机 | 理论上任意 metamodule，但要自己识别 |
+| 验证成本 | 真机一条命令级验证 | 4 步 PoC（P3 需内核只读探针） |
+
+**结论（Lead 2026-11-10 拍板）**：
+1. **D 路线降级为备选**，保留 §10.9 作为现成路线图（含三处否决点与解法、10 个实测偏移、锁分析、P1–P4 PoC）；触发条件 = **目标 metamodule/provider 组合不支持上述配置**。
+2. **暂不立项 P1/P2，不写代码**。
+3. §10.9 的价值不变：若生态路线在某个目标机型/模块组合上走不通，它是唯一"不重构模块挂载"的可行自研方案。
+
+**生态方案的验证项（离线可做，真机最好也过一遍）**：
+- 目标 Mountify 版本是否含 `MOUNT_DEVICE_NAME`（读其 `config.sh`）；
+- provider 版本是否按 `info.source` 判定（读其 `root_impl/apatch.rs`，与 NEW-DOC-05 §14.1 的 `-V` 判定同源）；
+- provider 的 umount 时机（注入路径里按 uid，而不是全局）；
+- `package_config` 被 provider 实际读取（0644 可读、`exclude` 列语义正确）；
+- 关闭"排除"开关后，应用内 `/proc/self/mountinfo` 恢复可见模块挂载（A/B 对照）。
+
 
 ## 11. rc 虚拟化（APatch 路线）：可行性与最小设计（2026-11-10 复核）
 
@@ -1384,6 +1435,8 @@ on property:sys.boot_completed=1
 - 运行期失败（`filp_open` 失败、rc 过长、uaccess 失败）→ **静默跳过**，不 printk、不 panic、不影响 init 正常打开 rc（init 读到原始文件，等价于"没启用"）
 - 长度安全：`__arch_copy_to_user` 只在 `strlen(replacement) < strlen(matched_path)` 时执行（28/34 > 19 已成立），**先比较再写**
 
+> **后续（Zygisk 启动链）**：模板需要从"只在 boot_completed 起 daemon"扩展到"post-fs-data 阶段就跑 apd"，以对齐 Zygisk provider 的时序 —— 方案、体积与失败降级见 **§11.5**（本轮只设计，未改代码）。
+
 **真机必须验证的 5 项（静态断言无法覆盖）**：
 1. init 解析到 rc 时 `/dev` 已挂载且 devtmpfs 可写（否则 `filp_open` 失败 → 静默失效）；
 2. `strncpy_from_user` / `__arch_copy_to_user` 在 syscall 入口上下文的 PAN/UAO 行为正确（错用即 fault/panic）；
@@ -1391,7 +1444,125 @@ on property:sys.boot_completed=1
 4. init 是否能解析"原文+追加"拼接（rc 语法、`override` 关键字、service 重名）；
 5. 开机稳定性：多次开关机、safe mode、`sys.boot_completed` 触发时序。
 
-### 11.5 断言与负样本（先证伪再入库）
+### 11.5 C′ + Zygisk 启动链（2026-11-10，Lead 拍板后的下一主线；本轮只设计、不写代码）
+
+> **背景**：C′ 已经提供了 zygisk 生态所需的**启动时机载体**（init 在 `post-fs-data`/`late_start` 阶段执行我们 rc 模板里的命令）。本节的唯一目标：**把 C′ 模板与 apd 的阶段调度对齐到能启动 Zygisk**，且不违背"引擎静态 shellcode / 默认 off / 失败降级"三条铁律。
+
+#### 11.5.1 目标与"明确不做什么"
+
+- **目标**：让 C′ 把「`post-fs-data`」与「`service`（late_start）」两个**阶段时机**交回 apd，使 Zygisk provider 的模块脚本按生态时序执行。
+- **不需要引擎知道 zygiskd**：生态约定是 provider 自己的脚本做事——`post-fs-data.sh` 里起 `zygisk-ptrace64 monitor`，`service.sh` 里起 `zygiskd`（见 11.5.2 官方文档摘录）。引擎/rc 只负责**把阶段跑起来**。
+- **明确不做**：
+  1. 引擎**不实现 Zygisk 注入**（我们没有内核侧 zygote hook，也不打算为了 Zygisk 把引擎从"静态 patch"改成"常驻运行时"）；
+  2. 不在本轮改代码（模板/apd 调度改动等 Lead 定内置方案后实施）；
+  3. 不把 zygisk 组件二进制打进引擎产物（包体/许可另议，见 11.5.9）。
+- 与 apd 兼容层的分工：`apd -V` = `10762`、`/data/adb/ap/package_config`（含 `exclude` 列）等**生态识别信号已由 apd-dev 落地**（NEW-DOC-05 §14）；本节只解决"什么时候跑"。
+
+#### 11.5.2 生态时序（逐行取自 APatch 官方模块文档 `APatch/docs/cn/ap_module.md`）
+
+| Android 启动阶段 | APatch 在此阶段做什么（原文要点） | 我们要对齐的点 |
+|---|---|---|
+| `post-fs-data` | 执行 `post-fs-data.d/` 与各模块 `post-fs-data.sh`；其中 **`(Zygisk)./bin/zygisk-ptrace64 monitor`** | **必须在这里跑 `apd post-fs-data`**（脚本会起 ptrace monitor，必须早于 zygote） |
+| `zygote-start` → `class_start main` | 加载 properties；zygote 启动 | 我们的阶段一必须**早于 class_start main** |
+| kernel2user init（boot 动画阶段） | 执行 `service.d/` 与模块 `service.sh`；其中 **`(Zygisk) hook zygote (start zygiskd)`** | 在 zygote 起来后、系统 app 前跑 `apd services` |
+| boot complete | `boot-completed.d/` + `boot-completed.sh` | 现有 daemon 的 Stage ③ 已覆盖 |
+
+> 关键结论：**Zygisk 的"注入"由 provider 的 ptrace monitor + zygiskd 完成，不由内核完成**。所以只要阶段时机对了，再加上 apd 的 APatch 兼容信号，NeoZygisk/OnyxZygisk 就会按 APatch 血统接管——**引擎侧零改动**。
+
+#### 11.5.3 现状缺口（对着真实代码量的）
+
+| 事实 | 证据 |
+|---|---|
+| apd 已有四个阶段子命令 | `apd/src/cli.rs:44-63`：`PostFsData` / `Services` / `BootCompleted` / `Daemon` |
+| apd 已设计"post-fs-data 内联脚本超时" | `apd/src/defs.rs:127`：脚本 inline 跑在 init 的 post-fs-data 里，必须有上限，否则=开机风险 |
+| 但**当前 rc 模板没有跑 post-fs-data 阶段** | `apd/assets/init.sproot.rc` 的 `on post-fs-data` 段只有 `mkdir` |
+| 且 daemon 起得太晚 | 模板里 daemon 是 `class late_start`，但实际由 `on property:sys.boot_completed=1` 触发 → **services 阶段被拖到 boot_completed 之后**（zygiskd 会在系统 app 之后才起，错过时序） |
+| C′ 模板 = 现 rc 等价物 | `patch_rc_virtualize.cpp::rc_virt_template()` 与 `apd/assets/init.sproot.rc` 同语义 → **继承了同一缺口** |
+
+→ 结论：**模板与 apd 调度必须一起改**，只改 rc 无法让 zygiskd 在正确时机起来。
+
+#### 11.5.4 三种模板方案（体积用 C′ 生成器同一套布局算法实测）
+
+| 方案 | rc 改动 | 模板字节 | blob 估算 | 洞余量（2092 B 洞） | 时序保证 | 风险 | apd 改动 |
+|---|---|---|---|---|---|---|---|
+| **C：单 daemon 提前（推荐）** | `on post-fs-data` 增加 `start sproot-apd`；service 改 `class core`；删 `boot_completed` 触发块 | **239 B（−39）** | **≈796 B（比现在更小）** | 1296 B | 最强：三阶段全在 apd 手里（可等 `init.svc.zygote`/`sys.boot_completed`） | 中：daemon 从 post-fs-data 起常驻，早期 socket/SELinux 需实测 | 中 |
+| A：`exec` 内联 | `on post-fs-data` 增加 `exec -- /data/adb/apd … post-fs-data`；daemon 不动 | 354 B（+76） | ≈912 B | 1180 B | 强：与 APatch 一致（内联、同步） | 中高：**阻塞 init**，脚本挂起=开机卡住（靠 apd 超时兜底） | 小 |
+| B：双 service | 新增 `sproot-pfd` 服务（`class core`/`oneshot`）+ `on post-fs-data: start sproot-pfd` | 464 B（+186） | ≈1024 B | 1068 B | 中：异步，存在"zygote 先起"窗口 | 低：不阻塞 init | 小 |
+
+**体积结论**：三种方案 blob 都 ≤ 1024 B < 2092 B → **无需换洞、无需扩洞**；若将来模板 >2092 B，扫描器会自动落到下一个洞（`0xfb1618`/2536 B）并把 `cave_offset` 写进 `report.launcher`（已有断言保证洞合法）。
+
+#### 11.5.5 推荐方案 C 的 rc 草案 + apd 调度（伪代码）
+
+```text
+# /dev/user_init.rc 追加段（C 方案草案）
+on post-fs-data
+    mkdir /data/adb/sproot 0700 root root
+    start sproot-apd
+service sproot-apd /data/adb/apd --superkey-file /data/adb/sproot/key daemon
+    class core
+    user root
+    group root
+    oneshot
+    disabled
+    override
+```
+
+```text
+# apd daemon 内部（伪代码，不是真实代码）
+daemon():
+  dispatch_stage("post-fs-data")          # ① 模块 post-fs-data.sh（含 Zygisk ptrace monitor），带超时
+  wait_until(init.svc.zygote == "running" or sys.boot_completed == "1", timeout=60s)
+  dispatch_stage("services")              # ② 模块 service.sh（含起 zygiskd）
+  wait_until(sys.boot_completed == "1", timeout=120s)
+  dispatch_stage("boot-completed")        # ③
+  serve_auth_socket(); uid_listener()     # 原有职责
+```
+
+要点：
+- daemon **必须在 `post-fs-data` 就能起来**（此时 `/data` 已挂载、`/data/adb` 可读 ✅；SELinux policy 已加载）
+- 阶段一仍要**严格超时**（沿用 `defs.rs:127` 的上限），因为它在 init 的关键路径上（同步阻塞）
+- 阶段二是**非阻塞**的（zygiskd 是长期进程，脚本可能 `nohup &`）
+- `oneshot + disabled + override` 保持不变 → 最坏情况只是"自启失效"，不会 bootloop
+
+#### 11.5.6 失败降级矩阵（"宁可功能不生效，也不开机事故"）
+
+| 失败点 | 行为 | 用户可见结果 |
+|---|---|---|
+| `/data/adb/apd` 缺失/不可执行 | `start` 失败，init 记日志，继续开机 | 自启/Zygisk 全失效，系统正常 |
+| `post-fs-data` 脚本挂起 | apd 超时杀子进程并继续 | 个别模块失效，其余照常 |
+| `zygote` 未起/等待超时 | 跳过或延后 services 阶段（不阻塞） | Zygisk 可能不生效，模块挂载仍在 |
+| provider 未安装 | 阶段空转（无脚本可跑） | `selftest zygisk` 显示未安装，无副作用 |
+| 模板某行语法错 | init 忽略该行继续（只该行失效） | 最坏=阶段不跑 |
+| service 重复定义 | init 报 redefined，后定义被忽略 | 幂等，不影响功能（但见 11.5.7） |
+
+#### 11.5.7 数据面新风险：**双模板**（本轮发现，实施前必须定）
+
+C′ 现在对**两条**原 rc 路径都追加**同一份模板**（`/system/etc/init/hw/init.rc` 与 `/vendor/etc/init/hw/init.target.rc`）。若设备两者都存在，就会各带一份 `service sproot-apd` → init 报 "redefined"（后定义被忽略）。当前是"幂等但日志脏"；一旦两份模板将来分叉（例如一边带 zygisk 触发、一边不带），行为就不可预期。两种收敛方式：
+
+| 方式 | 数据区开销 | 适用 |
+|---|---|---|
+| (a) **按匹配路径分模板**：`init.rc` = 完整模板；`init.target.rc` = 仅 `on post-fs-data` 触发块（或空） | +60～120 B（blob 仍 <1 KB） | 推荐：万能，且两文件语义各自正确 |
+| (b) 只对 `/system/etc/init/hw/init.rc` 追加（target.rc 只重定向、不追加） | +0 | 简单，但若某机型只解析 target.rc 则自启失效 |
+
+#### 11.5.8 断言与真机验证（实施时**先造负样本**再落地）
+
+| 断言 | 判据 | 负样本（必须打红） |
+|---|---|---|
+| A12a 阶段位置 | 模板中 `start sproot-apd` 位于 `on post-fs-data` 段内（或 `exec` 行在段内） | 把 start 挪到 `on property:` 段 → FAIL |
+| A12b 参数序 | `--superkey-file` 在子命令 `daemon` 之前（clap 顶层参数） | 交换顺序 → FAIL |
+| A12c 服务名唯一 | 模板内 `service ` 定义名不重复 | 复制一份 service → FAIL |
+| A12d 模板上限 | 模板 ≤ 1024 B（防失控撑爆洞）且 blob ≤ 洞大小 | 塞 2 KB 注释 → FAIL |
+| A12e 双模板不冲突 | 若采用 (a)：两变体合起来 `service` 名不重复；采用 (b)：target 变体无 service 行 | 两变体都带 service → FAIL |
+| B12 真机 | `ps -A \| grep zygiskd` 有进程；`apd selftest --json` 的 `zygisk.running=true`、`module.version != -`；init 日志可见我们的 post-fs-data 阶段；开机耗时回归 ≤ +2 s；关开关后 A/B 对照回到旧行为 | 不实现 `zygisk.running` 字段 → 视为未验收 |
+
+#### 11.5.9 待 Lead 决策（本轮不实施）
+
+1. **内置 Zygisk 组件方案**：打包 provider 二进制进 APK，还是依赖用户自行安装 NeoZygisk/OnyxZygisk？（决定 apd 是否需要内置 `zygiskd` 启动逻辑）
+2. **方案 C 还是 A**：是否接受"daemon 从 post-fs-data 起常驻"（C，体积更小/时序最强） vs "exec 内联"（A，语义最贴 APatch 但有阻塞风险）。
+3. **双模板 (a) 还是 (b)**（11.5.7）。
+4. **组数契约**：zygisk 阶段并入现有 `--launcher rc` 组（组数 +0）还是新开可选组（+1）——建议**并入**，因为两者共用同一次 rc 重定向，没有独立开关的必要。
+
+### 11.6 断言与负样本（先证伪再入库）
 
 | 断言 | 判据 | 负样本（必须打红） |
 |---|---|---|
@@ -1404,7 +1575,7 @@ on property:sys.boot_completed=1
 | Tier B | report `launcher{cave_offset,cave_size,symbols{},shellcode_bytes,template_bytes}` 自洽；`cave_offset` 落在 .text 且区内全零 | 篡改 cave 地址到 rodata → FAIL |
 | 真机 S3 | 开机后 `ps -A \| grep apd` 存在且 `startup_source=init-rc`；`/data/adb/sproot/boot_count` 正常；无 panic/avc 风暴 | 不实现 `startup_source` → 视为未验收 |
 
-### 11.6 顺带纠正一个前提：APatch **没有**「umount modules」
+### 11.7 顺带纠正一个前提：APatch **没有**「umount modules」
 
 查 `/tmp/APatch` + `/tmp/KernelPatch` 全仓（`.rs/.c/.h/.sh`）：
 
@@ -1414,39 +1585,39 @@ on property:sys.boot_completed=1
 
 → **结论**：KSU 的 umount modules 是 KSU 独有；不存在"APatch 在用户态做了、我们照做即可"的捷径。用户态唯一可行路线是 **Magisk Zygisk 式 zygote 注入**（在 app 进程内 unshare + umount），那是另一套子系统（我们没有 zygote 注入能力），且 apd 无法替别的进程卸载（`setns` 只能让自身进入某 ns，而共享 ns 上的 umount 会波及全体）。**§10 的结论（方案 ③ 不做）不变。**
 
-### 11.7 新结论：要不要改 init_boot
+### 11.8 新结论：要不要改 init_boot
 
 | 方案 | 免 init_boot | 开机自启 | 引擎改动 | 真机风险 | 备注 |
 |---|---|---|---|---|---|
 | 现状：ramdisk rc 注入 | ❌ | ✅ | 0（客户端已实现） | 低 | 还需 ramdisk unpack/repack + T-12/AVB 一整套 |
-| **C′：rc 虚拟化（本节）** | ✅ **彻底** | ✅ | +1 可选组、实测 blob 836 B、新代码洞 | **中高**（5 项真机验证） | **已实现（默认 off）**，见 §11.8；同时消掉 ramdisk 链 |
+| **C′：rc 虚拟化（本节）** | ✅ **彻底** | ✅ | +1 可选组、实测 blob 836 B、新代码洞 | **中高**（5 项真机验证） | **已实现（默认 off）**，见 §11.9；同时消掉 ramdisk 链 |
 | B：内核 launcher（§9.4） | ✅ | ❌（需先提权一次） | +≈422 B、并入 do_execve 组 | 中 | 作为 A 的兜底 |
 | C：init exec + umh（§9.5） | ❌ 不可行 | — | — | — | 时机不成立（已否决） |
 
 **建议（供 Lead 拍板）**：
 1. **空间判据已过**（实测 53.6 KB 单洞 + 6.3 KB 其它洞）→ 若人类接受"引擎新增一个默认 off 的可选组 + 一轮真机验证"，**C′ 是"彻底免 init_boot"的正解**，且顺带把 ramdisk 侧整条风险链（unpack/repack/T-12/AVB/rc 文件冲突）一起消掉。
-2. 实施顺序（**已按此执行**）：A 真机验证照旧先做 → **C′ 已落地**（先造负样本再实现，`--launcher rc` 默认 off，见 §11.8）→ B 降为 C′ 真机失败时的兜底层（`umh` 仍为未实现的 E101 占位）。
+2. 实施顺序（**已按此执行**）：A 真机验证照旧先做 → **C′ 已落地**（先造负样本再实现，`--launcher rc` 默认 off，见 §11.9）→ B 降为 C′ 真机失败时的兜底层（`umh` 仍为未实现的 E101 占位）。
 3. **不变量**：无论 C′ 是否落地，`--workdir` 所有权、密钥 47+NUL、组数严格等值这三条既有契约都不能破；C′ 必须作为"默认 off 的可选组"接入，**默认产物与当前逐字节一致**（用组数断言 + Tier B 字节比对兜住）。
 
-### 11.8 实现状态（2026-11-10 落地：默认 off，可开）
+### 11.9 实现状态（2026-11-10 落地：默认 off，可开）
 
 **结论**：C′ 已按"默认 off、可选开"的最小实现落地；off 时产物与旧版**逐字节一致**（实测证明见下）；显式 `--launcher rc` 时在真内核上完成织入并通过字节级自证。
 
-#### 11.8.1 变更清单（文件级）
+#### 11.9.1 变更清单（文件级）
 
 | 文件 | 变更 |
 |---|---|
 | `engine/src/patch_rc_virtualize.{h,cpp}`（新增） | 纯逻辑层（模板唯一来源、数据布局、洞扫描、必需符号清单）+ asmjit 生成的 openat hook shellcode；**clean-room 自研**（仅参考 APatch 机制，未复制代码） |
 | `engine/src/analyze/symbol_analyze.{h,cpp}` | 新增 `_etext` 与 10 个符号解析（`__arm64_sys_openat`/`strncpy_from_user`/`strcmp`/`filp_open`/`kernel_read`/`kernel_write`/`filp_close`/`vmalloc`/`vfree`/`__arch_copy_to_user`） |
 | `engine/src/patch_pipeline.{h,cpp}` | `LauncherOptions{mode}`；`hook_groups_expected_count(ge61, huawei, launcher_rc)`（三参，默认第三参 false）；handler 末尾按需织入并 `mark("rc_virtualize", ...)`；`PatchKernelResult.launcher` |
-| `engine/src/skroot_patch_main.cpp` | `--launcher off\|rc\|umh`（默认 off；`umh` 未实现 → E101）；`--self-test-rcvirtual`（29 例）；`--self-test-groups` 增加 launcher 维度；report 增加 `launcher{}`；显式 rc 前置不满足 → **E202 且不产出 `--out`**；**修复失败路径 report 越界读 bug**（见 §11.8.5） |
+| `engine/src/skroot_patch_main.cpp` | `--launcher off\|rc\|umh`（默认 off；`umh` 未实现 → E101）；`--self-test-rcvirtual`（29 例）；`--self-test-groups` 增加 launcher 维度；report 增加 `launcher{}`；显式 rc 前置不满足 → **E202 且不产出 `--out`**；**修复失败路径 report 越界读 bug**（见 §11.9.5） |
 | `engine/src/Makefile` | `SPROOT_SRCS` 增加 `patch_rc_virtualize.cpp` |
 | `engine/android/verify_artifact.sh` | **A8-rc**（组数矩阵扩到 8 例：off 6 + rc 2）；**A11/A11b/A11c/A11d**（纯逻辑自检 29 例 + off 组数不变 + `umh`/非法取值 → E101）；**Tier B B11a~d**（真内核 rc 织入自证、off 不变量、无洞降级负样本） |
 | `engine/android/build_arm64.sh` | ENGINE-META 增加 `launcher_modes` / `launcher_cave_scanner` / `launcher_report_fields`；`report_fields` 补 `launcher{...}` |
 
 **CLI 契约**：`--launcher off|rc|umh`，**默认 `off`**。`umh`（B 方案）尚未实现——显式传 `umh` 返回 **E101** 并在 stderr 写明"未实现"，**绝不静默忽略**。
 
-#### 11.8.2 report 新增 `launcher{}`（真机排障入口）
+#### 11.9.2 report 新增 `launcher{}`（真机排障入口）
 
 ```json
 "launcher": {
@@ -1461,7 +1632,7 @@ on property:sys.boot_completed=1
 - `cave_offset/size` = 实际选用的洞；`hook_addr` = PAC/BTI 之后的 openat 入口；
 - `enabled=false` 时 `reason` 必填（如 `symbol missing: kernel_write` / `no zero-filled cave >= 2048 B in .text`）。
 
-#### 11.8.3 真内核实测（`samples/meizu21` 抽出的 33,892,864 B Image）
+#### 11.9.3 真内核实测（`samples/meizu21` 抽出的 33,892,864 B Image）
 
 | 项 | 实测 |
 |---|---|
@@ -1484,7 +1655,7 @@ on property:sys.boot_completed=1
 artifact `skroot-engine-arm64` 2,471,087 B。**与本地构建逐字节一致（可复现）**。
 本地另跑 Tier A + Tier B（`KERNEL_IMAGE` = Meizu 21 6.1 的 33,892,864 B Image）：**RESULT: ALL PASS**（含 B11a~d）。
 
-#### 11.8.4 断言与负样本（先证伪，全部实测打红）
+#### 11.9.4 断言与负样本（先证伪，全部实测打红）
 
 | # | 负样本（在临时副本上故意改坏） | 期望/实测 |
 |---|---|---|
@@ -1496,13 +1667,13 @@ artifact `skroot-engine-arm64` 2,471,087 B。**与本地构建逐字节一致（
 
 CI 门槛（无内核镜像时不跑 Tier B）：**A11（29 例）+ A8-rc（2 例）+ A11b~d**，每次 CI 必跑；Tier B **B11a~d** 在有 `KERNEL_IMAGE` 时覆盖真内核字节级与降级路径。
 
-#### 11.8.5 附带修复：失败路径 report 越界读（既有 bug，非本次引入）
+#### 11.9.5 附带修复：失败路径 report 越界读（既有 bug，非本次引入）
 
 构建 report 的 `hooks[]` 会按组取 `st.patch_addrs/lens/hex`，但这三个数组**只在"成功收尾前"才回填**——而 `fail()` 也会构建 report。旧代码在 `pr.patched==false`（E220 无 hook 空间）路径上同样会越界读（本机 ASAN 复现为段错误，见负样本 N2 的首轮现象）。
 
 修法：组循环前计算 `have_bytes`（`g.last <= 三个数组长度` 且 `n>0`），不满足时输出 `resolved:false + reason:"patch_bytes_not_filled_yet_failure_path"`，**不冒充"已落位"**。修复后 E202/E220 失败路径均能正常写 report 并返回错误码。
 
-#### 11.8.6 明确未做（本版本边界）
+#### 11.9.6 明确未做（本版本边界）
 
 1. `--launcher umh`（B 方案内核启动器）**未实现**，显式传参返回 E101；
 2. `/init.rc`（9 B）**不处理**（替换串更长；GKI 机型无此文件）——处理它需要"改用户栈指针"，多一条链与真机风险；
