@@ -1477,6 +1477,13 @@ on property:sys.boot_completed=1
 **默认 off 不变量（硬证据）**：用 `git worktree` 在**未含本特性的 HEAD** 上编译旧引擎，与本版本用同一密钥/同一镜像跑 `--launcher off`：
 `sha256 = 399ac4797e6ab2ae5700cc21350676daf7b89fe397e473ef24ae32cb9cce3f2f`，**两者逐字节相同**（`cmp` 通过）；默认（不传 `--launcher`）与显式 `off` 亦逐字节相同。
 
+**CI 证据（GitHub Actions，`v2` @ `4db719d`）**：`engine-arm64` **run 42817636832 · success**，17/17 steps
+（其中 `Contract assertions (qemu-user 真实执行 arm64 产物)` 覆盖 A1–A11，含本轮新增 A8-rc / A11 29 例 / A11b~d；`asm oracle` 10/10；T-12 强断言）。
+产物：`libskrootpatch.so` sha256 `e294b8aa…d558` / **3,066,816 B**；`skroot-patch` sha256 `bdbb1c83…b44b` / **2,994,944 B**；
+`ENGINE-META.txt` sha256 `8812ce04…4717`；`SYMBOLS-libskrootpatch.txt` sha256 `663826aa…b42d`；
+artifact `skroot-engine-arm64` 2,471,087 B。**与本地构建逐字节一致（可复现）**。
+本地另跑 Tier A + Tier B（`KERNEL_IMAGE` = Meizu 21 6.1 的 33,892,864 B Image）：**RESULT: ALL PASS**（含 B11a~d）。
+
 #### 11.8.4 断言与负样本（先证伪，全部实测打红）
 
 | # | 负样本（在临时副本上故意改坏） | 期望/实测 |
