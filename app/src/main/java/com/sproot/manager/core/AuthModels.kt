@@ -30,12 +30,18 @@ import android.graphics.drawable.Drawable
 enum class AuthState(val wire: String, val label: String) {
     ALLOW("allow", "允许"),
     DENY("deny", "拒绝"),
-    ASK("ask", "待询问");
+    ASK("ask", "待询问"),
+
+    /** 客户端展示态：apd auth list 里没有该应用 → 未授权（默认态）；不对应任何 wire 值。 */
+    NONE("none", "未授权");
 
     companion object {
-        /** 宽容解析：未知/缺失一律回落到 [DENY]（最保守），原始值仍写日志便于排查。 */
-        fun fromWire(raw: String?): AuthState =
-            entries.firstOrNull { it.wire == raw?.trim()?.lowercase() } ?: DENY
+        /** 宽容解析：缺失/空 → [NONE]（未授权）；未知非空值 → [DENY]（最保守），原始值仍写日志便于排查。 */
+        fun fromWire(raw: String?): AuthState {
+            val v = raw?.trim()?.lowercase()
+            if (v.isNullOrEmpty() || v == "null") return NONE
+            return entries.firstOrNull { it.wire == v } ?: DENY
+        }
     }
 }
 

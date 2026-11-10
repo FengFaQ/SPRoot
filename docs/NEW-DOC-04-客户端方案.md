@@ -136,12 +136,21 @@ android.newDsl=false
 - **卸载**：二次确认对话框（说明「AP 模块变更通常在下次重启后生效」）。
 - 业务数据仍只经 `ModuleRepository`（`apd module ...` root-exec），客户逻辑未改。
 
-### 3.3A 授权管理页（SuperUser，v0.4 接真实 apd 契约）
+### 3.3A 授权管理页（SuperUser，v0.5 重做：所有已装应用 + root 授权开关）
 
-照 KSU `SuperUserMiuix.kt` 版式：TopAppBar「授权」+ 审计日志入口 + 筛选菜单（全部/已允许/已拒绝/待询问）
-+ 刷新；列表首项搜索栏（应用名/包名/uid）；列表项 = 应用图标 + 名称 + 包名 + uid/统计 + 右侧三态标签；
-点卡片进详情（应用信息 + 三态单选 + 审计日志入口 + 撤销授权 + 权限详情）。
-**审计日志页**：`event/decision/package/cmd_name/iso`（apd 只给脱敏信息：无完整命令、无密钥，UI 不补全不猜测）。
+照 KSU `SuperUserMiuix.kt` 版式：TopAppBar「授权」+ 审计日志入口 + 筛选（全部/已授权/未授权）+ 刷新；
+搜索栏（应用名/包名/uid）；应用行 = 图标 + 名称 + 包名 + 右侧 **root 授权开关** + 点行进详情；
+详情 = 应用信息 + 三态单选（允许/拒绝/待询问·Phase 1 不可交互）+ 审计日志入口 + 撤销 + 权限详情。
+
+**主数据源（人类指令 D）**：**PackageManager 枚举手机上所有已安装用户应用**（排除系统应用与本 App），
+默认全部未授权（`AuthState.NONE`）；授权态来自 `apd auth list --json`，按 uid（其次 package）合并；
+apd 有但 PM 枚举不到的行追加展示（避免"幽灵授权"不可见）。开关 ON = 授予（`apd auth set --state allow`），
+OFF = 撤销（`apd auth revoke`→deny）；乐观更新 + 失败回滚重载。
+
+**不做（等引擎评估）**：「卸载模块 / umount modules」（KSU 的 UMOUNT 能力，内核 `setuid` hook +
+`path_umount` 实现）——我们引擎目前没有该能力，**不画开关、不做灰态占位**，等 engine-dev 结论。
+
+**审计日志页保留**：`event/decision/package/cmd_name/iso`（apd 只给脱敏信息：无完整命令、无密钥，UI 不补全不猜测）。
 
 **数据契约**（apd commit `d6c9ecb`，经 `ApdClient.rootExec`）：
 - `apd auth list --json` → 裸数组：`{uid, package, label, app_icon_path, state, last_grant_at,

@@ -1,8 +1,10 @@
 package com.sproot.manager.core
 
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.drawable.Drawable
+import android.os.Process
 
 /**
  * Root 授权数据层 —— D（授权管理页）的唯一数据入口。
@@ -43,6 +45,93 @@ object AuthRepository {
     )
 
     // ------------------------------------------------------------------ 列表
+
+    /** 统一列表：**手机上所有已安装用户应用**（主数据源）+ apd auth list 的授权态合并。 */
+    data class UnifiedResult(
+        val ok: Boolean,
+        /** apd auth list 是否读取成功；失败时列表仍展示（全部未授权）+ 提示 */
+        val authOk: Boolean,
+        val message: String,
+        val apps: List<AuthApp>,
+    )
+
+    /**
+     * 主数据源 = PackageManager 枚举的所有**用户应用**（人类指令 D：列出所有用户软件、默认未授权）；
+     * 授权态来自 `apd auth list --json`，按 uid（其次 package）合并；不在列表里的应用 = [AuthState.NONE]。
+     *
+     * 阻塞，调用方放后台线程（枚举 + 图标解析 + root-exec）。
+     */
+    fun unifiedList(context: Context, superKey: String?): UnifiedResult {
+        val installed = runCatching { installedUserApps(context) }.getOrElse { error ->
+            AppLog.error(TAG, "枚举已安装应用失败", error)
+            emptyList()
+        }
+        val authResult = list(context, superKey)
+        val byUid = authResult.apps.associateBy { it.uid }
+        val byPackage = authResult.apps.filter { it.packageName.isNotBlank() }.associateBy { it.packageName }
+        val merged = installed.map { app ->
+            val auth = byUid[app.uid] ?: byPackage[app.packageName]
+            if (auth == null) {
+                app
+            } else {
+                app.copy(
+                    state = auth.state,
+                    lastGrantAt = auth.lastGrantAt,
+                    lastDenyAt = auth.lastDenyAt,
+                    requestCount = auth.requestCount,
+                    toUid = auth.toUid,
+                    sctx = auth.sctx,
+                    exclude = auth.exclude,
+                )
+            }
+        }
+        // apd 里有、但 PM 枚举不到（已卸载/无包名 uid）→ 追加，避免"幽灵授权"不可见
+        val installedUids = installed.map { it.uid }.toSet()
+        val installedPackages = installed.map { it.packageName }.toSet()
+        val extras = authResult.apps.filter {
+            it.uid !in installedUids && it.packageName !in installedPackages
+        }
+        val all = (merged + extras).sortedWith(
+            compareByDescending<AuthApp> { it.state == AuthState.ALLOW }
+                .thenBy { it.label.lowercase() },
+        )
+        AppLog.info(TAG, "统一授权列表：已安装=${installed.size} apd=${authResult.apps.size} 合并=${all.size}")
+        return UnifiedResult(
+            ok = installed.isNotEmpty() || authResult.ok,
+            authOk = authResult.ok,
+            message = if (authResult.ok) "共 ${all.size} 个应用" else authResult.message,
+            apps = all,
+        )
+    }
+
+    /** 枚举所有已安装的**用户应用**（排除系统应用与本 App），默认状态 [AuthState.NONE]。 */
+    fun installedUserApps(context: Context): List<AuthApp> {
+        val pm = context.packageManager
+        val selfUid = Process.myUid()
+        return pm.getInstalledApplications(PackageManager.GET_META_DATA)
+            .asSequence()
+            .filter { it.uid != selfUid }
+            .filter { ai ->
+                (ai.flags and ApplicationInfo.FLAG_SYSTEM) == 0 ||
+                    (ai.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
+            }
+            .map { ai ->
+                val label = runCatching { pm.getApplicationLabel(ai).toString() }
+                    .getOrNull()
+                    ?.takeIf { it.isNotBlank() }
+                    ?: ai.packageName
+                val icon = runCatching { pm.getApplicationIcon(ai) }.getOrNull()
+                AuthApp(
+                    uid = ai.uid,
+                    packageName = ai.packageName,
+                    label = label,
+                    state = AuthState.NONE,
+                    icon = icon,
+                )
+            }
+            .sortedBy { it.label.lowercase() }
+            .toList()
+    }
 
     /** 列表（阻塞，调用方放后台线程）。 */
     fun list(context: Context, superKey: String?): ListResult {

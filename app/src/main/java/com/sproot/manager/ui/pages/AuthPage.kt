@@ -73,6 +73,7 @@ import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
 import top.yukonga.miuix.kmp.basic.PopupPositionProvider
 import top.yukonga.miuix.kmp.basic.RadioButton
 import top.yukonga.miuix.kmp.basic.Scaffold
+import top.yukonga.miuix.kmp.basic.Switch
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.basic.TopAppBar
@@ -90,32 +91,34 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme.colorScheme
 import top.yukonga.miuix.kmp.utils.overScrollVertical
 import top.yukonga.miuix.kmp.utils.scrollEndHaptic
 
-/** 筛选：对应 KSU SuperUser 页右上角菜单（全部 / 已允许 / 已拒绝 / 待询问）。 */
+/** 筛选：全部应用 / 已授权 / 未授权（未授权含 deny/ask/none）。 */
 private enum class AuthFilter(val label: String) {
     ALL("全部应用"),
-    ALLOWED("已允许"),
-    DENIED("已拒绝"),
-    ASKED("待询问"),
+    ALLOWED("已授权"),
+    UNAUTHORIZED("未授权"),
 }
 
 /**
- * Root 授权管理页（D）—— 照 KernelSU `ui/screen/superuser/SuperUserMiuix.kt` 版式：
+ * 授权管理页（D，人类 2026-11-10 重做要求）—— 照 KernelSU `SuperUserMiuix.kt` 版式：
  *
  * ```
- * Scaffold(BlurredBar(TopAppBar("授权" + 筛选 + 刷新 + 审计日志)))
+ * Scaffold(BlurredBar(TopAppBar("授权" + 审计日志 + 筛选 + 刷新)))
  *  └─ LazyColumn(12dp 横距)
- *      ├─ Notice：默认授权态是「待询问」(ask) → 新 App 首次请求会被拒
- *      ├─ Notice：AP 未部署（125）时优雅降级
+ *      ├─ Notice：默认所有应用未授权；已授权/未授权含义
  *      ├─ 搜索栏（应用名 / 包名 / uid）
- *      ├─ AuthApp 卡（应用图标 + 名称 + 包名 + 右侧状态，点卡片进详情）
- *      ├─ 空态（大图标 + 文案 + 默认态说明）
- *      └─ 详情页（二级页）：应用信息 + 三态单选 + 权限详情 + 撤销 + 审计日志入口
+ *      ├─ 应用行（图标 + 名称 + 包名 + 右侧 root 授权开关；点行进详情）
+ *      ├─ 空态
+ *      └─ 详情页（二级页）：应用信息 + 三态单选（允许/拒绝/待询问·Phase1 不可交互）+ 撤销 + 权限详情
  * ```
  *
- * ## 数据契约（apd d6c9ecb）
- * `apd auth list/set/revoke/log --json`，全部经 [ApdClient.rootExec]。
- * `label`/`app_icon_path` 恒为 null → 本页用 PackageManager 解析名称/图标（uid 无包时显示 uid=xxxxx）。
- * `ask` Phase 1 不可交互（当前等同拒绝）→ 详情页显示但**禁用**并标「待实现」，不假装可用。
+ * ## 主数据源（人类指令 D）
+ * **PackageManager 枚举手机上所有已安装用户应用**（默认未授权）；授权状态来自
+ * `apd auth list --json`，按 uid/package 合并。apd 里有但 PM 枚举不到的行会追加展示（避免不可见）。
+ * `ask` Phase 1 不可交互（当前等同拒绝），详情页显示但禁用并标注，不做假弹窗。
+ *
+ * ## 不做的事
+ * 「卸载模块 / umount modules」（KSU 的 UMOUNT 能力）是**内核能力**，我们引擎尚未实现，
+ * 按 lead 裁决**不画开关、不做灰态占位**，等 engine-dev 评估结论。
  */
 @Composable
 fun AuthPager(
@@ -127,7 +130,7 @@ fun AuthPager(
     val apdStatus = remember { ApdClient.status(context) }
     val apdReady = apdStatus.ok
 
-    var listResult by remember { mutableStateOf<AuthRepository.ListResult?>(null) }
+    var snapshot by remember { mutableStateOf<AuthRepository.UnifiedResult?>(null) }
     var loading by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
     var filter by remember { mutableStateOf(AuthFilter.ALL) }
@@ -145,21 +148,46 @@ fun AuthPager(
         if (loading) return
         loading = true
         Thread {
-            val r = runCatching { AuthRepository.list(context, key) }.getOrElse {
-                AuthRepository.ListResult(
+            val r = runCatching { AuthRepository.unifiedList(context, key) }.getOrElse {
+                AuthRepository.UnifiedResult(
                     ok = false,
+                    authOk = false,
                     message = "读取授权列表异常：${it.javaClass.simpleName}: ${it.message}",
                     apps = emptyList(),
                 )
             }
-            listResult = r
+            snapshot = r
             loading = false
-            if (!r.ok) AppLog.error("Auth", "授权列表失败：${r.message}")
+            if (!r.authOk) AppLog.error("Auth", "授权状态读取失败：${r.message}")
         }.start()
     }
 
     LaunchedEffect(isCurrentPage) {
-        if (isCurrentPage && listResult == null) load()
+        if (isCurrentPage && snapshot == null) load()
+    }
+
+    /** 本地更新某 uid 的状态（乐观更新，失败时 load() 回滚）。 */
+    fun applyState(uid: Int, state: AuthState) {
+        snapshot = snapshot?.let { current ->
+            current.copy(apps = current.apps.map { if (it.uid == uid) it.copy(state = state) else it })
+        }
+        detail = detail?.takeIf { it.uid == uid }?.copy(state = state) ?: detail
+    }
+
+    fun toggle(app: AuthApp, allow: Boolean) {
+        val target = if (allow) AuthState.ALLOW else AuthState.DENY
+        applyState(app.uid, target)
+        Thread {
+            val r = if (allow) {
+                AuthRepository.setState(context, key, app.uid, AuthState.ALLOW)
+            } else {
+                AuthRepository.revoke(context, key, app.uid)
+            }
+            actionMsg = r.message
+            if (!r.ok) {
+                load()
+            }
+        }.start()
     }
 
     // ---------------- 审计日志页（二级页） ----------------
@@ -177,15 +205,11 @@ fun AuthPager(
             app = currentDetail,
             onBack = { detail = null },
             onSetState = { state ->
+                applyState(currentDetail.uid, state)
                 Thread {
                     val r = AuthRepository.setState(context, key, currentDetail.uid, state)
                     actionMsg = r.message
-                    if (r.ok) {
-                        load()
-                        detail = currentDetail.copy(state = state)
-                    } else {
-                        AppLog.warn("Auth", "设置授权失败：${r.message}")
-                    }
+                    if (!r.ok) load()
                 }.start()
             },
             onRevoke = { showRevokeConfirm = true },
@@ -198,13 +222,11 @@ fun AuthPager(
             confirmText = "撤销",
             onConfirm = {
                 showRevokeConfirm = false
+                applyState(currentDetail.uid, AuthState.DENY)
                 Thread {
                     val r = AuthRepository.revoke(context, key, currentDetail.uid)
                     actionMsg = r.message
-                    if (r.ok) {
-                        load()
-                        detail = currentDetail.copy(state = AuthState.DENY)
-                    }
+                    if (!r.ok) load()
                 }.start()
             },
             onDismiss = { showRevokeConfirm = false },
@@ -212,7 +234,7 @@ fun AuthPager(
         return
     }
 
-    val apps = listResult?.apps.orEmpty()
+    val apps = snapshot?.apps.orEmpty()
     val filtered = remember(apps, query, filter) {
         val q = query.trim().lowercase()
         apps.asSequence()
@@ -220,8 +242,7 @@ fun AuthPager(
                 when (filter) {
                     AuthFilter.ALL -> true
                     AuthFilter.ALLOWED -> app.state == AuthState.ALLOW
-                    AuthFilter.DENIED -> app.state == AuthState.DENY
-                    AuthFilter.ASKED -> app.state == AuthState.ASK
+                    AuthFilter.UNAUTHORIZED -> app.state != AuthState.ALLOW
                 }
             }
             .filter { app ->
@@ -230,7 +251,6 @@ fun AuthPager(
                     app.packageName.lowercase().contains(q) ||
                     app.uid.toString() == q
             }
-            .sortedBy { it.label.lowercase() }
             .toList()
     }
 
@@ -311,7 +331,7 @@ fun AuthPager(
             ) {
                 item {
                     WarningCard(
-                        message = AuthRepository.DEFAULT_STATE_NOTICE,
+                        message = "默认不授予任何应用 root；打开右侧开关即授予，关闭即撤销",
                         level = WarningLevel.Notice,
                     )
                 }
@@ -319,15 +339,15 @@ fun AuthPager(
                     if (!apdReady) {
                         WarningCard(
                             message = "尚未部署 AP 守护（需先刷入修补后的镜像）：授权命令走 apd root-exec，" +
-                                "部署完成前列表与操作不可用",
+                                "部署完成前开关只更新界面、不会真正生效",
                             level = WarningLevel.Notice,
                         )
                     }
                 }
-                listResult?.takeIf { !it.ok }?.let { failed ->
+                snapshot?.takeIf { !it.authOk }?.let { failed ->
                     item {
                         WarningCard(
-                            message = "授权列表加载失败：${failed.message}",
+                            message = "授权状态读取失败（列表按全部未授权展示）：${failed.message}",
                             level = WarningLevel.Error,
                         )
                     }
@@ -348,20 +368,7 @@ fun AuthPager(
                 }
                 when {
                     loading && apps.isEmpty() -> {
-                        item {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 48.dp),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                Text(
-                                    text = "正在读取授权列表…",
-                                    fontSize = 14.sp,
-                                    color = colorScheme.onSurfaceVariantSummary,
-                                )
-                            }
-                        }
+                        item { LoadingText("正在读取已安装应用…") }
                     }
 
                     filtered.isEmpty() -> {
@@ -374,7 +381,11 @@ fun AuthPager(
 
                     else -> {
                         items(filtered, key = { it.uid }) { app ->
-                            AuthAppCard(app = app, onClick = { detail = app })
+                            AuthAppRow(
+                                app = app,
+                                onOpenDetail = { detail = app },
+                                onToggle = { allow -> toggle(app, allow) },
+                            )
                         }
                     }
                 }
@@ -386,15 +397,22 @@ fun AuthPager(
 
 // ---------------------------------------------------------------- 列表项
 
-/** 列表项：应用图标 + 名称 + 包名 + 统计，右侧三态标签；点卡片进详情（KSU SuperUser 版式）。 */
+/**
+ * 应用行（KSU SuperUser 版式）：图标 + 名称 + 包名 + 右侧 **root 授权开关**；
+ * 点行进详情。开关 ON = 允许（allow），OFF = 撤销（revoke→deny）。
+ */
 @Composable
-private fun AuthAppCard(app: AuthApp, onClick: () -> Unit) {
+private fun AuthAppRow(
+    app: AuthApp,
+    onOpenDetail: () -> Unit,
+    onToggle: (Boolean) -> Unit,
+) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
             .padding(bottom = 12.dp),
         insideMargin = PaddingValues(16.dp),
-        onClick = onClick,
+        onClick = onOpenDetail,
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             AppIcon(app = app)
@@ -412,28 +430,31 @@ private fun AuthAppCard(app: AuthApp, onClick: () -> Unit) {
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    text = app.packageName.ifBlank { "（无对应包）" },
+                    text = app.packageName,
                     fontSize = 12.sp,
                     color = colorScheme.onSurfaceVariantSummary,
                     fontFamily = FontFamily.Monospace,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
-                Text(
-                    text = buildString {
-                        append("uid ").append(app.uid)
-                        if (app.requestCount > 0) append(" · 请求 ").append(app.requestCount).append(" 次")
-                    },
-                    fontSize = 12.sp,
-                    color = colorScheme.onSurfaceVariantSummary,
-                )
             }
-            StateTag(state = app.state)
+            if (app.state == AuthState.ASK) {
+                StatusTag(
+                    label = "待询问",
+                    backgroundColor = colorScheme.tertiaryContainer,
+                    contentColor = colorScheme.onTertiaryContainer,
+                )
+                Spacer(Modifier.size(8.dp))
+            }
+            Switch(
+                checked = app.state == AuthState.ALLOW,
+                onCheckedChange = onToggle,
+            )
         }
     }
 }
 
-/** 应用图标：apd 不给图标 → App 侧解析；解析不到时用首字母圆底（uid 无包也适用）。 */
+/** 应用图标：PM 解析结果 → 自绘 Painter；解析不到回退首字母圆底。 */
 @Composable
 private fun AppIcon(app: AuthApp, size: Dp = 44.dp) {
     val icon = app.icon
@@ -463,7 +484,7 @@ private fun AppIcon(app: AuthApp, size: Dp = 44.dp) {
     }
 }
 
-/** android Drawable → Compose Painter（不引入 core-ktx/Coil；直接画 native canvas）。 */
+/** android Drawable → Compose Painter（不引 core-ktx/Coil；直接画 native canvas）。 */
 private class DrawablePainter(private val drawable: Drawable) : Painter() {
     override val intrinsicSize: Size
         get() = Size(
@@ -475,26 +496,6 @@ private class DrawablePainter(private val drawable: Drawable) : Painter() {
         drawable.setBounds(0, 0, size.width.toInt().coerceAtLeast(1), size.height.toInt().coerceAtLeast(1))
         drawIntoCanvas { canvas -> drawable.draw(canvas.nativeCanvas) }
     }
-}
-
-/** 三态标签：允许=primary、拒绝=error、待询问=tertiary（Phase 1 不可交互）。 */
-@Composable
-private fun StateTag(state: AuthState) {
-    val container = when (state) {
-        AuthState.ALLOW -> colorScheme.primaryContainer
-        AuthState.DENY -> colorScheme.errorContainer
-        AuthState.ASK -> colorScheme.tertiaryContainer
-    }
-    val content = when (state) {
-        AuthState.ALLOW -> colorScheme.onPrimaryContainer
-        AuthState.DENY -> colorScheme.onErrorContainer
-        AuthState.ASK -> colorScheme.onTertiaryContainer
-    }
-    StatusTag(
-        label = if (state == AuthState.ASK) "${state.label}·Phase1" else state.label,
-        backgroundColor = container,
-        contentColor = content,
-    )
 }
 
 // ---------------------------------------------------------------- 详情页
@@ -561,13 +562,13 @@ private fun AuthDetailPager(
                                         color = colorScheme.onSurface,
                                     )
                                     Text(
-                                        text = app.packageName.ifBlank { "（无对应包）" },
+                                        text = app.packageName,
                                         fontSize = 12.sp,
                                         fontFamily = FontFamily.Monospace,
                                         color = colorScheme.onSurfaceVariantSummary,
                                     )
                                     Text(
-                                        text = "uid ${app.uid} · 请求 ${app.requestCount} 次",
+                                        text = "uid ${app.uid}",
                                         fontSize = 12.sp,
                                         color = colorScheme.onSurfaceVariantSummary,
                                     )
@@ -594,7 +595,8 @@ private fun AuthDetailPager(
                             )
                             AuthStateRow(
                                 state = AuthState.DENY,
-                                selected = app.state == AuthState.DENY,
+                                selected = app.state == AuthState.DENY ||
+                                    app.state == AuthState.NONE,
                                 hint = "拒绝提权请求（不弹窗，直接失败）",
                                 onClick = { onSetState(AuthState.DENY) },
                             )
@@ -635,7 +637,7 @@ private fun AuthDetailPager(
                                 color = colorScheme.onSurface,
                             )
                             InfoLine("state", app.state.wire)
-                            InfoLine("package", app.packageName.ifBlank { "—" }, monospace = true)
+                            InfoLine("package", app.packageName, monospace = true)
                             InfoLine("uid", app.uid.toString())
                             InfoLine("to_uid", app.toUid.toString())
                             InfoLine("sctx", app.sctx.ifBlank { "—" })
@@ -702,7 +704,6 @@ private fun AuthStateRow(
 
 // ---------------------------------------------------------------- 审计日志页
 
-/** 审计日志页：event/decision/package/cmd_name/iso（apd 只给脱敏信息，UI 不补全不猜测）。 */
 @Composable
 private fun AuthLogPager(superKey: String?, onBack: () -> Unit) {
     val context = LocalContext.current
@@ -767,7 +768,7 @@ private fun AuthLogPager(superKey: String?, onBack: () -> Unit) {
                 item {
                     WarningCard(
                         message = "日志只含 apd 提供的脱敏信息（无完整命令、无密钥）；" +
-                            "cmd_name 是命令名，cmd_args 是参数个数，不展示完整参数",
+                            "cmd_name 是命令名，不展示完整参数",
                         level = WarningLevel.Notice,
                     )
                 }
@@ -781,40 +782,12 @@ private fun AuthLogPager(superKey: String?, onBack: () -> Unit) {
                 }
                 result?.entries?.let { entries ->
                     if (entries.isEmpty() && !loading) {
-                        item {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 48.dp),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                Text(
-                                    text = "暂无审计记录",
-                                    fontSize = 14.sp,
-                                    color = colorScheme.onSurfaceVariantSummary,
-                                )
-                            }
-                        }
+                        item { LoadingText("暂无审计记录") }
                     }
-                    items(entries) { entry ->
-                        AuthLogCard(entry = entry)
-                    }
+                    items(entries) { entry -> AuthLogCard(entry = entry) }
                 }
                 if (loading) {
-                    item {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 40.dp),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            Text(
-                                text = "正在读取审计日志…",
-                                fontSize = 14.sp,
-                                color = colorScheme.onSurfaceVariantSummary,
-                            )
-                        }
-                    }
+                    item { LoadingText("正在读取审计日志…") }
                 }
             }
         }
@@ -941,6 +914,22 @@ private fun SearchCard(query: String, onQueryChange: (String) -> Unit) {
 }
 
 @Composable
+private fun LoadingText(text: String) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 48.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = text,
+            fontSize = 14.sp,
+            color = colorScheme.onSurfaceVariantSummary,
+        )
+    }
+}
+
+@Composable
 private fun InfoLine(label: String, value: String, monospace: Boolean = false) {
     Column(modifier = Modifier.padding(vertical = 3.dp)) {
         Text(
@@ -980,20 +969,10 @@ private fun EmptyAuthState(searchEmpty: Boolean) {
             )
         }
         Text(
-            text = if (searchEmpty) "没有匹配的应用" else "还没有提权请求记录",
+            text = if (searchEmpty) "没有匹配的应用" else "没有已安装的用户应用",
             fontSize = 16.sp,
             fontWeight = FontWeight.Medium,
             color = colorScheme.onSurface,
-        )
-        Text(
-            text = if (searchEmpty) {
-                "换个关键词或切换筛选条件试试"
-            } else {
-                "当应用通过 AP 请求 root 时会出现这里。注意默认态是「待询问」：" +
-                    "新应用首次请求会被拒绝（ask 当前等同拒绝），请在此改为「允许」"
-            },
-            fontSize = 13.sp,
-            color = colorScheme.onSurfaceVariantSummary,
         )
     }
 }
