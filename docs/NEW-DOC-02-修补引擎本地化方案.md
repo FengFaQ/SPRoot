@@ -20,6 +20,7 @@
 | 无真机验证 | `verify_artifact.sh`：Tier A（ELF/契约，qemu-user 可跑，**ALL PASS**）+ Tier B（真内核字节级断言）。**已用魅族 21 官方 boot.img 全链实测**：抽 kernel sha256 与 qa ground truth 一致、补丁 rc=0、等长、可确定性复现、重打包等长。 |
 | **`--workdir` 所有权契约（2026-11-09 真机事故后）** | **显式传入 `--workdir` ⇒ 目录及内容生命周期归调用方，引擎不得删除其中任何内容；只有默认 workdir（`<out>.work`）由引擎成功收尾时回收**（§8.1）。行为证据：A9d `--self-test-workdir` 13 例矩阵（CI 必跑）+ Tier B B9 事故现场回归 / B10 默认回收正控。 |
 | **密钥 ABI 契约（P0，提权链）** | CLI `--key` **严格 48 字符**（47/49/非 alnum → E101）；内核只写 **`key[0:47]` + NUL = 48 字节**（`embed_key_bytes()`，内联断言）；`report.key_spec` 输出 `abi="47+nul"/bytes=48/last_byte_is_nul=true/input_len=48`（§7.5）。行为证据：A10 `--self-test-keyabi` 17 例（CI 必跑）+ Tier B B7。**用户态提权串必须 47 字符**。 |
+| **用户态 daemon 启动方式（2026-11-10 评估）** | SK 引擎**无任何内核态拉起用户态的能力**（`call_usermodehelper`/`kernel_thread`/`kthread_run`/`init_task` 全零命中）；KSU 亦需改 ramdisk/init_boot，APatch 靠常驻内核运行时做 init.rc 虚拟化才不需要。**选型：A（App 自引导）先落地 → B（提权时内核顺带拉起）作兜底 → C（init hook + umh）不建议**。详见 §9。 |
 | 推荐集成 | **主形态 JNI（`libskrootpatch.so` + `System.loadLibrary("skrootpatch")`）**，次形态静态 exec（`skroot-patch` 从 `nativeLibraryDir` 真实路径 exec，**禁止** symlink 到 `filesDir`；该可执行件默认不进 APK）。 |
 | 实测编译耗时 | 全量 100+ TU，12 核并行 **18 秒**（`make objs`，见 §3.4）。 |
 | 打包工具 | **magiskboot v31.1 ARM64**（SKRoot 官方路径；988,984 B，静态 AArch64，sha256 `97e9ec75…bb54`），CI 内固定版本+哈希校验并随 artifact 分发；自研 bootimg 保留为交叉校验/回退（§7）。**禁止 AIK**。 |
@@ -132,7 +133,7 @@ $NDKB/aarch64-linux-android29-clang++ -shared -static-libstdc++ -Wl,-soname,libs
 llvm-strip --strip-all <build>/jni/libskrootpatch.so
 ```
 
-**asmjit / capstone 如何编**：两者都是**源码内编**（非预编译库），asmjit 只编 `asmjit/arm/*` + `asmjit/core/*`（**裁掉 x86 后端可省 ~200 KB**，当前 Makefile 仍包含 x86 源，见 §10-R3），capstone 只编 `arch/AArch64` + 公共 `cs.c/MC*.c/SStream.c/utils.c/Mapping.c`。两者与目标架构无关（asmjit 是「生成 arm64 机器码」，capstone 是「反汇编 arm64」），可在任意宿主上交叉编译，实测 0 报错（仅 263 处 `-Wunused-function` 类告警）。
+**asmjit / capstone 如何编**：两者都是**源码内编**（非预编译库），asmjit 只编 `asmjit/arm/*` + `asmjit/core/*`（**裁掉 x86 后端可省 ~200 KB**，当前 Makefile 仍包含 x86 源，见 §11-R3），capstone 只编 `arch/AArch64` + 公共 `cs.c/MC*.c/SStream.c/utils.c/Mapping.c`。两者与目标架构无关（asmjit 是「生成 arm64 机器码」，capstone 是「反汇编 arm64」），可在任意宿主上交叉编译，实测 0 报错（仅 263 处 `-Wunused-function` 类告警）。
 
 ### 3.3 产物与校验（实测）
 
@@ -631,7 +632,144 @@ magiskboot 来自 Magisk（**GPL-3.0**），我们以**独立可执行程序**�
 
 证据：A6g/A6h（长度守卫）、A10（`--self-test-keyabi` 17 例，CI 必跑）、Tier B B4/B7（真内核产物字节）。
 
-## 9. 包体与体积
+## 9. 用户态守护进程的启动方式：三种方案对比与选型（2026-11-10 评估）
+
+> **本节结论先行**：
+> 1. **“KSU/APatch 都不需要修补 init_boot”这个前提只对 APatch 成立，对 KSU 不成立** —— KSU 同样要改 ramdisk（`/init` → ksuinit → 加载 ko → exec `init.real`），在 GKI+init_boot 机型上改的就是 **init_boot**（见 §9.2 证据）。
+> 2. 我们**确实没有**任何“从内核态拉起用户态进程”的能力（§9.1 代码级核对），这是 SK 上游「零常驻内核运行时」模型的直接推论，不是实现遗漏。
+> 3. **建议**：**A（App 自引导）先落地验证**；**B（提权时顺带拉起）作为 A 的兜底，待 A 真机结果再决定**；**C（init hook + `call_usermodehelper`）不建议做**，C′（init.rc 虚拟化，APatch 路线）超出 SK 静态 patch 模型，且只能 clean-room。**本轮不动代码。**
+
+### 9.1 现状核对：SK 引擎有没有“拉起用户态”的能力？
+
+**结论：完全没有。** 代码级证据（`engine/src/`，排除 `3rdparty/`）：
+
+| 检索项 | 命中数 | 说明 |
+|---|---|---|
+| `call_usermodehelper` / `usermodehelper` / `umh` | **0** | 内核态拉起用户态进程的标准原语，零引用 |
+| `kernel_thread` / `kthread_run` / `kthread_create` | **0** | 零引用 |
+| `init_task` / `init_task_struct` | **0** | 未做任务链表注入（引擎里的 `init_cred` 是**凭据**搜索器，只用于提权，不创建进程） |
+| `userd` / `init.rc` 虚拟化 | **0** | 无 APatch 式 rc 替换机制 |
+
+上游同源核对（`upstream/SKRoot-linuxKernelRoot/`，Lite + Pro 全仓）：`call_usermodehelper` / `kernel_thread` / `kthread_run` 亦为 **0 命中**（`userd` 命中均为 `userdata` 误匹配）。即：**上游 SKRoot 本身就没有启动器**，A1 文档「无 daemon、无 socket、无设备节点」的结论在代码上成立。
+
+引擎的全部 hook 组（`patch_pipeline.cpp:98-171`）都是**拦截类**，无一组创建/唤醒进程：
+
+| 组 | 作用 | 是否创建进程 |
+|---|---|---|
+| `do_execve`（`patch_do_execve.cpp`） | 比较 execve 路径串 == 47 字符密钥；命中则就地把 `current->cred` 改成 uid/gid=0 + 满 cap、清 `TIF_SECCOMP` 与 seccomp 字段 | ❌ 只改**当前**进程凭据 |
+| `filldir64` / `compat_filldir` | 按密钥前缀隐藏目录项 | ❌ |
+| `avc_check` / `avc_denied` | 仅当“uid=0 且满 cap 且 securebits=0”（即被本引擎提权的进程）时把 AVC 拒绝改为放行（`patch_current_avc_check.cpp:20-50`） | ❌ |
+| `audit_log_start` | 同类进程的审计静默 | ❌ |
+| `cfi_bypass` / `huawei_bypass` / `drm_*_coredump` | 稳定性/厂商绕过 | ❌ |
+| `embed_key` | 写入 47+NUL 密钥 | ❌ |
+
+→ **现状**：内核只负责「让某个进程变成 root」，**没有任何机制让内核主动把 `/data/adb/apd` 拉起来**。因此“AP 守护开机自启”只能借 init：把 `init.sproot.rc` 塞进 **ramdisk**，由 init 解析 service 并启动（§3.1.3 自启链）。
+
+### 9.2 为什么“我们要 init_boot”而 APatch 不要（同业对照，含一处前提纠正）
+
+先修正前提：**KSU 也要改 ramdisk**。仓库内已做的源码级调研（`docs/research/kernelsu-architecture.md`）记录：
+
+- KSU `boot-patch` 第 11 步：`cpio.mv("init","init.real")` + `cpio.add("init", 0o755, ksu_init)` + `cpio.add("kernelsu.ko", ...)`（同文档 L251）；
+- `ksuinit` 的定位是「ramdisk 里的 `/init` 第一阶段：加载 ko 后 exec 真正的 init」（同文档 L33）；
+- 目标分区参数含 `--partition <boot|init_boot|vendor_boot>`（同文档 L696）。
+
+即 **KSU 的引导件必须落在 ramdisk**；GKI 机型的 ramdisk 在 `init_boot`，所以 **KSU 在这些机型上同样修 init_boot**。我们的方案与 KSU 属**同一层级**的手段（都是往 ramdisk 塞引导件），区别只是我们塞 `rc` 交给 init 解析，KSU 塞 `/init` 外壳程序。
+
+**APatch 确实不需要 init_boot**，原因不是“它更聪明地避开了”，而是它有 SK 所没有的**常驻内核运行时**（KernelPatch）：
+
+| 维度 | SK/SKRoot（我们） | KernelSU | APatch / KernelPatch |
+|---|---|---|---|
+| 内核侧形态 | **纯静态 shellcode**，无分配器/无 hook 框架/无运行时符号解析 | 常驻 ko 模块（LKM 模式） | 常驻补丁运行时（hook 框架 + `vmalloc` + 运行时 kallsyms 解析） |
+| 拉起用户态的方式 | **无** | 改 ramdisk `/init`（ksuinit 加载 ko 后 exec 真 init）；核心 root 不依赖常驻 daemon | **init.rc 虚拟化**：syscall hook 拦截 init 对 `/system/etc/init/hw/init.rc` 等的 open，把内容替换为 `原 rc + exec su -Z u:r:magisk:s0 exec /data/adb/apd`（`upstream/KernelPatch/kernel/patch/android/userd.c:46,106-130,1743-1797`） |
+| 是否需要动 ramdisk | **需要**（rc 注入） | **需要**（`/init`） | **不需要**（rc 在 `/system`，内核侧替换） |
+
+**为什么 Meizu21 上是 init_boot 而不是 boot**（实测证据，`--bootimg info samples/meizu21/boot.img`）：
+
+```
+header_version=4  kernel: offset=4096 size=33892864 compression=raw
+ramdisk: offset=33898496 size=0        ← boot.img 里没有 ramdisk（GKI 布局）
+init_boot.img: ramdisk=2,131,370 B     ← rc 只能注进这里
+```
+
+→ **“要修 init_boot”不是架构缺陷，而是两件事的交集**：①SK 内核无启动器（§9.1）＋②本机 ramdisk 在 init_boot（实测）。非 GKI 机型（ramdisk 在 boot）只需修 boot.img，与 KSU 的“只修 boot”表现一致。
+
+### 9.3 三方案对比
+
+| | **A：App 自引导** | **B：提权时顺带拉起** | **C：init hook + `call_usermodehelper`** |
+|---|---|---|---|
+| 机制 | App 先用密钥 exec 一次（内核 hook 授 root）→ 该进程再 `exec /data/adb/apd daemon` | 在 `do_execve` 密钥命中分支后，**内核**调 `call_usermodehelper("/data/adb/apd", argv, envp, UMH_WAIT_EXEC)` | 新增 hook（如 init 首次 exec 或某低频繁 exec 点）→ 一次性标志 → `call_usermodehelper` |
+| 引擎改动 | **0** | 小（见 §9.4） | 大（时机/标志/符号/风险，见 §9.5） |
+| **能否实现“开机自启”** | ❌ 需用户打开一次 App | ❌ 需先有人提权一次 | ⚠️ 理论可以，但**触发时机在 `/data` 挂载之前**（见 §9.5） |
+| 真机风险 | 低（纯用户态链路；依赖现有 avc 绕过） | 中（改 exec 热路径；daemon 以 kernel cred/SID 运行） | **高**（早期启动路径，失败=无法开机/bootloop） |
+| 何时可交付 | **立即可做**（ui-client 已在做） | A 之后按需 | 不建议排期 |
+
+**A 的真实定位（必须说清，避免误判）**：A **不是 rc 注入的替代方案**，而是**首版降低刷机面/验证成本的路径**：
+- 现状链路本来就存在“首次部署必须有一次用户态 root”的鸡生蛋（`apd deploy` 要写 `/data/adb/sproot/key`，`/data/adb` 仅 root 可写）——这一步**任何方案都躲不掉**，rc 注入解决的是**之后每次开机**的自动拉起；
+- A 能让“首版不注入 rc 也能跑通全链”（App 打开即可用），代价是**第三方 App 的 root 依赖用户先打开 SPRoot Manager**（daemon 未起时无 socket 授权），且模块开机挂载/`bootloop` 计数时机会后移；
+- 因此 A/B 都是“**免 init_boot 但放弃开机自启**”；要在免 init_boot 的同时保留开机自启，只有 C 或 C′（APatch 路线），二者都要求常驻内核运行时。
+
+**我们的 avc 绕过使 A 在技术上可行**（关键前提）：`avc_check` 的放行判据是「uid=0 + 满 cap + securebits=0」，而提权后进程恰好满足 → 其后续 `exec /data/adb/apd`、写 `/data/adb` 的 AVC 拒绝会被改为放行（`patch_current_avc_check.cpp:20-50` + `patch_avc_denied.cpp:25-41`）。**残留风险**：进程 SELinux **域**仍是 `untrusted_app`（改的是 cred 不是 sid），apd 在该域下的 socket/模块/setcon 行为与 init 拉起时不同，**必须真机实测**。
+
+### 9.4 若做 B：最小改动清单（含断言与负样本）
+
+**空间与符号预算（在真机镜像 `samples/meizu21` 抽出的 33,892,864 B Image 上实测）**：
+
+| 项 | 实测值 | 说明 |
+|---|---|---|
+| shellcode 可用区 `die` | 0x24bd4 起、到下一符号 **696 B** | ≥6.1 分支的 shellcode 宿主（`root_key_region=0x24bd4`） |
+| `die` 已用 | **180 B**（do_execve 164 + 4 个 4 B 跳转） | 含 48 B 内联密钥缓冲 |
+| `die` 余量 | **≈516 B** | 加 launcher 可用 |
+| `__drm_printfn_coredump` / `__drm_puts_coredump` | 252 B（已用 140）/ 212 B（已用 56） | 另两处宿主 |
+| 全量已打补丁字节 | 508 B | 来自真实 report.json |
+| `call_usermodehelper` | **在 kallsyms 中，0x000d5878**（下一符号间距 164 B） | patch 时可解析，无需运行时 kallsyms |
+| `kallsyms_lookup_name` | 在 kallsyms 中，0x001a4354 | 备用（不推荐运行时解析） |
+
+**改动清单（约 1–2 人日 + 真机窗口）**：
+
+1. **新增 `engine/src/patch_daemon_launcher.{h,cpp}`（自有代码，非上游衍生）**：asmjit 生成 launcher shellcode——
+   - 栈上构造 argv（**注意 clap 顶层参数序**，`apd` 的 `--superkey-file` 必须在子命令前）：
+     `["/data/adb/apd", "--superkey-file", "/data/adb/sproot/key", "daemon", NULL]` → 4 个内联字符串（13+15+20+7 ≈ 55 B）+ 40 B 指针表 + 调用序列，**估 250–320 B**（在 516 B 余量内，但缓冲很薄）；
+   - 字符串地址用 `adr` **PC 相对**取得（**禁止嵌入绝对内核地址**：当前 patch 模型不含 KASLR 基址，硬编码绝对地址在启用 KASLR 的机型上必崩）；
+   - `mov x3, #1`（`UMH_WAIT_EXEC`）+ 间接调用；返回失败**静默**（不 panic、不改 exec 结果）。
+2. **`analyze/symbol_analyze.{h,cpp}` 新增 `call_usermodehelper` 解析**：找不到时**降级不织入**并在 report 标 `launcher.resolved=false`（不阻断修补）。
+3. **上游衍生文件的小幅插入**：`patch_do_execve.cpp` 在密钥命中分支后加一条 `bl launcher`（约 +20 B）。**这是 B 唯一必须动上游文件的地方**；备选“另挂一个 hook 点”不可行（同一函数只能有一个入口 hook）。
+4. **CLI 契约**：新增 `--launcher <off|on>`（**默认 off**，保持现有契约与 CI 不变）+ report 新增 `launcher {enabled, symbol, shellcode_bytes, trigger}`。
+5. **组数契约**：launcher **并入 `do_execve` 组**（不新增 group）→ `hook_groups_expected` 仍为 14/15（11/12），**不破坏“组数严格等值”断言**；若作为独立组则必须同步 `hook_groups_expected_count()` + A8 矩阵 + qa 断言（不推荐）。
+
+**必须新增的断言（按铁律，先证伪再入库）**：
+
+| 断言 | 判据 | 负样本（必须先打红） |
+|---|---|---|
+| `--self-test-launcher`（CI 必跑） | launcher blob 中：内联字符串逐字节 == 上述 argv 四条；指针表 5 项且末项为 0；`UMH_WAIT_EXEC` 立即数 == 1；调用点为 `blr` 前有**位置无关**的目标装载（`adr/adrp+add` 或 literal load），**不得**出现裸绝对地址 | 改字符串 1 字节 / 指针表少 NULL / 立即数改 2 / 换成硬编码绝对地址 → 断言必须红 |
+| Tier B（真内核） | report `launcher.symbol_addr` == kallsyms 中 `call_usermodehelper` 偏移；`hooks[do_execve].new_bytes` 含该调用序列 | 把符号名拼错 → 期望 `launcher.resolved=false` 或 E202，**且产物仍正常生成**（不得因 launcher 失败而丢修补） |
+| 真机 S3 | apd `selftest --json` **必须新增 `startup_source`**（`init-rc` / `app-exec` / `kernel-umh`）+ `parent_pid` | 不实现该字段 → **B 无法验收**（否则又是“永远 PASS 的空断言”） |
+
+**B 的风险清单**：①kCFI/kCFI 检查（间接调用）依赖现有 `cfi_bypass` 组生效——**必须真机确认不会 panic**；②daemon 以 kernel cred（uid 0 + 满 cap）与 **kernel/init 域 SID** 运行，与 `service ... user root` 拉起的语义不同，apd 的 socket/模块/setcon 行为需实测；③每次密钥提权都会尝试拉起（apd 有单实例 `flock`，重复启动无害但有多余进程抖动；若要“只拉一次”需**可写标志**，而当前 patch 模型只写只读 text → 不建议为此引入 data 段 patch）。
+
+### 9.5 为什么不建议 C（init hook + `call_usermodehelper`）
+
+1. **触发时机不成立（硬事实）**：init 由 `kernel_init` exec，`/data` 由 init 自己在其后的阶段挂载 → “hook init 首次 exec 就拉 daemon”时 `/data/adb/apd` **还不存在**，UMH 必然失败。要可用必须“等 /data 就绪” → 需要轮询/延迟/重试逻辑。
+2. **“只拉一次”需要可写内存**：一次性标志必须放在可写段（`.data`/`.bss`），而 shellcode 取该地址同样需要运行期基址（KASLR）推导；当前引擎刻意只用 PC 相对寻址（零 KASLR 依赖），引入绝对地址即新增一类机型风险。
+3. **SID 不对（APatch 用实证避开了这一点）**：UMH 的 helper 继承 kernel 上下文（`kthreadd` → `init_cred`），exec 后**不是** `u:r:magisk:s0` / `init` 域。APatch 特意走“由 init 自己 exec（`su -Z u:r:magisk:s0 exec /data/adb/apd`）”，就是为了拿对域。我们走 UMH 会得到一个“root 但域不对”的 daemon，apd 的后续能力（模块挂载、域转换、socket 授权）都可能静默失效。
+4. **风险-收益倒挂**：C 的唯一收益是“省掉 init_boot 修补”，但 §9.2 表明 KSU 也修 ramdisk/init_boot → 该收益并不构成架构优势；而 C 失败即“无法开机”，代价是最高等级。
+5. **C′（APatch 的 init.rc 虚拟化）为什么也不现实**：它需要**常驻运行时**（syscall hook 框架、`vmalloc`、运行时 kallsyms、`/dev` 写入、`copy_to_user` 路径改写），本质是 KernelPatch 级子系统；SK 引擎是“一次性静态 patch”，无分配器、无运行时符号解析 → 要做等于重写一套 KernelPatch，且 KernelPatch 为 GPL-2.0-or-later，**不能混入 proprietary 的 SK 引擎**（只能 clean-room，工期以周计）。
+
+### 9.6 上游与许可约束（对本议题的直接结论）
+
+| 约束 | 事实 | 对 A/B/C 的影响 |
+|---|---|---|
+| SKRoot 上游 | proprietary（作者授权可用），**无启动器**（§9.1） | B 的 launcher 是我们的**全新自有代码**；只需在 `patch_do_execve.cpp` 做 ≤5 行插入，属“小幅插入”而非重写核心逻辑 → **工程上可行** |
+| 许可混合现状 | 上游部分“原作者保留所有权利” + 本项目新增部分 AGPL-3.0，**同二进制混合的现状已存在并已评估** | 新增自有文件（AGPL-3.0）不改变该结构；但**若引入 KernelPatch（GPL-2.0-or-later）代码**会污染整包 → 禁止复制 C′ |
+| 无真机 → 断言门槛 | 新增断言必须先被负样本打红（T-12 铁律） | B 的 `--self-test-launcher` 与 Tier B 断言必须先各造一条负样本；C 无法在无真机条件下验证“开机不崩” → 不可测即不应排期 |
+
+### 9.7 建议（供 Lead 拍板）
+
+1. **先落地 A**（ui-client 已在做；零引擎改动、零新 CI 周期）：它能验证“免 init_boot 也能跑通全链”，并暴露 apd 在 `untrusted_app` 域下的真实行为（这是所有后续方案的共同前置知识）。
+2. **B 暂不排期，等 A 的真机结论**：若 A 的失败点正是“提权进程 exec/写 `/data/adb` 被拒”，则 B 的价值成立（由内核代为拉起），再按 §9.4 实施；若 A 顺利，**B 无必要**（A 已能拉起 daemon）。
+3. **C 不做**；若未来确实要实现“免 ramdisk 且开机自启”，应单独立项评估 **C′（rc 虚拟化）**——需明确“引入常驻内核运行时”这一架构变更，并做许可与真机风险双重评审，**不要**以“加个 hook”的名义低估工程量。
+4. **对外口径**：「我们要修 init_boot」的准确表述是——**本机 ramdisk 在 init_boot（GKI 布局），而我们的守护自启走 ramdisk rc（KSU 走 ramdisk `/init`，同一层级）**；APatch 不需要 ramdisk 是因为它有常驻内核运行时做 rc 虚拟化，不是因为我们漏了什么。
+
+## 10. 包体与体积
 
 | 组合 | 增量 | 评价 |
 |---|---|---|
@@ -639,11 +777,11 @@ magiskboot 来自 Magisk（**GPL-3.0**），我们以**独立可执行程序**�
 | 仅 exec 形态 | 2.81 MB（2,950,880 B） | 需 legacy packaging + 路径规范 |
 | 两形态都带 | 5.69 MB | 仅调试期（排障时 exec 形态可直接抓 stderr） |
 
-优化空间（未实施，列入 §10-R3）：裁掉 asmjit x86 后端（~200 KB）、`-ffunction-sections -Wl,--gc-sections`、`-flto`（预估可降到 ~2.0–2.3 MB）；`capstone` 仅 A64 已裁，`cJSON` 不可省（report）。
+优化空间（未实施，列入 §11-R3）：裁掉 asmjit x86 后端（~200 KB）、`-ffunction-sections -Wl,--gc-sections`、`-flto`（预估可降到 ~2.0–2.3 MB）；`capstone` 仅 A64 已裁，`cJSON` 不可省（report）。
 
 ---
 
-## 10. 风险与待决
+## 11. 风险与待决
 
 | # | 风险/待决 | 影响 | 建议 |
 |---|---|---|---|
@@ -657,7 +795,7 @@ magiskboot 来自 Magisk（**GPL-3.0**），我们以**独立可执行程序**�
 
 ---
 
-## 11. 验收门禁映射（lead 的 10 条 → 本文证据）
+## 12. 验收门禁映射（lead 的 10 条 → 本文证据）
 
 | 门禁 | 本文落点 |
 |---|---|
@@ -709,7 +847,7 @@ bash engine/android/verify_artifact.sh
 KERNEL_IMAGE=samples/gki-kernel-arm64.Image bash engine/android/verify_artifact.sh
 ```
 
-## 12. 许可证与合规（D-3）
+## 13. 许可证与合规（D-3）
 
 | 组件 | 位置 | 许可证 | 结论 |
 |---|---|---|---|
