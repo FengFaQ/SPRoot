@@ -18,16 +18,16 @@
   "apd": {
     "description": "SPRoot AP 守护（aarch64 PIE 可执行 ELF；部署时复制为 /data/adb/apd）",
     "artifact": "apd-aarch64-latest",
-    "run_id": 42817721471,
-    "file": "libapd-arm64.so",
+    "run_id": 43015986161,
+    "file": "libapd.so",
     "target": "libapd.so",
-    "sha256": "69a57bef432f3b2e1e7e6d93f1aafc1a44e7a76548c05597d79b24fb9a1d5836",
-    "size": 2154992,
-    "commit": "d6c9ecb69095ba8afd9690c476b4d0c1cf045fd3",
-    "version": "290e659",
+    "sha256": "9e900643093f786b82045c3546ca3e693725a053bf6db26c2ffec35bbc9b3adc",
+    "size": 2202072,
+    "commit": "19c19bb91784564e695811b66880863b02a14f59",
+    "version": "19c19bb",
     "extra_assets": {
-      "apd-version.txt": "3b024b1838fcd7f49c8d9d0ec1ec5f02585a11ed4f0508ac07d59c94b43e2790",
-      "apd-capabilities.txt": "2abb17a825e71c0cc22d6eb91b9a66eee7b008347f0f49d91b6f2412e37cc269"
+      "apd-version.txt": "6966754437c671458dcbab8754f1093f2dde0f26908b624fe76d9795c15c701a",
+      "apd-capabilities.txt": "8e63fe526e4e2046345dbe91cfde5844ad4e16dfe0eddebe0e414b3cb54c384d"
     }
   },
   "magiskboot": {
