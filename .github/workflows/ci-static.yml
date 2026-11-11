@@ -98,6 +98,22 @@ jobs:
           python3 quality/static/check_device_crash_regressions.py
           echo "check_device_crash_regressions.py PASS"
 
+      - name: check_ci_wiring.py (门禁接线自检)
+        run: |
+          set -e
+          # 本项目多次出现「门禁存在但从未跑」的静默失效：
+          #   verify_patch.py 只跑 --help 整整一代、apk.yml 漏 apd/assets/** 导致
+          #   模板更新后 APK 不重建、改门禁脚本不触发重跑。CI 全绿但门禁没执行。
+          # 本步骤校验：每个门禁都被调用、paths 含脚本路径、有自检的必须带 --self-test、
+          # ci-static 保持无 paths 兜底。
+          [ -f quality/static/check_ci_wiring.py ] || {
+            echo "::error::check_ci_wiring.py 缺失（门禁接线自检不可缺）"; exit 1; }
+          pip install --quiet pyyaml
+          # 先验本门禁四条判据自身有效（坏样本必须变红），再验真实接线
+          python3 quality/static/check_ci_wiring.py --self-test
+          python3 quality/static/check_ci_wiring.py
+          echo "check_ci_wiring.py PASS"
+
       - name: verify_patch.py --help (argparse 契约)
         run: |
           set -e
