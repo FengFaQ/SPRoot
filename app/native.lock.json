@@ -19,7 +19,7 @@
     "description": "SPRoot AP 守护（aarch64 PIE 可执行 ELF；部署时复制为 /data/adb/apd）",
     "artifact": "apd-aarch64-latest",
     "run_id": 43015986161,
-    "file": "libapd.so",
+    "file": "libapd-arm64.so",
     "target": "libapd.so",
     "sha256": "9e900643093f786b82045c3546ca3e693725a053bf6db26c2ffec35bbc9b3adc",
     "size": 2202072,
