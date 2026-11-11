@@ -1,0 +1,32 @@
+{
+  "self_test": {
+    "rc": 0,
+    "ok": true
+  },
+  "patch_audit": {
+    "rc": 0,
+    "ok": true,
+    "source": "blocking[]",
+    "detail": "0 blocking",
+    "attribution": {
+      "source": "hooks[]",
+      "declared_ranges": 19,
+      "attributed_regions": 9,
+      "unattributed_regions": 0,
+      "coverage": "9/9"
+    }
+  },
+  "driver_integrity": {
+    "rc": 0,
+    "ok": true,
+    "source": "blocking[]",
+    "detail": "0 blocking"
+  },
+  "boot": {
+    "rc": 0,
+    "ok": true,
+    "source": "comparison.regression",
+    "detail": "no regression",
+    "identical_behaviour": true
+  }
+}

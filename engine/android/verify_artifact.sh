@@ -229,6 +229,28 @@ if [[ -n "$QEMU" && -f "$EXEC" ]]; then
   GCNT="$(printf '%s\n' "$OUT_B" | grep -c '^GBREAK ' || true)"
   [[ "${GCNT:-0}" -ge 30 ]] && pass "A8b 规模 ${GCNT} 例（>=30，防 breakdown 用例被删）" \
                             || fail "A8b 规模仅 ${GCNT} 例（<30，疑似用例被删）"
+
+  # ---- A8c（XV-2 回归）：report 必须如实列出每一处改动，尤其是"真实函数入口" ----
+  # 缺陷现场：>=6.1 分支 shellcode 在 cave、真实函数入口在别处；旧 report 只记 cave，
+  # 入口被埋在 patches[1] 且键名采集器不认识 ⇒ 交叉验证出现"3 处未解释改动"。
+  # 这组断言锁死：入口成对记录 + 未归因必须显式列出（不许静默丢弃）。
+  if [[ "$OUT_B" == *"SITERESULT PASS"* ]]; then
+    pass "A8c 改动归因矩阵全绿（SITERESULT PASS）"
+  else
+    fail "A8c 改动归因矩阵失败：$(printf '%s\n' "$OUT_B" | grep -E 'FAIL$|SITERESULT' | head -5)"
+  fi
+  for scase in sites_count_covers_all entry_hook_count_3 all_entry_hooks_recorded \
+               patches_have_offset_alias no_unattributed_when_fully_grouped \
+               neg_missing_entry_goes_unattributed neg_unattributed_marks_entry_hook \
+               neg_dropped_group_becomes_unattributed \
+               cls_b_is_entry_hook cls_non_branch_not_entry cls_ret_is_ret_patch \
+               cls_multibyte_is_shellcode; do
+    if [[ "$OUT_B" == *"SITECASE $scase"*"PASS"* ]]; then
+      pass "A8c-[$scase]"
+    else
+      fail "A8c-[$scase] 用例缺失或未 PASS（改动归因断言被削弱成空断言）"
+    fi
+  done
 else
   echo "SKIP  A8 期望组数分支自检（需 qemu）"
 fi
@@ -482,6 +504,44 @@ if problems:
     print("; ".join(problems)); sys.exit(1)
 sys.exit(0)
 BDCHK
+    fi
+    # B8c（XV-2 回归 · 真机）：report 必须如实覆盖实测 diff 出来的每一处改动。
+    # 这是 lead 的 XV-2「未解释 3 处」在引擎 CI 侧的对偶断言：
+    #   ① all_patch_sites[] 必须存在且条数 == patch_sites_count
+    #   ② 每一处 entry_hook 都必须出现在某组 entry_hooks[]（成对地址，不许只记跳板）
+    #   ③ unattributed_patches[] 必须为**空**（有漏账就必须显式列出 → 这里直接判红）
+    # 注意：本步不重新 diff 镜像（Tier B 已有 B1/B11 的字节断言），只校验 report 自身
+    # 的记账完整性；真正的 diff-vs-report 交叉归因由 quality/crossverify 独立完成。
+    if [[ -f "$OUT.report.json" ]] && command -v python3 >/dev/null; then
+      python3 - "$OUT.report.json" <<'SITECHK' && pass "B8c 改动记账完整：all_patch_sites 覆盖全部写入，入口成对记录，无未归因" || fail "B8c report 漏记改动（审计者会以为'没记的就是没改' → 必须修引擎）"
+import json, sys
+r = json.load(open(sys.argv[1]))
+sites = r.get("all_patch_sites")
+if not isinstance(sites, list):
+    print("all_patch_sites 缺失"); sys.exit(1)
+cnt = r.get("patch_sites_count")
+if not isinstance(cnt, int) or cnt != len(sites):
+    print("patch_sites_count(%r) != len(all_patch_sites)=%d" % (cnt, len(sites))); sys.exit(1)
+# 每处 entry_hook 都必须能在某组 entry_hooks[] 里找到（成对地址）
+recorded = set()
+for h in r.get("hooks") or []:
+    for e in h.get("entry_hooks") or []:
+        po = e.get("patch_offset")
+        if isinstance(po, str):
+            recorded.add(po.lower())
+missing = [s.get("patch_offset") for s in sites
+           if s.get("role") == "entry_hook"
+           and str(s.get("patch_offset", "")).lower() not in recorded]
+if missing:
+    print("这些入口改写了但没进任何 entry_hooks[]: %s" % missing[:5]); sys.exit(1)
+un = r.get("unattributed_patches")
+if not isinstance(un, list):
+    print("unattributed_patches 字段缺失（无法判断是否漏账）"); sys.exit(1)
+if un:
+    print("存在未归因写入 %d 处: %s" % (len(un), [x.get("patch_offset") for x in un][:5]))
+    sys.exit(1)
+sys.exit(0)
+SITECHK
     fi
     if [[ -f "$OUT.report.json" ]] && command -v python3 >/dev/null; then
       python3 - "$OUT.report.json" "$KEY" <<'KEYCHK' && pass "B7 密钥自证：embed_key.new_bytes = 48 字节(key[:47]hex+\"00\")，key_spec 四字段自证" || fail "B7 密钥自证/key_spec 断言失败（47+NUL ABI 被破坏 → 提权会静默失败）"

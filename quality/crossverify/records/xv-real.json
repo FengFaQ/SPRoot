@@ -1,0 +1,179 @@
+{
+  "XV-1": {
+    "ok": true,
+    "regions": 20,
+    "bytes": 466,
+    "equal_length": true
+  },
+  "XV-2": {
+    "ok": true,
+    "declared": 54,
+    "attributed": 20,
+    "unexplained": 0,
+    "detail": [
+      {
+        "offset": "0x24bd4",
+        "len": 110,
+        "group": "do_execve",
+        "via": "addr-proximity"
+      },
+      {
+        "offset": "0x24c43",
+        "len": 63,
+        "group": "do_execve",
+        "via": "addr-proximity"
+      },
+      {
+        "offset": "0x24c83",
+        "len": 5,
+        "group": "do_execve",
+        "via": "addr-proximity"
+      },
+      {
+        "offset": "0x1c1720",
+        "len": 4,
+        "group": "audit_log_start",
+        "via": "addr-proximity"
+      },
+      {
+        "offset": "0x28f130",
+        "len": 2,
+        "group": "cfi_bypass",
+        "via": "addr-proximity"
+      },
+      {
+        "offset": "0x28f134",
+        "len": 5,
+        "group": "cfi_bypass",
+        "via": "addr-proximity"
+      },
+      {
+        "offset": "0x28f13a",
+        "len": 2,
+        "group": "cfi_bypass",
+        "via": "addr-proximity"
+      },
+      {
+        "offset": "0x38fcd4",
+        "len": 4,
+        "group": "do_execve",
+        "via": "branch-target"
+      },
+      {
+        "offset": "0x3a1d88",
+        "len": 4,
+        "group": "do_execve",
+        "via": "branch-target"
+      },
+      {
+        "offset": "0x3a276c",
+        "len": 4,
+        "group": "do_execve",
+        "via": "branch-target"
+      },
+      {
+        "offset": "0x5e1830",
+        "len": 4,
+        "group": "avc_denied",
+        "via": "addr-proximity"
+      },
+      {
+        "offset": "0x85dee8",
+        "len": 2,
+        "group": "drm_printfn_coredump",
+        "via": "addr-proximity"
+      },
+      {
+        "offset": "0x85deec",
+        "len": 30,
+        "group": "drm_printfn_coredump",
+        "via": "addr-proximity"
+      },
+      {
+        "offset": "0x85df0b",
+        "len": 34,
+        "group": "drm_printfn_coredump",
+        "via": "addr-proximity"
+      },
+      {
+        "offset": "0x85df2e",
+        "len": 50,
+        "group": "drm_printfn_coredump",
+        "via": "addr-proximity"
+      },
+      {
+        "offset": "0x85dfbc",
+        "len": 2,
+        "group": "drm_printfn_coredump",
+        "via": "addr-proximity"
+      },
+      {
+        "offset": "0x85dfc0",
+        "len": 18,
+        "group": "drm_printfn_coredump",
+        "via": "addr-proximity"
+      },
+      {
+        "offset": "0x85dfd3",
+        "len": 7,
+        "group": "drm_printfn_coredump",
+        "via": "addr-proximity"
+      },
+      {
+        "offset": "0x85dfdb",
+        "len": 7,
+        "group": "drm_printfn_coredump",
+        "via": "addr-proximity"
+      },
+      {
+        "offset": "0x85dfe3",
+        "len": 109,
+        "group": "drm_printfn_coredump",
+        "via": "addr-proximity"
+      }
+    ]
+  },
+  "XV-3": {
+    "ok": true,
+    "caves": [
+      {
+        "offset": "0x24bd4",
+        "len": 180,
+        "ok": true,
+        "detail": "4 个出口（b, tbz）"
+      },
+      {
+        "offset": "0x85dee8",
+        "len": 120,
+        "ok": true,
+        "detail": "5 个出口（b, ret）"
+      },
+      {
+        "offset": "0x85dfbc",
+        "len": 108,
+        "ok": true,
+        "detail": "3 个出口（ret）"
+      }
+    ]
+  },
+  "XV-4": {
+    "ok": true,
+    "image_size": 34603008,
+    "regions_beyond": 0
+  },
+  "XV-5": {
+    "ok": true,
+    "added": 0,
+    "removed": 0
+  },
+  "XV-6": {
+    "ok": null,
+    "kallsyms": {
+      "kallsyms_names": false,
+      "kallsyms_offsets": false,
+      "kallsyms_num_syms": false,
+      "kallsyms_token_table": false
+    },
+    "symbol_check_possible": false
+  }
+}

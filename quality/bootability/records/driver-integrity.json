@@ -1,0 +1,166 @@
+{
+  "symbols": {
+    "decoded": true,
+    "error": null,
+    "total": 119907,
+    "method": "names-only (addresses unavailable)",
+    "driver_related": 8103,
+    "address_mapping_available": true,
+    "address_source": "engine-log",
+    "addresses_resolved": 25
+  },
+  "engine_claimed_targets": [
+    "__cfi_check(family)",
+    "__drm_printfn_coredump",
+    "__drm_puts_coredump",
+    "audit_log_start",
+    "avc_denied",
+    "compat_filldir(core)",
+    "compat_filldir(jump)",
+    "compat_filldir(root_key_guide)",
+    "current_avc_check",
+    "do_execveat_common",
+    "filldir64(core)",
+    "filldir64(jump)",
+    "filldir64(root_key_guide)",
+    "root_key(47+NUL)"
+  ],
+  "unexpected_targets": [
+    "__cfi_check(family)",
+    "compat_filldir(core)",
+    "compat_filldir(jump)",
+    "compat_filldir(root_key_guide)",
+    "current_avc_check",
+    "filldir64(core)",
+    "filldir64(jump)",
+    "filldir64(root_key_guide)",
+    "root_key(47+NUL)"
+  ],
+  "changed_regions": 9,
+  "overlaps": [
+    {
+      "offset": "0x00024bd4",
+      "length": 180,
+      "symbol": "die",
+      "symbol_start": "0x00024bd4",
+      "symbol_size": 696,
+      "inside_symbol": true,
+      "subsystem": "non-driver",
+      "is_driver": false
+    },
+    {
+      "offset": "0x001c1720",
+      "length": 4,
+      "symbol": "audit_log_start",
+      "symbol_start": "0x001c171c",
+      "symbol_size": 996,
+      "inside_symbol": true,
+      "subsystem": "non-driver",
+      "is_driver": false
+    },
+    {
+      "offset": "0x0028f130",
+      "length": 12,
+      "symbol": "report_cfi_failure",
+      "symbol_start": "0x0028f130",
+      "symbol_size": 0,
+      "inside_symbol": false,
+      "subsystem": "non-driver",
+      "is_driver": false
+    },
+    {
+      "offset": "0x0038fcd4",
+      "length": 4,
+      "symbol": "do_execveat_common",
+      "symbol_start": "0x0038fcd0",
+      "symbol_size": 708,
+      "inside_symbol": true,
+      "subsystem": "non-driver",
+      "is_driver": false
+    },
+    {
+      "offset": "0x003a1d88",
+      "length": 4,
+      "symbol": "filldir64",
+      "symbol_start": "0x003a1d84",
+      "symbol_size": 1528,
+      "inside_symbol": true,
+      "subsystem": "non-driver",
+      "is_driver": false
+    },
+    {
+      "offset": "0x003a276c",
+      "length": 4,
+      "symbol": "compat_filldir",
+      "symbol_start": "0x003a2768",
+      "symbol_size": 1388,
+      "inside_symbol": true,
+      "subsystem": "non-driver",
+      "is_driver": false
+    },
+    {
+      "offset": "0x005e1830",
+      "length": 4,
+      "symbol": "avc_denied",
+      "symbol_start": "0x005e17b0",
+      "symbol_size": 132,
+      "inside_symbol": true,
+      "subsystem": "non-driver",
+      "is_driver": false
+    },
+    {
+      "offset": "0x0085dee8",
+      "length": 120,
+      "symbol": "__drm_puts_coredump",
+      "symbol_start": "0x0085dee8",
+      "symbol_size": 248,
+      "inside_symbol": true,
+      "subsystem": "display",
+      "is_driver": true
+    },
+    {
+      "offset": "0x0085dfbc",
+      "length": 148,
+      "symbol": "__drm_printfn_coredump",
+      "symbol_start": "0x0085dfbc",
+      "symbol_size": 248,
+      "inside_symbol": true,
+      "subsystem": "display",
+      "is_driver": true
+    }
+  ],
+  "blocking": [],
+  "warnings": [
+    "DI-2: engine patched `__cfi_check(family)` — not in the expected hook list; classified as non-driver",
+    "DI-2: engine patched `compat_filldir(core)` — not in the expected hook list; classified as non-driver",
+    "DI-2: engine patched `compat_filldir(jump)` — not in the expected hook list; classified as non-driver",
+    "DI-2: engine patched `compat_filldir(root_key_guide)` — not in the expected hook list; classified as non-driver",
+    "DI-2: engine patched `current_avc_check` — not in the expected hook list; classified as non-driver",
+    "DI-2: engine patched `filldir64(core)` — not in the expected hook list; classified as non-driver",
+    "DI-2: engine patched `filldir64(jump)` — not in the expected hook list; classified as non-driver",
+    "DI-2: engine patched `filldir64(root_key_guide)` — not in the expected hook list; classified as non-driver",
+    "DI-2: engine patched `root_key(47+NUL)` — not in the expected hook list; classified as non-driver"
+  ],
+  "sample_driver_symbols": [
+    "arch_remove_kprobe",
+    "trampoline_probe_handler",
+    "pm_domain",
+    "dev_pm_ops",
+    "device_driver",
+    "pm_message_t",
+    "pm_message",
+    "dl_dev_state",
+    "DL_DEV_NO_DRIVER",
+    "DL_DEV_PROBING",
+    "DL_DEV_DRIVER_BOUND",
+    "DL_DEV_UNBINDING",
+    "dev_pm_info",
+    "in_dpm_list",
+    "no_pm_callbacks",
+    "rpm_request",
+    "RPM_REQ_NONE",
+    "RPM_REQ_IDLE",
+    "RPM_REQ_SUSPEND",
+    "RPM_REQ_AUTOSUSPEND"
+  ]
+}

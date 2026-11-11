@@ -1,0 +1,130 @@
+{
+  "ok": true,
+  "rows": [
+    {
+      "id": "NEG-PA2-out-of-image",
+      "status": "PASS",
+      "msg": "PA-2 必须把跳出 Image 的 b 判为 blocking；实得 blocking=2"
+    },
+    {
+      "id": "NEG-PA2-oob",
+      "status": "PASS",
+      "msg": "PA-2 越界跳转必须 blocking"
+    },
+    {
+      "id": "POS-PA2-clean",
+      "status": "PASS",
+      "msg": "良好跳转不应产生 blocking；实得 blocking=[]"
+    },
+    {
+      "id": "NEG-PA3-data-over-code",
+      "status": "PASS",
+      "msg": "PA-3 必须识别数据覆盖代码；blocking=1"
+    },
+    {
+      "id": "POS-PA3-ascii-cave",
+      "status": "PASS",
+      "msg": "密钥字面量应被判为 ascii 而非 data：['new bytes look like: ascii (49/49 bytes are printable text)']"
+    },
+    {
+      "id": "POS-PA-identical",
+      "status": "PASS",
+      "msg": "相同镜像应报 0 处改动；实得 0"
+    },
+    {
+      "id": "NEG-PA0-no-report",
+      "status": "PASS",
+      "msg": "无 report 时 0 归属必须 blocking；实得 blocking=1"
+    },
+    {
+      "id": "NEG-PA0-legacy-report",
+      "status": "PASS",
+      "msg": "legacy hook_table:true 无 hooks[] 也必须 blocking"
+    },
+    {
+      "id": "POS-PA0-attributed",
+      "status": "PASS",
+      "msg": "带 hooks[] 的 report 应完成归属；实得 coverage=1/1"
+    },
+    {
+      "id": "POS-DI-expected",
+      "status": "PASS",
+      "msg": "预期 hook 不应 blocking；实得 []"
+    },
+    {
+      "id": "NEG-DI-driver-touched",
+      "status": "PASS",
+      "msg": "驱动符号被 patch 必须 blocking；实得 1"
+    },
+    {
+      "id": "NEG-DI-mapping-gap",
+      "status": "PASS",
+      "msg": "无地址映射时必须报 gap（而非静默 PASS）"
+    },
+    {
+      "id": "NEG-DI-symbol-tiebreak",
+      "status": "PASS",
+      "msg": "精确起点必须优先；实得 __drm_printfn_coredump"
+    },
+    {
+      "id": "POS-DI-logparse",
+      "status": "PASS",
+      "msg": "引擎日志解析应区分有/无 size 行；实得 {'do_execveat_common': (3734736, 708), 'avc_denied': (6166448, 132), 'report_cfi_failure': (2683184, 0)}"
+    },
+    {
+      "id": "POS-BOOT-same",
+      "status": "PASS",
+      "msg": "表现一致应判 NO_REGRESSION；实得 NO_REGRESSION"
+    },
+    {
+      "id": "NEG-BOOT-earlier-death",
+      "status": "PASS",
+      "msg": "patched 更早失败必须判 REGRESSION；实得 REGRESSION"
+    },
+    {
+      "id": "NEG-BOOT-silence",
+      "status": "PASS",
+      "msg": "patched 完全无输出必须判 REGRESSION；实得 REGRESSION"
+    },
+    {
+      "id": "NEG-BOOT-l3-false-positive",
+      "status": "PASS",
+      "msg": "panic 回溯中的 kernel_init 不得算 L3；实得 L3=False depth=rootfs-mount-attempted"
+    },
+    {
+      "id": "POS-BOOT-l3-real",
+      "status": "PASS",
+      "msg": "真实 init 交接标记应满足 L3"
+    },
+    {
+      "id": "NEG-BOOT-L1-invalid",
+      "status": "PASS",
+      "msg": "无效镜像必须 L1=False"
+    },
+    {
+      "id": "NEG-BOOT-normalise-noise",
+      "status": "PASS",
+      "msg": "时间戳/RTC/栈深抖动必须被归一化；实得 diff=0 []"
+    },
+    {
+      "id": "NEG-BOOT-normalise-real-diff",
+      "status": "PASS",
+      "msg": "驱动 probe 行消失必须仍被检出；实得 diff=2"
+    },
+    {
+      "id": "POS-BOOT-multiset",
+      "status": "PASS",
+      "msg": "同行不同序应判内容集合相同；实得 order_diff=2 multiset=True"
+    },
+    {
+      "id": "NEG-BOOT-multiset-missing",
+      "status": "PASS",
+      "msg": "确实少一行时 multiset 必须不同，并列出 only_in_orig；实得 ['page_owner is disabled']"
+    },
+    {
+      "id": "NEG-BOOT-pid-kaslr",
+      "status": "PASS",
+      "msg": "PID 与 KASLR 偏移必须被归一化；实得 diff=0 []"
+    }
+  ]
+}

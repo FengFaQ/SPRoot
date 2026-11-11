@@ -457,10 +457,45 @@ fn foreach_active_module(f: impl FnMut(&Path) -> Result<()>) -> Result<()> {
     foreach_module(ModuleType::Active, f)
 }
 
+/// Apply every active module's `sepolicy.rule` (`magiskpolicy --live --apply`).
+///
+/// **Cost note (APD-4 ④-5).** Each iteration calls `get_policy_main`, which
+/// loads and parses the *entire* live SELinux policy (`SePolicy::from_file(
+/// "/sys/fs/selinux/policy")` — megabytes on a real device) even when the rule
+/// is one line. With N modules carrying rules that is N full policy parses, so
+/// this is an N× (not N²) but still expensive loop, and it runs inside
+/// `post-fs-data`, which now has a hard 90 s budget (APD-1).
+///
+/// The per-module loop is kept deliberately: applying rules independently means
+/// one module's malformed rule cannot block the others' policies, and merging
+/// them would require holding N rules against one parse. What is bounded here
+/// is the *time*: `deadline` (when supplied) caps the whole loop, and the
+/// remaining modules are skipped with a warning rather than silently running
+/// past the stage budget.
 pub fn load_sepolicy_rule() -> Result<()> {
+    load_sepolicy_rule_bounded(None)
+}
+
+/// [`load_sepolicy_rule`] with an optional deadline.
+///
+/// `None` = unbounded (the historic behaviour, used by non-boot callers).
+pub fn load_sepolicy_rule_bounded(deadline: Option<std::time::Instant>) -> Result<()> {
+    let mut skipped = 0usize;
+    let mut exhausted = false;
     foreach_active_module(|path| {
         let rule_file = path.join("sepolicy.rule");
         if !rule_file.exists() {
+            return Ok(());
+        }
+        if exhausted {
+            skipped += 1;
+            return Ok(());
+        }
+        if let Some(deadline) = deadline
+            && std::time::Instant::now() >= deadline
+        {
+            exhausted = true;
+            skipped += 1;
             return Ok(());
         }
 
@@ -474,11 +509,34 @@ pub fn load_sepolicy_rule() -> Result<()> {
 
         Ok(())
     })?;
+    if skipped > 0 {
+        warn!(
+            "[sepolicy] post-fs-data budget exhausted: skipped {skipped} module \
+             sepolicy.rule file(s) — they did NOT apply this boot. Boot proceeds."
+        );
+    }
 
     Ok(())
 }
 
 pub fn exec_script<T: AsRef<Path>>(path: T, wait: bool) -> Result<()> {
+    exec_script_bounded(path, wait, None)
+}
+
+/// Execute a module script, optionally under an explicit timeout.
+///
+/// `timeout` is the **stage-budget-aware** per-script bound computed by
+/// `event::StageBudget::timeout_for_script` (APD-1, 2026-11-11). `None` means
+/// "use the plain `SCRIPT_TIMEOUT_SECS`", which is what non-budgeted callers
+/// (`apd module action`, the services/boot-completed stages) want.
+///
+/// The caller decides the budget: this function never invents one, because only
+/// the stage knows how much of its wall-clock allowance is left.
+pub fn exec_script_bounded<T: AsRef<Path>>(
+    path: T,
+    wait: bool,
+    timeout: Option<Duration>,
+) -> Result<()> {
     info!("exec {}", path.as_ref().display());
 
     let is_module_script = path.as_ref().starts_with(defs::MODULE_DIR);
@@ -522,16 +580,21 @@ pub fn exec_script<T: AsRef<Path>>(path: T, wait: bool) -> Result<()> {
     // A module script runs inline with init's post-fs-data, so an unbounded
     // script is a boot hang. `wait_timeout` kills the whole process group (the
     // script is spawned as group leader above) after the per-script budget.
+    //
+    // APD-1: the bound is `min(SCRIPT_TIMEOUT_SECS, remaining stage budget)`
+    // when the caller supplies one — a 10-module stage can no longer take
+    // 10 × 60 s.
+    let effective = timeout.unwrap_or_else(|| Duration::from_secs(defs::SCRIPT_TIMEOUT_SECS));
     let result = if wait {
         let mut child = command
             .spawn()
             .map_err(|err| anyhow!("Failed to exec {}: {}", path.as_ref().display(), err))?;
-        match wait_timeout(&mut child, Duration::from_secs(defs::SCRIPT_TIMEOUT_SECS))? {
+        match wait_timeout(&mut child, effective)? {
             Some(_) => Ok(()),
             None => {
                 warn!(
-                    "script timed out after {}s, process group killed: {}",
-                    defs::SCRIPT_TIMEOUT_SECS,
+                    "script timed out after {:.1}s, process group killed: {}",
+                    effective.as_secs_f64(),
                     path.as_ref().display()
                 );
                 Ok(())
@@ -544,18 +607,40 @@ pub fn exec_script<T: AsRef<Path>>(path: T, wait: bool) -> Result<()> {
 }
 
 pub fn exec_stage_script(stage: &str, block: bool) -> Result<()> {
+    exec_stage_script_bounded(stage, block, |_| None)
+}
+
+/// Stage-script runner with a per-module timeout supplied by the caller.
+///
+/// `timeout_for` is invoked once per module (in iteration order) with the
+/// module path. Returning `None` means "use the default per-script budget";
+/// returning `Some(None)` is not expressible, so stages that need to *skip*
+/// remaining modules once the budget is gone must call this and decide before
+/// spawning — see `event::run_module_stage_bounded`.
+pub fn exec_stage_script_bounded<F>(stage: &str, block: bool, mut timeout_for: F) -> Result<()>
+where
+    F: FnMut(&Path) -> Option<Duration>,
+{
     foreach_active_module(|module| {
         let script_path = module.join(format!("{stage}.sh"));
         if !script_path.exists() {
             return Ok(());
         }
-
-        exec_script(&script_path, block)
+        let t = timeout_for(module);
+        exec_script_bounded(&script_path, block, t)
     })?;
     Ok(())
 }
 
 pub fn exec_common_scripts(dir: &str, wait: bool) -> Result<()> {
+    exec_common_scripts_bounded(dir, wait, |_| None)
+}
+
+/// Common-script runner with a per-script timeout supplied by the caller.
+pub fn exec_common_scripts_bounded<F>(dir: &str, wait: bool, mut timeout_for: F) -> Result<()>
+where
+    F: FnMut(&Path) -> Option<Duration>,
+{
     let script_dir = Path::new(defs::ADB_DIR).join(dir);
     if !script_dir.exists() {
         info!("{} not exists, skip", script_dir.display());
@@ -571,7 +656,8 @@ pub fn exec_common_scripts(dir: &str, wait: bool) -> Result<()> {
             continue;
         }
 
-        exec_script(path, wait)?;
+        let t = timeout_for(&path);
+        exec_script_bounded(path, wait, t)?;
     }
 
     Ok(())
@@ -762,6 +848,19 @@ fn _install_module_inner(zip: &str, quiet: bool) -> Result<()> {
     // unzip the image and move it to modules_update/<id> dir
     let file = fs::File::open(zip)?;
     let mut archive = zip::ZipArchive::new(file)?;
+    // APD-4 ④-4: re-validate the *extracted* archive before writing anything.
+    //
+    // `install_module_json` runs `inspect_module_zip` first, but that opens the
+    // zip by path and this line opens it again — a classic TOCTOU window in
+    // which the file can be swapped for a malicious one that passed inspection
+    // in name only. Re-checking here (on the very handle we are about to
+    // extract) closes it: the checks that matter (zip-slip / symlink escape /
+    // entry count) are cheap and run against the same inode we extract from.
+    //
+    // Non-bulk callers (`apd module install` without --json, lua) reach this
+    // function without any prior inspection at all, so this is not redundant
+    // for them either.
+    revalidate_archive_for_extraction(&mut archive).map_err(|e| anyhow!("{e}"))?;
     archive.extract(&_module_update_dir)?;
 
     say(quiet, "- Running module installer");
@@ -854,6 +953,74 @@ fn module_meta_from_dir(dir: &Path) -> Option<(String, i64)> {
 
 /// Pre-flight validation of a module zip: size caps, zip-slip/symlink rejection,
 /// `module.prop` required fields, uncompressed-size accounting.
+/// Why an entry name is unsafe to extract, or `None` when it is fine.
+///
+/// Extracted so the *inspection* pass and the *extraction* pass apply exactly
+/// the same rule (APD-4 ④-4). Duplicating this predicate is how the two passes
+/// drift apart and a file that fails inspection gets extracted anyway.
+fn unsafe_entry_reason(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    // zip-slip: absolute paths, backslashes (Windows separators), drive letters.
+    if name.starts_with('/') || name.starts_with('\\') || name.contains('\\') {
+        return Some(format!("unsafe absolute path: {name}"));
+    }
+    if name
+        .split('/')
+        .any(|c| c == ".." || c == "." || c.is_empty() && name.contains("//"))
+    {
+        return Some(format!("unsafe relative path: {name}"));
+    }
+    None
+}
+
+/// Re-run the safety checks on an already-open archive, immediately before
+/// extraction (APD-4 ④-4).
+///
+/// `inspect_module_zip` validates a zip it opened **by path**; the extraction
+/// code then opens it again. Between those two opens the file can be replaced
+/// (TOCTOU) — and for the non-`--json` install path no inspection happens at
+/// all. This runs the same predicates on the archive handle that is about to be
+/// extracted, so "checked" and "extracted" refer to the same bytes.
+///
+/// Deliberately re-checks only the *cheap, structural* properties (names,
+/// symlink bits, entry count, uncompressed total). Content-level checks
+/// (`module.prop` fields) stay in `inspect_module_zip` to avoid reading the
+/// archive twice.
+fn revalidate_archive_for_extraction<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> Result<()> {
+    if archive.len() > MAX_ZIP_ENTRIES {
+        bail!(
+            "zip has {} entries, over the {MAX_ZIP_ENTRIES} limit",
+            archive.len()
+        );
+    }
+    let mut uncompressed: u64 = 0;
+    for i in 0..archive.len() {
+        let entry = archive
+            .by_index_raw(i)
+            .with_context(|| format!("read entry #{i} during extraction re-check"))?;
+        let name = entry.name().to_string();
+        if let Some(reason) = unsafe_entry_reason(&name) {
+            bail!("refusing to extract: {reason}");
+        }
+        if let Some(mode) = entry.unix_mode()
+            && mode & 0o170000 == 0o120000
+        {
+            bail!("refusing to extract: symlink entry: {name}");
+        }
+        uncompressed = uncompressed.saturating_add(entry.size());
+        if uncompressed > MAX_UNCOMPRESSED_BYTES {
+            bail!(
+                "refusing to extract: uncompressed size over {MAX_UNCOMPRESSED_BYTES} B"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn inspect_module_zip(zip_path: &Path) -> Result<ModuleZipInfo, (i32, String)> {
     let meta = fs::metadata(zip_path)
         .map_err(|e| (EXIT_INPUT_MISSING, format!("zip not readable: {e}")))?;
@@ -891,15 +1058,11 @@ fn inspect_module_zip(zip_path: &Path) -> Result<ModuleZipInfo, (i32, String)> {
         if name.is_empty() {
             continue;
         }
-        // zip-slip: absolute paths, backslashes, `..` components.
-        if name.starts_with('/') || name.starts_with('\\') || name.contains('\\') {
-            return Err((EXIT_UNSAFE_ZIP, format!("unsafe absolute path: {name}")));
-        }
-        if name
-            .split('/')
-            .any(|c| c == ".." || c == "." || c.is_empty() && name.contains("//"))
-        {
-            return Err((EXIT_UNSAFE_ZIP, format!("unsafe relative path: {name}")));
+        // zip-slip / symlink / size accounting — the SAME predicate the
+        // extraction re-check uses (`unsafe_entry_reason`), so the two passes
+        // cannot drift apart (APD-4 ④-4).
+        if let Some(reason) = unsafe_entry_reason(&name) {
+            return Err((EXIT_UNSAFE_ZIP, reason));
         }
         // symlink entries could escape the module dir after extraction.
         if let Some(mode) = entry.unix_mode()
@@ -1884,3 +2047,143 @@ mod tests {
         );
     }
 }
+
+    // -----------------------------------------------------------------------
+    // APD-4 ④ regression guards (2026-11-11).
+    // -----------------------------------------------------------------------
+
+    /// ④-1: the timeout error code must still be 124, not 120 or 121.
+    /// This path was fixed earlier; the later task-19/20/21 changes touched
+    /// nearby code, so the mapping is re-asserted here.
+    #[test]
+    fn timeout_still_maps_to_124_after_later_changes() {
+        let err: anyhow::Error = ModuleError::Timeout {
+            secs: INSTALL_TIMEOUT_SECS,
+        }
+        .into();
+        assert_eq!(classify_install_error(&err), EXIT_TIMEOUT);
+        assert_eq!(EXIT_TIMEOUT, 124);
+        assert_ne!(EXIT_TIMEOUT, EXIT_SCRIPT_FAILED);
+        assert_ne!(EXIT_TIMEOUT, EXIT_IO_FAILED);
+    }
+
+    /// ④-1: classification must still be a *type* walk, not string matching.
+    /// A `ModuleError::Io` whose message screams "timeout"/"installer" must stay
+    /// 121 — the old matcher would have called it 120.
+    #[test]
+    fn classification_is_still_type_based_not_string_based() {
+        let misleading: anyhow::Error =
+            ModuleError::Io("module installer timeout exceeded, install failed".into()).into();
+        assert_eq!(classify_install_error(&misleading), EXIT_IO_FAILED);
+        assert_ne!(classify_install_error(&misleading), EXIT_TIMEOUT);
+        assert_ne!(classify_install_error(&misleading), EXIT_SCRIPT_FAILED);
+    }
+
+    /// ④-2: module scripts are spawned as process-group leaders, which is what
+    /// makes `kill(-pid)` able to reach their children. Assert the invariant the
+    /// timeout path depends on rather than the (untestable here) syscall.
+    #[test]
+    fn install_script_is_spawned_as_process_group_leader() {
+        // The source of truth is `exec_install_script`, which chains
+        // `.process_group(0)`. Verified structurally: if that call is removed,
+        // `wait_timeout`'s `kill(-pid)` only kills the shell and orphans the
+        // script's children. Documented here so the coupling is explicit.
+        let src = include_str!("module.rs");
+        assert!(
+            src.contains(".process_group(0)"),
+            "module scripts must be process-group leaders for kill(-pid) to work"
+        );
+        // And the killer must target the group, not just the pid.
+        let utils_src = include_str!("utils.rs");
+        assert!(
+            utils_src.contains("kill(-(pid as i32)"),
+            "wait_timeout must signal the process group"
+        );
+    }
+
+    /// ④-4: the extraction re-check must reject exactly the names inspection
+    /// rejects — one predicate, two call sites.
+    #[test]
+    fn unsafe_entry_reason_matches_zip_slip_rules() {
+        // Unsafe
+        for bad in [
+            "/etc/passwd",
+            "\\windows\\system32",
+            "a\\b",
+            "../escape",
+            "dir/../../escape",
+            "./relative",
+            "dir//double",
+        ] {
+            assert!(
+                unsafe_entry_reason(bad).is_some(),
+                "{bad:?} must be rejected"
+            );
+        }
+        // Safe
+        for ok in ["module.prop", "system/bin/app", "customize.sh", "a/b/c.txt"] {
+            assert!(
+                unsafe_entry_reason(ok).is_none(),
+                "{ok:?} must be allowed, got {:?}",
+                unsafe_entry_reason(ok)
+            );
+        }
+        // Empty is allowed (directory-ish entries are skipped by callers).
+        assert!(unsafe_entry_reason("").is_none());
+    }
+
+    /// ④-4: the reason string distinguishes the two failure classes, so logs can
+    /// tell an absolute-path attempt from a traversal attempt.
+    #[test]
+    fn unsafe_entry_reason_classifies_the_attack() {
+        let abs = unsafe_entry_reason("/etc/passwd").unwrap();
+        assert!(abs.contains("absolute"), "{abs}");
+        let rel = unsafe_entry_reason("../x").unwrap();
+        assert!(rel.contains("relative"), "{rel}");
+    }
+
+    /// ④-4: the extraction path must actually *call* the re-check.
+    ///
+    /// The pure-function tests above prove `unsafe_entry_reason` is correct, but
+    /// they stay green if `_install_module_inner` stops calling
+    /// `revalidate_archive_for_extraction` — the TOCTOU window would silently
+    /// reopen. This asserts the wiring itself, in the same spirit as the
+    /// process-group test: structural, because spawning a real hostile zip here
+    /// would need the whole install path.
+    #[test]
+    fn extraction_path_calls_the_revalidation() {
+        let src = include_str!("module.rs");
+        // The call must appear AFTER the archive is opened for extraction, and
+        // BEFORE `extract(`, i.e. it must actually sit in the gap it protects.
+        let open_at = src
+            .find("let mut archive = zip::ZipArchive::new(file)?;")
+            .expect("extraction must open the archive");
+        let revalidate_at = src
+            .find("revalidate_archive_for_extraction(&mut archive)")
+            .expect("TOCTOU re-check is missing from the extraction path");
+        let extract_at = src
+            .find("archive.extract(&_module_update_dir)?;")
+            .expect("extraction call");
+        assert!(
+            open_at < revalidate_at,
+            "re-check must run after the archive is opened"
+        );
+        assert!(
+            revalidate_at < extract_at,
+            "re-check must run BEFORE extracting (that is the TOCTOU window)"
+        );
+    }
+
+    /// ④-4: inspection and extraction must share one predicate. If a future edit
+    /// reintroduces a private copy of the zip-slip rule in `inspect_module_zip`,
+    /// the two can drift and a name rejected at inspection can still be
+    /// extracted.
+    #[test]
+    fn inspection_and_extraction_share_the_same_zip_slip_predicate() {
+        let src = include_str!("module.rs");
+        let uses = src.matches("unsafe_entry_reason(").count();
+        assert!(
+            uses >= 3,
+            "expected the definition plus two call sites (inspect + revalidate), found {uses}"
+        );
+    }

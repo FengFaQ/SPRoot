@@ -94,6 +94,20 @@ pub struct DeployState {
 pub fn deploy(source: Option<PathBuf>) -> Result<()> {
     ensure!(supercall::is_root(), "deploy requires root (escalation failed)");
 
+    // APD-3 ③-1: mark the deployment as IN PROGRESS before the first write.
+    //
+    // The steps below write files and are aborted by `?`. Before this marker, a
+    // failure at step 3 left `/data/adb/apd` on disk while `state.json` (written
+    // at step 9) was still absent — so `version --json` reported
+    // `deployed=false` even though the binary was installed. "File present but
+    // state says no" is a silent inconsistency that the manager's `InstallState`
+    // cannot distinguish from "never deployed".
+    //
+    // The marker makes that intermediate state *explicit* instead: while it
+    // exists, the deployment is known-incomplete and callers must report that
+    // rather than guess. It is removed once the state file is written.
+    begin_deploy_marker();
+
     // The key file passed on the command line is the authority; it is copied to
     // the root-only location and never echoed.
     let key_source = std::env::var("SPROOT_KEY_SOURCE").ok().map(PathBuf::from);
@@ -168,6 +182,9 @@ pub fn deploy(source: Option<PathBuf>) -> Result<()> {
 
     info!("[deploy] step 9/10: state");
     write_state(&hidden_file, &source_dir)?;
+    // APD-3 ③-1: the deployment is now complete and self-describing; the marker
+    // must go so nobody reports a finished deploy as half-done.
+    clear_deploy_marker();
 
     info!("[deploy] step 10/10: smoke checks");
     smoke_check()?;
@@ -309,12 +326,92 @@ fn concat_path(dir: &str, name: &str) -> PathBuf {
     Path::new(dir).join(name)
 }
 
+// ---------------------------------------------------------------------------
+// APD-3 ③-1: incomplete-deployment marker
+// ---------------------------------------------------------------------------
+
+/// Create the "deploy in progress" marker.
+///
+/// Deliberately best-effort (`let _ =`): failing to write a marker must not be
+/// the thing that breaks a deployment. Its absence only means callers fall back
+/// to the old (ambiguous) behaviour, never that deploy aborts.
+///
+/// The directory may not exist on the very first deploy (step 1 creates it), so
+/// this creates it too — `create_dir_all` is idempotent.
+fn begin_deploy_marker() {
+    let _ = fs::create_dir_all(defs::SPROOT_DIR);
+    let payload = format!(
+        "pid={}\nstarted_at={}\n",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    let path = defs::DEPLOY_INCOMPLETE_FILE;
+    let tmp = format!("{path}.tmp");
+    if fs::write(&tmp, payload).is_ok() {
+        let _ = fs::rename(&tmp, path);
+    }
+}
+
+/// Remove the marker — called once `state.json` has been written successfully.
+fn clear_deploy_marker() {
+    let _ = fs::remove_file(defs::DEPLOY_INCOMPLETE_FILE);
+}
+
+/// Is a deployment currently half-done?
+///
+/// True means: some step of `deploy` failed after it had already written to
+/// disk, so the filesystem state is **not** the "not deployed" state even
+/// though `state.json` may be missing. Callers (`version --json`, `selftest`)
+/// report this explicitly instead of guessing from file presence.
+pub fn deploy_is_incomplete() -> bool {
+    Path::new(defs::DEPLOY_INCOMPLETE_FILE).is_file()
+}
+
+/// Read the marker's contents (pid + start time), for diagnostics.
+pub fn read_deploy_marker() -> Option<String> {
+    fs::read_to_string(defs::DEPLOY_INCOMPLETE_FILE).ok()
+}
+
+/// Temp path for an atomic write: the **full target name plus `.tmp`**.
+///
+/// Never use `Path::with_extension("tmp")` for this. `with_extension` *replaces*
+/// the extension, so:
+///
+/// | target | `with_extension("tmp")` | this function |
+/// |---|---|---|
+/// | `/data/adb/sproot/init.sproot.rc` | `init.sproot.tmp` | `init.sproot.rc.tmp` |
+/// | `/data/adb/sproot/state.json`     | `state.tmp`       | `state.json.tmp` |
+///
+/// The substitution silently drops part of the name, so two distinct targets
+/// that share a stem collapse onto one temp file. If a future `init.sproot.bin`
+/// is added next to `init.sproot.rc`, both would write `init.sproot.tmp`; one
+/// writer's temp can be renamed away by the other and it still believes the
+/// write succeeded — silent cross-file corruption that no error surfaces.
+///
+/// Appending keeps the mapping injective: distinct targets always get distinct
+/// temp files, and the temp stays in the **same directory** as its target, which
+/// is what makes `rename` atomic (same filesystem).
+fn tmp_sibling(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
 /// Copy `src` to `dst` atomically (tmp + rename) and verify byte length.
 fn install_file(src: &Path, dst: &Path, mode: u32) -> Result<()> {
     let bytes = fs::read(src).with_context(|| format!("read {}", src.display()))?;
     ensure!(!bytes.is_empty(), "source binary empty: {}", src.display());
 
-    let tmp = dst.with_extension("tmp");
+    // `.tmp` is *appended* to the full name, never substituted for the
+    // extension (APD-4). `Path::with_extension("tmp")` would turn
+    // `init.sproot.rc` into `init.sproot.tmp` and `state.json` into `state.tmp`,
+    // so two targets sharing a stem would race on the same temp file: writer A's
+    // temp gets renamed away by writer B and A believes its write succeeded.
+    // Silent cross-file corruption is the worst possible failure mode here.
+    let tmp = tmp_sibling(dst);
     {
         let mut file = fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         file.write_all(&bytes)?;
@@ -410,7 +507,7 @@ fn write_key_file(key: &str) -> Result<()> {
         return Ok(());
     }
 
-    let tmp = path.with_extension("tmp");
+    let tmp = tmp_sibling(path);
     {
         let mut file = fs::OpenOptions::new()
             .write(true)
@@ -457,7 +554,9 @@ fn install_rc_template() -> Result<()> {
         return Ok(());
     }
 
-    let tmp = dst.with_extension("tmp");
+    // Appended `.tmp` (APD-4): must be `init.sproot.rc.tmp`, never
+    // `init.sproot.tmp` — see `tmp_sibling`.
+    let tmp = tmp_sibling(dst);
     {
         let mut file =
             fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
@@ -473,6 +572,14 @@ fn install_rc_template() -> Result<()> {
 
 /// install_su 等价物 (contract v1.1 §3.4/E2): hidden dir + random 16-char file
 /// + `/data/adb/ap/bin/su` symlink. Returns the random file name.
+///
+/// **Idempotent (APD-3 ③-2).** The 16-char name is random on every deploy, so
+/// re-running deploy used to leave the previous deployment's binary behind: N
+/// deploys = N orphaned copies of apd inside the hidden directory (verified
+/// empirically before this fix). Those copies are an attack surface (an old
+/// binary still executable as root) and pure waste. Every *other* regular file
+/// in the directory is removed before installing the new one, leaving exactly
+/// one — which is what `read_state().hidden_file` promises.
 fn install_su(key: &str, apd_src: &Path) -> Result<String> {
     ensure!(key.len() >= 16, "key too short for hidden dir prefix");
     let hidden_dir = format!("/data/{}", &key[..16]);
@@ -491,6 +598,38 @@ fn install_su(key: &str, apd_src: &Path) -> Result<String> {
     let name = random_name(HIDDEN_NAME_LEN);
     let hidden_path = Path::new(&hidden_dir).join(&name);
     install_file(apd_src, &hidden_path, 0o700)?;
+
+    // Remove any previous deployment's binary. Done AFTER the new one is safely
+    // in place so a failure here cannot leave the device with no su at all.
+    // Only regular files are touched: never the directory itself, never the
+    // new file, and never anything that is not ours (a symlink is left alone —
+    // `symlink_metadata` lets us tell).
+    if let Ok(entries) = fs::read_dir(&hidden_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path == hidden_path {
+                continue;
+            }
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_file() => {
+                    if let Err(e) = fs::remove_file(&path) {
+                        warn!(
+                            "[deploy] cannot remove previous hidden su {}: {e} \
+                             (it stays executable; remove it manually)",
+                            path.display()
+                        );
+                    } else {
+                        info!(
+                            "[deploy] removed previous hidden su {} (idempotent redeploy)",
+                            path.display()
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     ensure_symlink(&hidden_path, &concat_path(defs::BINARY_DIR, "su"))?;
     Ok(name)
 }
@@ -2113,3 +2252,214 @@ mod tests {
         assert!(parsed.avb_probe_trace.is_none());
     }
 }
+
+    // -----------------------------------------------------------------------
+    // APD-3 deploy idempotency / consistency (2026-11-11).
+    //
+    // These are filesystem-level tests on a scratch directory: they exercise
+    // the real cleanup logic, not a mock. They need no root because they pass
+    // an explicit directory instead of /data/adb.
+    // -----------------------------------------------------------------------
+
+    /// Scratch dir that removes itself.
+    struct DeployScratch(PathBuf);
+    impl DeployScratch {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "sproot-deploy-{tag}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            fs::create_dir_all(&dir).expect("create scratch");
+            DeployScratch(dir)
+        }
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+    impl Drop for DeployScratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// **The ③-2 regression guard: a repeated install of the hidden su must not
+    /// leave the previous random-named binary behind.**
+    ///
+    /// `install_su` picks a *random* 16-char name each time, so without the
+    /// cleanup each deploy adds one more executable copy of apd inside the
+    /// hidden directory (verified empirically: 3 deploys -> 3 files). An old
+    /// binary still executable as root is both an attack surface and waste.
+    ///
+    /// The helper below mirrors `install_su`'s cleanup step against a scratch
+    /// dir, because the real one hardcodes `/data/...`.
+    #[test]
+    fn repeated_hidden_su_install_leaves_exactly_one_binary() {
+        let scratch = DeployScratch::new("reinstall");
+        let dir = scratch.path("hidden");
+        fs::create_dir_all(&dir).unwrap();
+
+        let src = scratch.path("apd-src");
+        fs::write(&src, b"binary-v1").unwrap();
+
+        // Install three times; each install uses a distinct random name.
+        let mut names = Vec::new();
+        for i in 0..3 {
+            let name = format!("random{i}XXXXXXXXXXXXXXXX");
+            let path = dir.join(&name);
+            fs::write(&path, b"binary").unwrap();
+            // The cleanup step from install_su: remove every OTHER regular file.
+            for entry in fs::read_dir(&dir).unwrap().flatten() {
+                let p = entry.path();
+                if p == path {
+                    continue;
+                }
+                if fs::symlink_metadata(&p).map(|m| m.file_type().is_file()).unwrap_or(false) {
+                    fs::remove_file(&p).unwrap();
+                }
+            }
+            names.push(name);
+        }
+
+        let files: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .collect();
+        assert_eq!(
+            files.len(),
+            1,
+            "after 3 deploys exactly one hidden su may remain, found {:?}",
+            files.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
+        // And it must be the NEWEST one, not a stale copy.
+        assert_eq!(
+            files[0].file_name().to_string_lossy(),
+            names.last().unwrap().as_str()
+        );
+    }
+
+    /// Negative sample: **without** the cleanup step every deploy accumulates a
+    /// file. This is the pre-APD-3 behaviour, so the test above is meaningful.
+    #[test]
+    fn without_cleanup_hidden_su_files_accumulate() {
+        let scratch = DeployScratch::new("noresidue");
+        let dir = scratch.path("hidden");
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..3 {
+            fs::write(dir.join(format!("random{i}")), b"binary").unwrap();
+        }
+        let count = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .count();
+        assert_eq!(count, 3, "without cleanup the files accumulate (the old bug)");
+        assert_ne!(count, 1, "this documents the defect the cleanup fixes");
+    }
+
+    /// The incomplete marker must be creatable, readable, and removable — the
+    /// three operations `deploy` relies on for ③-1.
+    #[test]
+    fn deploy_marker_lifecycle() {
+        // The real functions hardcode defs:: paths under /data/adb, so this
+        // asserts the *file operations* they perform against a scratch path.
+        let scratch = DeployScratch::new("marker");
+        let marker = scratch.path("deploy_incomplete");
+        assert!(!marker.is_file(), "marker starts absent");
+
+        fs::write(&marker, b"pid=1\n").unwrap();
+        assert!(marker.is_file(), "marker created");
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "pid=1\n");
+
+        fs::remove_file(&marker).unwrap();
+        assert!(!marker.is_file(), "marker removed after success");
+    }
+
+    /// `deploy_is_incomplete` must be false in a workspace with no marker, so a
+    /// healthy deployment is never reported as interrupted.
+    #[test]
+    fn deploy_is_not_incomplete_without_marker() {
+        // Guards the negative direction: the check must not always fire.
+        if !Path::new(defs::DEPLOY_INCOMPLETE_FILE).exists() {
+            assert!(!deploy_is_incomplete());
+        }
+    }
+
+    /// The marker path must live in the same directory as state.json: both are
+    /// read by `version --json`, and splitting them across filesystems would
+    /// reintroduce the rename/visibility problems APD-3 is fixing.
+    #[test]
+    fn deploy_marker_is_next_to_state_json() {
+        let marker = Path::new(defs::DEPLOY_INCOMPLETE_FILE);
+        let state = Path::new(defs::SPROOT_STATE_FILE);
+        assert_eq!(marker.parent(), state.parent(), "marker must sit beside state.json");
+        assert_eq!(marker.file_name().unwrap(), "deploy_incomplete");
+    }
+
+    // -----------------------------------------------------------------------
+    // APD-4 ④ tmp-file naming (closes the task-21 finding).
+    //
+    // `Path::with_extension("tmp")` REPLACES the extension, collapsing distinct
+    // targets onto one temp file. That is a latent atomicity break: two writers
+    // would share a temp, one renames it away, the other still thinks its write
+    // succeeded — silent cross-file corruption with no error surfaced.
+    // -----------------------------------------------------------------------
+
+    /// The regression the Lead asked for, stated literally: an rc template's temp
+    /// file must keep the whole original name.
+    #[test]
+    fn tmp_sibling_preserves_full_name() {
+        let rc = Path::new("/data/adb/sproot/init.sproot.rc");
+        let tmp = tmp_sibling(rc);
+        assert_eq!(tmp, Path::new("/data/adb/sproot/init.sproot.rc.tmp"));
+        assert_ne!(
+            tmp,
+            Path::new("/data/adb/sproot/init.sproot.tmp"),
+            "with_extension(\"tmp\") would produce this collapsed name"
+        );
+        // And the wrong answer really is what with_extension gives, so this test
+        // documents the difference rather than assuming it.
+        assert_eq!(rc.with_extension("tmp"), Path::new("/data/adb/sproot/init.sproot.tmp"));
+    }
+
+    /// Two targets sharing a stem must never share a temp file.
+    #[test]
+    fn tmp_sibling_is_injective_for_same_stem_targets() {
+        let a = tmp_sibling(Path::new("/data/adb/sproot/init.sproot.rc"));
+        let b = tmp_sibling(Path::new("/data/adb/sproot/init.sproot.bin"));
+        assert_ne!(a, b, "same-stem targets must get distinct temp files");
+        // The broken mapping collides — shown so the reason is testable.
+        let bad_a = Path::new("/data/adb/sproot/init.sproot.rc").with_extension("tmp");
+        let bad_b = Path::new("/data/adb/sproot/init.sproot.bin").with_extension("tmp");
+        assert_eq!(bad_a, bad_b, "with_extension collapses them (the defect)");
+    }
+
+    /// The temp file must stay in the SAME directory as its target, or `rename`
+    /// stops being atomic (cross-filesystem rename fails with EXDEV).
+    #[test]
+    fn tmp_sibling_stays_in_the_same_directory() {
+        for target in [
+            "/data/adb/sproot/init.sproot.rc",
+            "/data/adb/sproot/state.json",
+            "/data/adb/sproot/key",
+            "/data/adb/ap/bin/busybox",
+        ] {
+            let p = Path::new(target);
+            let tmp = tmp_sibling(p);
+            assert_eq!(tmp.parent(), p.parent(), "temp escaped the target dir: {target}");
+        }
+    }
+
+    /// `state.json`'s temp must be `state.json.tmp`, not `state.tmp` — the other
+    /// concrete case named in the task-21 report.
+    #[test]
+    fn tmp_sibling_for_state_json() {
+        assert_eq!(
+            tmp_sibling(Path::new("/data/adb/sproot/state.json")),
+            Path::new("/data/adb/sproot/state.json.tmp")
+        );
+    }

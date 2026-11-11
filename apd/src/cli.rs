@@ -739,7 +739,27 @@ fn print_change(change: &auth_list::Change, json: bool) {
 
 fn print_version(json: bool) -> Result<()> {
     let state = deploy::read_state();
-    let deployed = state.is_some() && std::path::Path::new(defs::DAEMON_PATH).exists();
+    let binary_present = std::path::Path::new(defs::DAEMON_PATH).exists();
+    let deployed = state.is_some() && binary_present;
+    // APD-3 ③-1: expose the intermediate state instead of letting callers
+    // infer it. `deploy` writes the marker before its first write and removes it
+    // after state.json; while it exists, files may be present that state.json
+    // does not describe. Without this field a manager sees `deployed=false` and
+    // concludes "never deployed", which is wrong and unactionable.
+    let deploy_incomplete = deploy::deploy_is_incomplete();
+    // The three states must be distinguishable; "incomplete" wins over the
+    // simple presence check because it is the more specific fact.
+    let deploy_status = if deploy_incomplete {
+        "incomplete"
+    } else if deployed {
+        "deployed"
+    } else if binary_present {
+        // Binary on disk but no state.json and no marker: written by an older
+        // build that did not use markers. Still not a healthy deployment.
+        "inconsistent"
+    } else {
+        "not_deployed"
+    };
     // key_prefix_sha256 (contract §8.3): an integrity marker, never the key or
     // any fragment of it. Only computable when root can read the key file —
     // otherwise the field is null (the contract's "身份要求: 任意").
@@ -751,6 +771,9 @@ fn print_version(json: bool) -> Result<()> {
     if !json {
         println!("{} ({})", defs::VERSION_NAME.trim(), defs::VERSION_CODE.trim());
         println!("deployed: {deployed}");
+        if deploy_status != "deployed" && deploy_status != "not_deployed" {
+            println!("deploy_status: {deploy_status}");
+        }
         return Ok(());
     }
     let payload = serde_json::json!({
@@ -758,6 +781,10 @@ fn print_version(json: bool) -> Result<()> {
         "version_code": defs::VERSION_CODE.trim(),
         "commit": defs::VERSION_COMMIT.trim(),
         "deployed": deployed,
+        // APD-3 ③-1 (additive): deployed | incomplete | inconsistent | not_deployed
+        "deploy_status": deploy_status,
+        "deploy_incomplete": deploy_incomplete,
+        "deploy_marker": deploy::read_deploy_marker(),
         "key_prefix_sha256": key_prefix_sha256,
         "daemon_pid": daemon::daemon_pid(),
         "boot_stage_done": daemon::boot_stage_done(),

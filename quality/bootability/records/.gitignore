@@ -1,0 +1,12 @@
+# B0 记录目录。
+#
+# 保留：一次正式运行的规范化结果（脚本固定文件名，便于 diff/审计）
+#   patch-audit.json / driver-integrity.json / boot-qemu.json / self-test.json / summary.json
+#
+# 忽略：带时间戳的原始串口日志（几十 KB，属一次性取证，重跑即得）
+#   <stamp>-orig.log / <stamp>-patched.log 等
+# 需要留档时用 `git add -f`，但常规提交不携带大日志。
+*-orig.log
+*-patched.log
+*-orig.json
+*-patched.json

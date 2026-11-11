@@ -943,6 +943,155 @@ pub fn run(json: bool) -> Result<()> {
         sock_state,
     ));
 
+    // ---- deploy consistency (APD-3 ③-1) --------------------------------
+    //
+    // "File present but state says not deployed" must never be silent. Three
+    // facts are checked together, and any disagreement is reported rather than
+    // smoothed over:
+    //   binary present + state.json present  -> consistent ("deployed")
+    //   binary present + marker present      -> an interrupted deploy
+    //   binary present + neither             -> inconsistent (older build)
+    let deploy_consistency = {
+        let binary = Path::new(defs::DAEMON_PATH).exists();
+        let state_present = deploy::read_state().is_some();
+        let incomplete = deploy::deploy_is_incomplete();
+        if !deployed && !binary {
+            Check::pending("deploy_consistency", "first-boot self-check")
+        } else if incomplete {
+            Check::new(
+                "deploy_consistency",
+                false,
+                true,
+                format!(
+                    "a deploy was INTERRUPTED ({} present): files may be on disk that \
+                     state.json does not describe. Re-run deploy to finish, or undeploy to \
+                     clean up. NOT treated as deployed.",
+                    defs::DEPLOY_INCOMPLETE_FILE
+                ),
+            )
+        } else if binary && !state_present {
+            Check::new(
+                "deploy_consistency",
+                false,
+                true,
+                format!(
+                    "{} exists but {} is missing — the install is INCONSISTENT (written by \
+                     an older build, or state.json was deleted). Re-run deploy.",
+                    defs::DAEMON_PATH,
+                    defs::SPROOT_STATE_FILE
+                ),
+            )
+        } else {
+            Check::new(
+                "deploy_consistency",
+                state_present,
+                true,
+                format!(
+                    "binary={binary} state.json={state_present} marker={incomplete} \
+                     (consistent)"
+                ),
+            )
+        }
+    };
+    checks.push(deploy_consistency);
+
+    // ---- daemon subsystems (APD-2, 2026-11-11) ---------------------------
+    //
+    // The uid-listener and the auth socket are the daemon's two long-lived
+    // subsystems; before APD-2 they could die with one log line while every
+    // health check kept passing. The daemon now publishes its supervision state
+    // to `daemon_subsystems.json`, and this check reads it.
+    //
+    // Three outcomes, and "unknown" is never a pass:
+    //   * every subsystem `running`            -> ok
+    //   * any `gave_up`                        -> FAIL (critical): that subsystem
+    //     is down for the rest of the boot — su requests or list sync are dead
+    //   * no published state / daemon absent   -> unknown (not critical)
+    //
+    // A `restarting` subsystem is reported but not failed: it is recovering.
+    let subsystems_check = if !deployed {
+        Check::pending("daemon_subsystems", "first-boot self-check")
+    } else {
+        match daemon::read_subsystem_state() {
+            None => Check::unknown(
+                "daemon_subsystems",
+                format!(
+                    "unknown — the daemon has not published {} (it is not running, or this \
+                     is not a daemon-managed boot). NOT a pass: a missing snapshot cannot \
+                     distinguish \"healthy\" from \"never started\".",
+                    defs::DAEMON_SUBSYSTEM_STATE_FILE
+                ),
+            ),
+            Some(v) => {
+                let items = v
+                    .get("subsystems")
+                    .and_then(|s| s.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let mut down: Vec<String> = Vec::new();
+                let mut restarting: Vec<String> = Vec::new();
+                let mut summary: Vec<String> = Vec::new();
+                for it in &items {
+                    let name = it.get("name").and_then(|x| x.as_str()).unwrap_or("?");
+                    let state = it.get("state").and_then(|x| x.as_str()).unwrap_or("?");
+                    let restarts = it.get("restarts").and_then(|x| x.as_u64()).unwrap_or(0);
+                    summary.push(format!("{name}={state}(restarts={restarts})"));
+                    match state {
+                        "gave_up" => down.push(name.to_string()),
+                        "restarting" => restarting.push(name.to_string()),
+                        _ => {}
+                    }
+                }
+                let pid = v.get("pid").and_then(|x| x.as_u64());
+                let detail = format!(
+                    "{} (pid={:?}, source={})",
+                    if summary.is_empty() {
+                        "<no subsystems listed>".to_string()
+                    } else {
+                        summary.join(" ")
+                    },
+                    pid,
+                    defs::DAEMON_SUBSYSTEM_STATE_FILE
+                );
+                if !down.is_empty() {
+                    Check::new(
+                        "daemon_subsystems",
+                        false,
+                        true,
+                        format!(
+                            "{detail} — DOWN: {}. These gave up after {} restart attempt(s); \
+                             the daemon is running but degraded (su requests and/or app-install \
+                             list sync will not work).",
+                            down.join(", "),
+                            defs::SUBSYSTEM_MAX_RESTARTS
+                        ),
+                    )
+                } else if summary.is_empty() {
+                    // Published a file with no subsystem array: we cannot judge.
+                    Check::unknown(
+                        "daemon_subsystems",
+                        format!("unknown — {detail} carries no `subsystems` array. NOT a pass."),
+                    )
+                } else {
+                    Check::new(
+                        "daemon_subsystems",
+                        true,
+                        true,
+                        if restarting.is_empty() {
+                            format!("{detail} — both subsystems running")
+                        } else {
+                            format!(
+                                "{detail} — {} recovering (has restarted at least once)",
+                                restarting.join(", ")
+                            )
+                        },
+                    )
+                }
+            }
+        }
+    };
+    checks.push(subsystems_check);
+
     // ---- boot-loop guard -------------------------------------------------
     let boot_count = fs::read_to_string(defs::SPROOT_BOOT_COUNT_FILE)
         .ok()

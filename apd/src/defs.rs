@@ -63,6 +63,12 @@ pub const SPROOT_BOOT_COUNT_FILE: &str = concatcp!(SPROOT_DIR, "boot_count");
 /// Deployment state, machine readable, never contains the key or its prefix.
 pub const SPROOT_STATE_FILE: &str = concatcp!(SPROOT_DIR, "state.json");
 
+/// Marker written at the start of `deploy` and removed once `state.json` is in
+/// place (APD-3 ③-1). While it exists, a deployment was interrupted after it had
+/// already written files — the "binary present but state says not deployed"
+/// inconsistency. 0644: no secrets, and QA/`version --json` must read it.
+pub const DEPLOY_INCOMPLETE_FILE: &str = concatcp!(SPROOT_DIR, "deploy_incomplete");
+
 // ---------------------------------------------------------------------------
 // AVB audit (2026-11-10 S1 fix). The previous `avb_untouched` check wrote the
 // literal `"vbmeta_untouched"` into state.json and then compared it back to the
@@ -132,6 +138,14 @@ pub const ALLOW_LIST_LOCK_FILE: &str = concatcp!(WORKING_DIR, "allow_list.lock")
 /// Single-instance lock for the resident daemon (`apd daemon`).
 pub const DAEMON_LOCK_FILE: &str = concatcp!(WORKING_DIR, "daemon.lock");
 
+/// Subsystem health published by the daemon for out-of-process readers
+/// (`apd selftest` runs in a different process, so it cannot read the daemon's
+/// atomics). 0644 — contains state names and counters, never secrets.
+///
+/// Written by `daemon::publish_subsystem_state()`; absence means "not
+/// published", which `selftest` reports as `unknown`, never as a pass.
+pub const DAEMON_SUBSYSTEM_STATE_FILE: &str = concatcp!(WORKING_DIR, "daemon_subsystems.json");
+
 // ---------------------------------------------------------------------------
 // Three-state authorisation store + audit log (NEW-DOC-05 §13, 2026-11-10).
 // The legacy csv above stays on disk as the one-way **migration source**; the
@@ -183,6 +197,60 @@ pub const AUTH_SOCK_FILE: &str = concatcp!(BINARY_DIR, ".su.sock");
 /// scripts run inline with init's post-fs-data, so an unbounded script is a
 /// boot hang; the plan (NEW-DOC-05 §5.2/§5.5) requires a per-script budget.
 pub const SCRIPT_TIMEOUT_SECS: u64 = 60;
+
+/// **Whole-stage** budget for `post-fs-data`, seconds (APD-1, 2026-11-11).
+///
+/// A per-script timeout alone does not bound the stage: 10 modules that each
+/// hang for the full `SCRIPT_TIMEOUT_SECS` block boot for 10 minutes. The
+/// `init.sproot.rc` template runs `exec -- /data/adb/apd post-fs-data`, and
+/// `exec` is init's **blocking** primitive — init does not continue until apd
+/// returns. So the stage needs its own hard ceiling.
+///
+/// 90 s is chosen to be comfortably above a healthy boot (typical
+/// post-fs-data work is a few seconds) while staying well under the point where
+/// init/watchdog behaviour becomes unpredictable. When the budget runs out the
+/// remaining scripts are skipped with a warning — "some modules did not run" is
+/// strictly better than "the device did not boot".
+pub const POST_FS_DATA_BUDGET_SECS: u64 = 90;
+
+/// Timeout for the small `sh -c` housekeeping commands inside post-fs-data
+/// (log rotation, `.old.log` moves). These are filesystem operations that
+/// should complete in milliseconds; 10 s is already pathological. They used to
+/// run with a bare `.wait()` and no bound at all.
+pub const HOUSEKEEPING_TIMEOUT_SECS: u64 = 10;
+
+// ---------------------------------------------------------------------------
+// Daemon subsystem supervision (APD-2, 2026-11-11).
+//
+// The daemon hosts two long-lived subsystems in threads: the uid-listener
+// (keeps the allow list in sync with `/data/system/packages.list`) and the
+// authorisation socket (the ONLY entry point third-party apps have for
+// requesting root, contract v1.1 §3.2). Both used to log one line and die:
+// silent degradation — the daemon stayed "healthy" while su requests failed or
+// app installs stopped updating the authorisation table.
+//
+// The daemon therefore supervises them with **bounded** restarts and a visible
+// counter, so a permanently broken subsystem is reported rather than hidden.
+// ---------------------------------------------------------------------------
+
+/// Maximum automatic restarts for a crashed subsystem before giving up.
+///
+/// 3 is deliberately small: a subsystem that fails 4 times in a row is not
+/// transiently unlucky, it is broken, and a restart storm inside a boot-blocking
+/// service is worse than a reported failure. After this the daemon marks the
+/// subsystem `GaveUp` (visible in `selftest`) and stops trying.
+pub const SUBSYSTEM_MAX_RESTARTS: u32 = 3;
+
+/// Base backoff for subsystem restarts, seconds. Delay for attempt N is
+/// `BASE * 2^(N-1)` → 1 s, 2 s, 4 s (capped by [`SUBSYSTEM_MAX_BACKOFF_SECS`]).
+pub const SUBSYSTEM_RESTART_BASE_SECS: u64 = 1;
+
+/// Upper bound on a single backoff delay, seconds. Without this, a larger
+/// restart budget would produce delays long enough to outlive the boot.
+pub const SUBSYSTEM_MAX_BACKOFF_SECS: u64 = 8;
+
+/// How often the supervisor polls a subsystem's liveness, milliseconds.
+pub const SUBSYSTEM_WATCH_INTERVAL_MS: u64 = 250;
 
 /// Property polled by the daemon to detect boot completion (contract v1.1 §7:
 /// userspace event engine — the SK kernel has no event source).

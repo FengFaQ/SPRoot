@@ -314,6 +314,74 @@ static std::string launcher_reason_effective(const std::string& mode, bool enabl
     return "not_embedded (launcher mode=" + mode + " produced no blob)";
 }
 
+// ---------------------------------------------------------------- 改动地址分类（纯函数）
+// 背景（XV-2 暴露的真缺陷）：report 曾只给"每组首处落位" = vec_patch[g.first]，
+// 而多数组的 vec_patch 顺序是 [shellcode@cave, jump@真实函数入口, ...]：
+//   filldir64/compat_filldir/avc_denied/audit_log_start 的 patch_jump(入口,...) 排在
+//   shellcode 之后 ⇒ g.first 指向 **cave**，真实函数入口被埋在 patches[1..]。
+// 结果：审计者看到 14 组，但实测 diff 出 17 处函数入口改写，其中 3 处**无任何记录**。
+// 修复思路：把每个改动地址按"改了什么"显式分类，并保证**全集**可枚举、可对账。
+//   只做分类不做裁剪——任何一处 vec_patch 都必须落进某一类，绝不静默丢弃。
+enum class PatchRole {
+    CaveShellcode,   // 织入的 shellcode/数据块（写的是空区/cave，不属函数入口）
+    EntryHook,       // 把真实函数入口首指令改成 b（审计最关心的一类）
+    RetPatch,        // patch_ret_*：把函数首指令改成 ret（bypass 类）
+    DataPatch,       // 纯数据写入（如 47+NUL 密钥、跳板数据区）
+};
+
+// 判断某处写入是不是"函数入口被改成跳转"：长度为 4 且新字节是一条 b/b.<cond> 指令。
+// AArch64 分支指令编码：bits[31:26]=0b000101（b）或 0b010101（b.cond）。
+static bool insn_is_branch(uint32_t insn) {
+    const uint32_t op = insn >> 26;
+    return op == 0x05u || op == 0x15u;   // 0b000101 / 0b010101
+}
+
+// 把 vec_patch 的大写 hex 串解成 32 位指令。
+// 注意字节序：hex 串是**按内存顺序**写的（bytes2hex 逐字节输出），
+// 所以前两个 hex 字符 = 最低地址字节 = 小端最低字节。不能用"整体当大端"读。
+static uint32_t hex_first_insn_le(const std::string& hex) {
+    if (hex.size() < 8) return 0;
+    auto nib = [](char c) -> uint32_t {
+        if (c >= '0' && c <= '9') return (uint32_t)(c - '0');
+        if (c >= 'A' && c <= 'F') return (uint32_t)(c - 'A' + 10);
+        if (c >= 'a' && c <= 'f') return (uint32_t)(c - 'a' + 10);
+        return 0;
+    };
+    uint32_t v = 0;
+    for (int byte_i = 0; byte_i < 4; ++byte_i) {
+        // 第 byte_i 个字节（内存序）由第 2*byte_i、2*byte_i+1 个 hex 字符组成
+        const uint32_t b = (nib(hex[2 * byte_i]) << 4) | nib(hex[2 * byte_i + 1]);
+        v |= b << (8 * byte_i);                  // 小端拼装
+    }
+    return v;
+}
+
+// 由写入字节与长度判定角色（**纯函数，只看这一处写入自身**）。
+// 刻意不依赖"从别处传进来的 cave 集合"：那种做法要靠调用方正确填充，
+// 一旦漏填就会把 shellcode 误判成入口 hook，反而制造新的假证据。
+// 判据全部来自这一处写入本身，因此对任何调用方都成立：
+//   ① 长度 != 4      → 一定是 shellcode/数据块（aarch64 单条指令恒 4 字节）
+//   ② 4 字节且是 b   → 入口被改成跳转（EntryHook）——这是审计最关心的一类
+//   ③ 4 字节且是 ret → bypass 类补丁（RetPatch）
+//   ④ 其余 4 字节    → 视为数据写入
+static PatchRole classify_patch(size_t /*addr*/, size_t len, const std::string& new_hex) {
+    if (len != 4) return PatchRole::CaveShellcode;   // 多字节块 = 织入的 shellcode/数据区
+    const uint32_t v = hex_first_insn_le(new_hex);
+    if (insn_is_branch(v)) return PatchRole::EntryHook;
+    if (v == 0xD65F03C0u /* ret */) return PatchRole::RetPatch;
+    return PatchRole::DataPatch;
+}
+
+static const char* patch_role_name(PatchRole r) {
+    switch (r) {
+        case PatchRole::CaveShellcode: return "cave_shellcode";
+        case PatchRole::EntryHook:     return "entry_hook";
+        case PatchRole::RetPatch:      return "ret_patch";
+        case PatchRole::DataPatch:     return "data_patch";
+    }
+    return "unknown";
+}
+
 // ---------------------------------------------------------------- 期望组数 breakdown（纯函数）
 // task-16：把「期望组数」从"一个数字"变成"可自解释的构成 + 具名证据"。
 // 序列化集中在此一处，build_report 与 --self-test-groups 共用，避免两边字段集漂移。
@@ -531,20 +599,33 @@ static J build_report(const EngineOptions& opt, const EngineState& st, const std
                      .set("bytes", 0);
                 } else {
                     h.set("resolved", true);
-                    const auto& first = st.groups.empty() ? g : g;
                     size_t off0 = 0, len0 = 0;
-                    // 首处落位（供 qa 快速核对；完整列表见 patches[]）
-                    (void)first;
                     J patches = J::array();
+                    J entry_hooks = J::array();   // 本组内"改写真实函数入口"的落位
                     for (size_t i = g.first; i < g.last; ++i) {
-                        size_t addr = st.patch_addrs[i];
-                        size_t len = st.patch_lens[i];
+                        const size_t addr = st.patch_addrs[i];
+                        const size_t len  = st.patch_lens[i];
+                        const std::string hexu = hex_lower(hex_of_str(st.patch_hex[i]));
+                        const PatchRole role = classify_patch(addr, len, st.patch_hex[i]);
                         if (off0 == 0) { off0 = addr; len0 = len; }
+                        char ah[32]; std::snprintf(ah, sizeof(ah), "0x%zx", addr);
                         J pj;
-                        pj.set("patch_offset", "0x" + [&]{ std::ostringstream o; o << std::hex << addr; return o.str(); }())
+                        pj.set("patch_offset", std::string(ah))
                           .set("orig_bytes", hex_of(st.orig_buf, addr, len))
-                          .set("new_bytes", hex_lower(hex_of_str(st.patch_hex[i])))
-                          .set("len", static_cast<long long>(len));
+                          .set("new_bytes", hexu)
+                          .set("len", static_cast<long long>(len))
+                          // 显式角色：让审计者不必猜这处是 shellcode、入口跳转还是 bypass
+                          .set("role", patch_role_name(role))
+                          // 兼容别名：XV-2 等外部工具按 offset/addr 收集地址，一并给出
+                          .set("offset", std::string(ah))
+                          .set("addr", std::string(ah));
+                        if (role == PatchRole::EntryHook) {
+                            J eh;
+                            eh.set("patch_offset", std::string(ah))
+                              .set("orig_bytes", hex_of(st.orig_buf, addr, len))
+                              .set("new_bytes", hexu);
+                            entry_hooks.push(std::move(eh));
+                        }
                         patches.push(std::move(pj));
                     }
                     char addr_hex[32]; std::snprintf(addr_hex, sizeof(addr_hex), "0x%zx", off0);
@@ -552,12 +633,21 @@ static J build_report(const EngineOptions& opt, const EngineState& st, const std
                     h.set("orig_bytes", hex_of(st.orig_buf, off0, len0));
                     h.set("new_bytes", hex_lower(hex_of_str(st.patch_hex[g.first])));
                     h.set("len", static_cast<long long>(len0));
-                    // C1 §2.3 术语别名（qa V 组按 hook_addr/trampoline/bytes 断言，与上面字段同源）：
-                    //   hook_addr = 该组首处补丁落位；trampoline = 作用/跳板地址（无则空串）；bytes = 首处字节数
-                    h.set("hook_addr", std::string(addr_hex));
+                    // ---- 地址语义（本次修复的核心，务必读清）----------------------------
+                    // 旧实现只有一个 patch_offset + 语义含混的 target_addr，导致审计者无法
+                    // 回答"原内核里哪个函数入口被改了"。现在明确区分两个**成对**地址：
+                    //   patched_site = 该组首处 vec_patch 的写入地址（多为 cave/shellcode 落位）
+                    //   entry_hooks[] = 该组内所有"把真实函数入口首指令改成 b"的地址全集
+                    // 二者可能相同（<6.1 分支 shellcode 就写在入口空区），也可能不同
+                    // （>=6.1 分支 shellcode 在 cave、入口在别处）——正因如此必须都记。
+                    h.set("hook_addr", std::string(addr_hex));   // 兼容既有 qa 断言：= patched_site
                     h.set("bytes", static_cast<long long>(len0));
+                    h.set("patched_site", std::string(addr_hex));
+                    // trampoline 语义澄清：= 本组 shellcode 入口（cave）地址；
+                    // 与"被改写的函数入口"是两回事，后者见 entry_hooks[]。
                     h.set("trampoline", g.target_addr ? [&]{ std::ostringstream t; t << "0x" << std::hex << g.target_addr; return t.str(); }()
                                                       : std::string(""));
+                    h.set("entry_hooks", std::move(entry_hooks));
                     h.set("patches", std::move(patches));
                 }
                 if (g.target_addr) {
@@ -586,6 +676,68 @@ static J build_report(const EngineOptions& opt, const EngineState& st, const std
             long long n = 0;
             for (auto& g : st.groups) if (g.last > g.first) ++n;
             return n;
+       }())
+       // ---- 改动全集（本次修复的关键：report 必须能回答"镜像到底改了哪几处"）--------
+       // all_patch_sites[] = vec_patch 里**每一处**写入的地址+角色，无遗漏、无去重丢失。
+       //   外部审计（如 quality/crossverify/xv.py 的 XV-2）拿它做 diff 归因，
+       //   就不会再出现"实测改了 17 处、report 只承认 14 处"的缺口。
+       // attribution = 全集是否都被 hooks[] 覆盖：
+       //   "complete"   每处都能在某个 hook 组的 patches[] 里找到（正常路径）
+       //   "incomplete" 有写入没被任何组覆盖 ⇒ 明细见 unattributed_patches[]（绝不静默丢弃）
+       .set("all_patch_sites", [&st]() -> J {
+           J arr = J::array();
+           for (size_t i = 0; i < st.patch_addrs.size(); ++i) {
+               const size_t addr = st.patch_addrs[i];
+               const size_t len  = i < st.patch_lens.size() ? st.patch_lens[i] : 0;
+               const std::string hexu = i < st.patch_hex.size()
+                   ? hex_lower(hex_of_str(st.patch_hex[i])) : std::string();
+               char ah[32]; std::snprintf(ah, sizeof(ah), "0x%zx", addr);
+               J o;
+               o.set("patch_offset", std::string(ah))
+                .set("offset", std::string(ah))            // xv.py 兼容别名
+                .set("len", static_cast<long long>(len))
+                .set("role", patch_role_name(classify_patch(addr, len,
+                          i < st.patch_hex.size() ? st.patch_hex[i] : std::string())))
+                .set("orig_bytes", hex_of(st.orig_buf, addr, len))
+                .set("new_bytes", hexu);
+               arr.push(std::move(o));
+           }
+           return arr;
+       }())
+       .set("patch_sites_count", static_cast<long long>(st.patch_addrs.size()))
+       .set("entry_hook_count", [&st]() -> long long {
+           long long n = 0;
+           for (size_t i = 0; i < st.patch_addrs.size(); ++i) {
+               const size_t len = i < st.patch_lens.size() ? st.patch_lens[i] : 0;
+               if (classify_patch(st.patch_addrs[i], len,
+                                  i < st.patch_hex.size() ? st.patch_hex[i] : std::string())
+                   == PatchRole::EntryHook) ++n;
+           }
+           return n;
+       }())
+       // 期望值：每组至少贡献一处写入；与实际 sites 数对照可发现"织入但未记账"。
+       .set("unattributed_patches", [&st]() -> J {
+           // 先把 hooks[] 覆盖到的下标标出来（各组的 [first,last) 区间并集）
+           std::vector<bool> covered(st.patch_addrs.size(), false);
+           for (const auto& g : st.groups)
+               for (size_t i = g.first; i < g.last && i < covered.size(); ++i) covered[i] = true;
+           J arr = J::array();
+           for (size_t i = 0; i < covered.size(); ++i) {
+               if (covered[i]) continue;                     // 已被某组记账
+               const size_t addr = st.patch_addrs[i];
+               const size_t len  = i < st.patch_lens.size() ? st.patch_lens[i] : 0;
+               char ah[32]; std::snprintf(ah, sizeof(ah), "0x%zx", addr);
+               J o;
+               o.set("patch_offset", std::string(ah))
+                .set("offset", std::string(ah))
+                .set("len", static_cast<long long>(len))
+                .set("role", patch_role_name(classify_patch(addr, len,
+                          i < st.patch_hex.size() ? st.patch_hex[i] : std::string())))
+                .set("reason", "写入落在所有 hook 组的 [first,last) 区间之外："
+                               "hooks[] 未记账，故在此显式列出（不静默丢弃）");
+               arr.push(std::move(o));
+           }
+           return arr;
        }())
        .set("hidden_dir_prefix", root_key.substr(0, 16))
        .set("errors", std::move(errors));
@@ -1209,6 +1361,147 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
             extra.set("breakdown_matrix", fails == 0 ? "PASS" : "FAIL")
                  .set("breakdown_cases", cases);
             if (fails != 0) {
+                emit_result(E_USAGE, std::move(extra));
+                if (g_ndjson.is_open()) g_ndjson.close();
+                return E_USAGE;
+            }
+
+            // ---- 地址记账矩阵（XV-2 缺陷回归）：report 必须如实列出每一处改动 ----
+            // 缺陷现场：>=6.1 分支里 shellcode 在 cave、真实函数入口在别处；
+            // 旧 report 只记 cave（patches[0]/patch_offset），入口被埋在 patches[1] 且
+            // 键名不被采集器认识 ⇒ 审计者以为"没记的就是没改"。这组用例锁死修复。
+            int afails = 0, acases = 0;
+            auto achk = [&](const char* name, bool ok) {
+                ++acases; if (!ok) ++afails;
+                std::cout << "SITECASE " << name << (ok ? " PASS" : " FAIL") << "\n";
+            };
+            // 用真实字节：lead 实测的三处入口 b 跳转 + 各自 cave shellcode
+            {
+                EngineOptions o; o.key_from_user = true;
+                EngineState s2; s2.branch_ge_6_1 = true;
+                s2.expected_breakdown = hook_groups_expected_breakdown(true, {}, false);
+                s2.orig_buf.assign(0x800000, 0); s2.file_buf = s2.orig_buf;
+                s2.patch_addrs = { 0x24bd4,  0x38fcd4,
+                                   0x85dee8, 0x3a1d88,
+                                   0x85dfbc, 0x3a276c };
+                s2.patch_hex   = { "AA",     "CC53F217",
+                                   "AA",     "BC0BF217",
+                                   "AA",     "4509F217" };
+                s2.patch_lens  = { 180, 4, 180, 4, 108, 4 };
+                s2.groups.push_back({ "do_execve",      "do_execveat_common",  0x24bd4,  0, 2 });
+                s2.groups.push_back({ "filldir64",      "filldir64(core)",     0x85dee8, 2, 4 });
+                s2.groups.push_back({ "compat_filldir", "compat_filldir(core)",0x85dfbc, 4, 6 });
+                J r2 = build_report(o, s2, std::string(48, 'A'));
+
+                // ① patch_sites_count 必须等于 vec_patch 总数（一处不漏）
+                achk("sites_count_covers_all",
+                     cJSON_GetObjectItem(r2.raw(), "patch_sites_count") &&
+                     static_cast<size_t>(cJSON_GetObjectItem(r2.raw(), "patch_sites_count")->valuedouble) ==
+                         s2.patch_addrs.size());
+                // ② entry_hook_count 必须 == 3（三处真实入口）
+                achk("entry_hook_count_3",
+                     cJSON_GetObjectItem(r2.raw(), "entry_hook_count") &&
+                     static_cast<int>(cJSON_GetObjectItem(r2.raw(), "entry_hook_count")->valuedouble) == 3);
+                // ③ 每个入口都必须出现在某组的 entry_hooks[] 里（成对地址）
+                {
+                    const char* want[] = { "0x38fcd4", "0x3a1d88", "0x3a276c" };
+                    cJSON* hooks = cJSON_GetObjectItem(r2.raw(), "hooks");
+                    bool all_found = true;
+                    for (const char* w : want) {
+                        bool found = false;
+                        const cJSON* hk = nullptr;
+                        cJSON_ArrayForEach(hk, hooks) {
+                            cJSON* ehs = cJSON_GetObjectItem(hk, "entry_hooks");
+                            const cJSON* e = nullptr;
+                            cJSON_ArrayForEach(e, ehs) {
+                                cJSON* po = cJSON_GetObjectItem(e, "patch_offset");
+                                if (po && cJSON_IsString(po) && std::string(po->valuestring) == w) found = true;
+                            }
+                        }
+                        if (!found) all_found = false;
+                    }
+                    achk("all_entry_hooks_recorded", all_found);
+                }
+                // ④ patches[] 每项都要能被外部按 offset/addr 收集到（xv.py 兼容）
+                {
+                    cJSON* hooks = cJSON_GetObjectItem(r2.raw(), "hooks");
+                    bool ok_compat = true;
+                    const cJSON* hk = nullptr;
+                    cJSON_ArrayForEach(hk, hooks) {
+                        cJSON* ps = cJSON_GetObjectItem(hk, "patches");
+                        const cJSON* p = nullptr;
+                        cJSON_ArrayForEach(p, ps) {
+                            if (!cJSON_GetObjectItem(p, "offset") || !cJSON_GetObjectItem(p, "addr"))
+                                ok_compat = false;
+                        }
+                    }
+                    achk("patches_have_offset_alias", ok_compat);
+                }
+                // ⑤ 正常路径不应有未归因写入
+                achk("no_unattributed_when_fully_grouped", [&]{
+                    cJSON* u = cJSON_GetObjectItem(r2.raw(), "unattributed_patches");
+                    return u && cJSON_IsArray(u) && cJSON_GetArraySize(u) == 0;
+                }());
+
+                // ---- 负样本：把某组区间改小，让一处写入"漏账" ----
+                // 期望：unattributed_patches 必须非空（显式列出），而不是静默丢掉。
+                {
+                    EngineState s3;   // EngineState 含 J（不可拷贝），故逐字段重建
+                    s3.branch_ge_6_1 = true;
+                    s3.expected_breakdown = s2.expected_breakdown;
+                    s3.orig_buf = s2.orig_buf; s3.file_buf = s2.file_buf;
+                    s3.patch_addrs = s2.patch_addrs;
+                    s3.patch_hex = s2.patch_hex;
+                    s3.patch_lens = s2.patch_lens;
+                    s3.groups = s2.groups;
+                    s3.groups[1].last = s3.groups[1].first + 1;  // filldir64 只记 cave，漏掉入口
+                    J r3 = build_report(o, s3, std::string(48, 'A'));
+                    cJSON* u = cJSON_GetObjectItem(r3.raw(), "unattributed_patches");
+                    achk("neg_missing_entry_goes_unattributed",
+                         u && cJSON_IsArray(u) && cJSON_GetArraySize(u) >= 1);
+                    // 且漏账那处必须被如实标成 entry_hook 角色（而不是含糊的 data_patch）
+                    bool role_ok = false;
+                    const cJSON* it = nullptr;
+                    cJSON_ArrayForEach(it, u) {
+                        cJSON* ro = cJSON_GetObjectItem(it, "role");
+                        cJSON* po = cJSON_GetObjectItem(it, "patch_offset");
+                        if (ro && po && std::string(ro->valuestring) == "entry_hook" &&
+                            std::string(po->valuestring) == "0x3a1d88") role_ok = true;
+                    }
+                    achk("neg_unattributed_marks_entry_hook", role_ok);
+                }
+                // ---- 负样本：整组丢失（模拟"织入了但完全没记账"）----
+                {
+                    EngineState s4;
+                    s4.branch_ge_6_1 = true;
+                    s4.expected_breakdown = s2.expected_breakdown;
+                    s4.orig_buf = s2.orig_buf; s4.file_buf = s2.file_buf;
+                    s4.patch_addrs = s2.patch_addrs;
+                    s4.patch_hex = s2.patch_hex;
+                    s4.patch_lens = s2.patch_lens;
+                    s4.groups = s2.groups;
+                    s4.groups.pop_back();          // 整个 compat_filldir 组消失
+                    J r4 = build_report(o, s4, std::string(48, 'A'));
+                    cJSON* u = cJSON_GetObjectItem(r4.raw(), "unattributed_patches");
+                    achk("neg_dropped_group_becomes_unattributed",
+                         u && cJSON_IsArray(u) && cJSON_GetArraySize(u) >= 2);
+                }
+                // ---- 负样本：分类器必须区分 b 跳转 vs 普通 4 字节写 ----
+                // 若把 is_branch 判定写坏（恒真/恒假），这两个用例必须翻。
+                achk("cls_b_is_entry_hook",
+                     classify_patch(0, 4, "CC53F217") == PatchRole::EntryHook);
+                achk("cls_non_branch_not_entry",
+                     classify_patch(0, 4, "1F2003D5") != PatchRole::EntryHook);   // nop
+                achk("cls_ret_is_ret_patch",
+                     classify_patch(0, 4, "C0035FD6") == PatchRole::RetPatch);
+                achk("cls_multibyte_is_shellcode",
+                     classify_patch(0, 180, "AA") == PatchRole::CaveShellcode);
+            }
+            std::cout << "SITERESULT " << (afails == 0 ? "PASS" : "FAIL")
+                      << " " << (acases - afails) << "/" << acases << " cases\n";
+            extra.set("attribution_matrix", afails == 0 ? "PASS" : "FAIL")
+                 .set("attribution_cases", acases);
+            if (afails != 0) {
                 emit_result(E_USAGE, std::move(extra));
                 if (g_ndjson.is_open()) g_ndjson.close();
                 return E_USAGE;
