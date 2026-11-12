@@ -115,6 +115,7 @@ python3 "$REPO/quality/crossverify/xv.py" \
 XV_RC=$?
 
 echo "=== 6. 第一套验证（bootability，若存在）==="
+BOOT_RC=""
 if [ -f "$REPO/quality/bootability/patch_audit.py" ]; then
   mkdir -p "$OUT/bootability"
   python3 "$REPO/quality/bootability/patch_audit.py" \
@@ -124,17 +125,37 @@ if [ -f "$REPO/quality/bootability/patch_audit.py" ]; then
   python3 "$REPO/quality/bootability/driver_integrity.py" \
     --orig "$OUT/kernel.orig" --patched "$OUT/kernel.patched" \
     --json "$OUT/bootability/driver-integrity.json" 2>&1 | tail -5
+  python3 "$REPO/quality/bootability/boot_qemu.py" \
+    --orig "$OUT/kernel.orig" --patched "$OUT/kernel.patched" \
+    --record-dir "$OUT/bootability" --json "$OUT/bootability/boot-qemu.json" \
+    > "$OUT/bootability/boot-qemu.txt" 2>&1
+  BOOT_RC=$?
+  [ "$BOOT_RC" -eq 3 ] && BOOT_RC=""   # 3 = qemu 不可用（infeasible，不参与仲裁）
 else
   echo "   SKIP: quality/bootability 不存在"
 fi
 
+# ── BUG-QA-4 仲裁：两套体系结论冲突时不得各说各话 ─────────────────────
+# 规则：任一 FAIL 即整体 FAIL（以更严格的一套为准），但必须显式输出
+# CONFLICT 行让人工知道两套结论不一致、具体差异在哪套。
+if [ -n "$BOOT_RC" ] && [ "$BOOT_RC" -ne "$XV_RC" ]; then
+  echo ""
+  echo "CONFLICT: bootability=$BOOT_RC crossverify=$XV_RC"
+  echo "  （两套独立体系结论不一致；按更严格的一套判定，差异明细见"
+  echo "    $OUT/bootability/ 与 $OUT/xv.json，需人工归因）"
+  echo "CONFLICT: bootability=$BOOT_RC crossverify=$XV_RC" > "$OUT/CONFLICT.txt"
+  FINAL_RC=$(( XV_RC == 0 ? BOOT_RC : XV_RC ))
+else
+  FINAL_RC="$XV_RC"
+fi
+
 echo ""
 echo "=============================================================="
-if [ "$XV_RC" -eq 0 ]; then
-  echo "结论：crossverify 全部 PASS"
+if [ "$FINAL_RC" -eq 0 ]; then
+  echo "结论：两套验证均 PASS（或仅一套可执行且 PASS）"
 else
-  echo "结论：crossverify 有 FAIL —— 见上方明细与 $OUT/xv.json"
+  echo "结论：验证 FAIL（rc=$FINAL_RC）—— 见上方明细与 $OUT/xv.json"
 fi
 echo "工作目录：$OUT"
 echo "=============================================================="
-exit "$XV_RC"
+exit "$FINAL_RC"

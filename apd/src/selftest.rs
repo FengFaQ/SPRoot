@@ -908,15 +908,17 @@ pub fn run(json: bool) -> Result<()> {
     // ---- daemon + socket -------------------------------------------------
     let mut daemon_alive = false;
     if deployed {
-        let pid = daemon::daemon_pid();
-        daemon_alive = pid
-            .map(|p| Path::new(&format!("/proc/{p}")).exists())
-            .unwrap_or(false);
+        // BUG-APD-9 fix (2026-11-12): the lock-file pid alone cannot prove the
+        // daemon is alive — after a reboot the pid may have been reused by an
+        // unrelated process, making `alive=true` (and summary `daemon_ready`) a
+        // lie. `running_daemon_pid()` additionally verifies the /proc cmdline
+        // really is `apd daemon` (same standard the rc_started check uses).
+        daemon_alive = running_daemon_pid().is_some();
         checks.push(Check::new(
             "daemon",
             daemon_alive,
             false,
-            format!("pid={pid:?} alive={daemon_alive}"),
+            format!("pid={:?} alive={daemon_alive}", daemon::daemon_pid()),
         ));
     } else {
         checks.push(Check::pending("daemon", "first-boot self-check"));

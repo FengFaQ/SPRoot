@@ -42,6 +42,16 @@
       "msg": "legacy hook_table:true 无 hooks[] 也必须 blocking"
     },
     {
+      "id": "NEG-PA0-low-coverage",
+      "status": "PASS",
+      "msg": "coverage 25%（1/4）< 50% 阈值必须 blocking；实得 coverage=0.25, blocking=1"
+    },
+    {
+      "id": "POS-PA0-branch-target",
+      "status": "PASS",
+      "msg": "入口 trampoline b→声明函数体内必须归属；实得 group=do_execve, notes=['attributed via branch-target 0x1004 ∈ [0x1000,0x1040)']"
+    },
+    {
       "id": "POS-PA0-attributed",
       "status": "PASS",
       "msg": "带 hooks[] 的 report 应完成归属；实得 coverage=1/1"

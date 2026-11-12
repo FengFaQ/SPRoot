@@ -75,12 +75,48 @@ jobs:
             echo "OK $3 sha256=$got size=$size（与 native.lock.json 一致）"
           }
 
+          # BUG-QA-11（2026-11-12 审计）：lock 表里每个 extra_assets 都记了
+          # 独立 sha256，但旧代码只拷贝不校验 —— artifact 内的 META/版本/能力
+          # 清单若内容漂移（同名 run 重发、上游改名后错位），会被原样打进 APK
+          # 而无任何断言拦截。现在逐个 sha256 比对 lock 表：缺失或漂移 → error。
+          # 消费 lock 表里的 extra_assets（键=文件名，值=sha256），不再手抄清单。
+          verify_extra_assets() { # $1=component (engine|apd|magiskboot) $2=artifact dir
+            comp="$1"; dir="$2"
+            # 注意：heredoc 内容整体缩进到与 workflow run 块同级（10 空格），
+            # PYEOF 终止符也带同样缩进 —— 顶格写会提前终止 YAML block scalar
+            # （正是上次 433 行 PYEOF 步的写法）。
+            python3 - "$LOCK" "$comp" "$dir" <<'PY'
+          import hashlib, json, os, sys
+          lock, comp, d = sys.argv[1], sys.argv[2], sys.argv[3]
+          extra = json.load(open(lock)).get(comp, {}).get("extra_assets") or {}
+          if not extra:
+              print("  (%s: lock 表无 extra_assets，跳过)" % comp)
+              sys.exit(0)
+          bad = 0
+          for name, want in sorted(extra.items()):
+              p = os.path.join(d, name)
+              if not os.path.isfile(p):
+                  print("::error::%s extra_assets 缺文件: %s（lock 表已锁定其 sha256）" % (comp, name))
+                  bad += 1
+                  continue
+              got = hashlib.sha256(open(p, "rb").read()).hexdigest()
+              if got != want:
+                  print("::error::%s extra_assets sha256 漂移: %s 锁定=%s 实际=%s（artifact 内容与被锁定 run 不一致，禁止出包）"
+                        % (comp, name, want[:16], got[:16]))
+                  bad += 1
+              else:
+                  print("OK %s extra_assets %s sha256=%s" % (comp, name, got[:16]))
+          sys.exit(1 if bad else 0)
+          PY
+          }
+
           # ---- engine (JNI) ----
           E=/tmp/pin-engine
           fetch_run_artifact "$(lock engine run_id)" "$(lock engine artifact)" "$E"
           verify_file "$E/$(lock engine file)" "$(lock engine sha256)" "engine JNI"
           cp -f "$E/$(lock engine file)" "$DEST/$(lock engine target)"
-          # 校验材料随包
+          verify_extra_assets engine "$E"
+          # 校验材料随包（sha256 已在上面按 lock 表验证过）
           for m in ENGINE-META.txt SYMBOLS-libskrootpatch.txt SHA256SUMS; do
             [ -f "$E/$m" ] && cp -f "$E/$m" "$ASSETS/$m" || echo "::warning::engine artifact 缺 $m"
           done
@@ -90,6 +126,7 @@ jobs:
           fetch_run_artifact "$(lock apd run_id)" "$(lock apd artifact)" "$A"
           verify_file "$A/$(lock apd file)" "$(lock apd sha256)" "apd"
           cp -f "$A/$(lock apd file)" "$DEST/$(lock apd target)"
+          verify_extra_assets apd "$A"
           for m in apd-version.txt apd-capabilities.txt; do
             [ -f "$A/$m" ] && cp -f "$A/$m" "$ASSETS/$m" || echo "::warning::apd artifact 缺 $m"
           done
@@ -99,6 +136,7 @@ jobs:
           fetch_run_artifact "$(lock magiskboot run_id)" "$(lock magiskboot artifact)" "$M"
           verify_file "$M/$(lock magiskboot file)" "$(lock magiskboot sha256)" "magiskboot"
           cp -f "$M/$(lock magiskboot file)" "$DEST/$(lock magiskboot target)"
+          verify_extra_assets magiskboot "$M"
           [ -f "$M/magiskboot-meta.txt" ] && cp -f "$M/magiskboot-meta.txt" "$ASSETS/magiskboot-meta.txt"
 
           echo "--- jniLibs ---"; ls -la "$DEST"

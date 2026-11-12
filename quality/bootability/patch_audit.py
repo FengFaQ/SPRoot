@@ -236,15 +236,50 @@ def audit(orig: bytes, patched: bytes, report: dict | None) -> dict:
 
     declared, attribution_source = _declared_ranges(report)
 
+def _branch_targets(f: Finding) -> list[int]:
+    """收集该 finding 新字节里全部 b/bl 的绝对目标地址。"""
+    out = []
+    for b in f.branches:
+        out.append(int(b["target"], 16))
+    return out
+
+
+def audit(orig: bytes, patched: bytes, report: dict | None) -> dict:
+    """Run all PA checks; return a machine-readable result dict."""
+    if len(orig) != len(patched):
+        raise ValueError(f"length mismatch: {len(orig)} vs {len(patched)}")
+
+    img = common.parse_arm64_image(orig)
+    runs = common.runs_of(orig, patched, max_merge_gap=8)
+
+    declared, attribution_source = _declared_ranges(report)
+
     findings = [Finding(s, e, orig[s:e], patched[s:e]) for s, e in runs]
     for f in findings:
         analyse_branches(f, len(orig))
 
         # Attribute to a declared engine group when possible.
+        #   路径 A（区间重叠）：改动落在引擎声明的补丁区间内。
+        #   路径 B（BUG-QA-10，2026-11-12）：改动区里某条 b/bl 的目标落进
+        #   某个声明区间 —— 引擎把 hook 函数体整体声明为 patch 区间，
+        #   入口 trampoline 跳回函数中段是合法形态（实测 0x38fcd4 → 0x24c04
+        #   ∈ do_execve [0x24bd4,0x24c78)），只走 A 会把这类入口改动判成
+        #   未解释，与 crossverify 的 branch-target 判法不对称。
         for grp, ds, de in declared:
             if f.start < de and f.end > ds:
                 f.group = grp
+                f.notes.append(f"attributed via region-overlap [{ds:#x},{de:#x})")
                 break
+        if f.group is None:
+            for tgt in _branch_targets(f):
+                hit = next(((grp, ds, de) for grp, ds, de in declared
+                            if ds <= tgt < de), None)
+                if hit:
+                    f.group = hit[0]
+                    f.notes.append(
+                        f"attributed via branch-target 0x{tgt:x} ∈ "
+                        f"[{hit[1]:#x},{hit[2]:#x})")
+                    break
 
         # PA-3: what did the patch actually write here? A literal (the embedded
         # key) is legitimate *inside a cave*; a literal written straight over
@@ -278,35 +313,42 @@ def audit(orig: bytes, patched: bytes, report: dict | None) -> dict:
     attributed = sum(1 for f in findings if f.group)
 
     # ------------------------------------------------------------------
-    # PA-0: "attributed nothing" must never pass.
+    # PA-0: attribution coverage must never be "mostly nothing".
     #
     # A real run once reported `attributed_regions: 0 / unattributed: 9` and
     # still returned PASS, because `--report` had not been passed. That is the
     # project's signature failure mode — a gate that runs, goes green, and did
-    # no work. Per-function attribution *is* the value of a code-level audit,
-    # so:
-    #   * changes exist but none attributable  -> BLOCKING (can never be a pass)
-    #   * changes exist but some unattributed  -> blocking only if the report
-    #     itself was unusable (then nothing could be checked, not "mostly ok")
+    # no work. Per-function attribution *is* the value of a code-level audit.
+    #
+    # BUG-QA-10（2026-11-12 审计）：旧阈值"==0 才阻断"存在覆盖漏洞 —— 1 处
+    # cave 命中即可让 PA-0 通过、其余 19 处未解释改动只留在 unattributed 列表
+    # 里不阻断（"1 处归属掩护 19 处改动"）。现改为**覆盖率阈值**：
+    #   coverage = attributed / findings < 0.5 → BLOCKING（阈值 50%，明示）
+    # 50% 的依据：正常产物上引擎 report 与字节 diff 应高度吻合（真实样本
+    # 20/20）；低于一半说明 report 与产物严重脱节或 patch 来源不受控，
+    # 逐代码审计已无法回答"改的是哪里"，宁红勿绿。
     # ------------------------------------------------------------------
-    if findings and attributed == 0:
-        if declared:
-            why = (
-                f"引擎 report 声明了 {len(declared)} 个补丁区间，但没有一处与"
-                f"实际字节改动重叠 —— report 与实际产物不符"
+    PA0_COVERAGE_THRESHOLD = 0.5
+    if findings:
+        coverage = attributed / len(findings)
+        if coverage < PA0_COVERAGE_THRESHOLD:
+            if declared:
+                why = (
+                    f"引擎 report 声明了 {len(declared)} 个补丁区间，但覆盖率仅 "
+                    f"{attributed}/{len(findings)}（{coverage:.0%}）—— report 与"
+                    f"实际产物不符，或存在来源不受控的改动"
+                )
+            else:
+                why = f"无可用归属信息（{attribution_source}）"
+            blocking.append(
+                f"PA-0: {len(findings)} 处字节改动、仅 {attributed} 处可归属到 "
+                f"hook 组（coverage {coverage:.0%} < {PA0_COVERAGE_THRESHOLD:.0%}"
+                f" 阈值）—— {why}。"
+                f"「逐代码检查」的核心就是把改动映射回具体函数；覆盖率不足一半"
+                f"意味着本审计无法回答『大部分改动改的是哪里』。"
+                f"请传 --report，或修复 report / 排查未归属改动。"
             )
-        else:
-            why = f"无可用归属信息（{attribution_source}）"
-        blocking.append(
-            f"PA-0: {len(findings)} 处字节改动、0 处可归属到 hook 组 —— {why}。"
-            f"「逐代码检查」的核心就是把改动映射回具体函数；0% 归属意味着本审计"
-            f"只做了字节 diff，没有回答『改的是哪里』。请传 --report，或修复 report。"
-        )
-    elif findings and not declared:
-        # Partial usefulness: bytes were audited, attribution could not even be
-        # attempted. Loud warning (not blocking) once PA-0 has been satisfied by
-        # at least one attribution is impossible here — declared empty means
-        # attributed==0, which PA-0 already made blocking. Kept for clarity.
+    if findings and not declared:
         warnings.append(f"PA-0: 归属信息不可用（{attribution_source}）")
 
     return {
@@ -325,6 +367,9 @@ def audit(orig: bytes, patched: bytes, report: dict | None) -> dict:
             "coverage": (
                 f"{attributed}/{len(findings)}" if findings else "n/a"
             ),
+            # BUG-QA-10：PA-0 阈值与覆盖率显式入档，供 run_all/人审消费
+            "coverage_ratio": (attributed / len(findings)) if findings else None,
+            "pa0_coverage_threshold": 0.5,
         },
         "summary": {
             "changed_regions": len(findings),

@@ -81,8 +81,19 @@ def collect_declared(report):
 
     覆盖 hooks[]、hook_table[]、launcher、caves[]。
     地址字段可能是 "0x..." 字符串或 int，两种都吃。
+
+    返回 (declared_points, declared_spans)：
+      * declared_points：[(addr, label)]——旧的点列表，兼容 attribute 的 A 路径
+        与 XV-3 的 cave 合并；
+      * declared_spans：[(start, end, label)]——hooks[].patch_offset + len 与
+        嵌套 patches[] 展开成的**区间**。BUG-QA-3 收紧后 branch-target 路径
+        用区间判定（目标落入 [start, end)），而不是"距点 ±tol"——引擎把
+        `do_execveat_common` 整个函数体（164B）声明为一个 patch 区间，入口
+        trampoline 跳回函数中段（实测 0x38fcd4 → 0x24c04，落在 [0x24bd4,
+        0x24c78) 内），按点 ±4B 判会漏掉这类"跳回函数体内"的合法回跳。
     """
     declared = []
+    spans = []
 
     def add(v, label):
         if isinstance(v, str) and v.lower().startswith("0x"):
@@ -93,14 +104,27 @@ def collect_declared(report):
         elif isinstance(v, int) and v > 0:
             declared.append((v, label))
 
+    def add_span(off, ln, label):
+        if isinstance(off, str) and off.lower().startswith("0x"):
+            try:
+                off = int(off, 16)
+            except ValueError:
+                return
+        if isinstance(off, int) and off > 0 and isinstance(ln, int) and ln > 0:
+            spans.append((off, off + ln, label))
+
     for h in report.get("hooks") or []:
         label = h.get("group") or h.get("name") or "?"
         for k in ("patch_offset", "target_addr", "hook_addr", "trampoline"):
             add(h.get(k), label)
+        # 区间：主 patch_offset + len，以及嵌套 patches[] 每一条
+        add_span(h.get("patch_offset"), h.get("len"), label)
         for p in h.get("patches") or []:
             if isinstance(p, dict):
                 for k in ("offset", "addr", "hook_addr"):
                     add(p.get(k), label)
+                add_span(p.get("patch_offset") or p.get("offset"),
+                         p.get("len"), label)
 
     for t in report.get("hook_table") or []:
         if isinstance(t, dict):
@@ -117,31 +141,49 @@ def collect_declared(report):
         if isinstance(c, dict):
             add(c.get("offset"), "cave")
 
-    return declared
+    return declared, spans
 
 
-def attribute(regions, declared, tol=0x400, patched=None):
+# BUG-QA-3（2026-11-12 审计采纳）：原容差 0x400（1KB）能容纳 ~256 条指令、
+# 多个相邻 hook —— hook 真实落点错误（patch 写进 ±1KB 内的无关代码）会被
+# "附近恰有任一声明地址"洗白成已归属，恰好绕过本套与 patch_audit 双重把关。
+# 收紧依据：AArch64 指令 4B；64B = 16 条指令，足以吸收 report 里跳板头与
+# 入口指令间的对齐填充，但不足以掩盖"写错函数中段"。
+PROXIMITY_TOL = 64
+# BUG-QA-3：branch-target 路径从 ±tol 收紧为**精确命中**（目标 == 声明地址或
+# 声明区间起点 ±4B）。entry_hooks[] 起就是精确地址（跳板头对齐到指令边界），
+# ±4B 只吸收"落在声明区间起点前一条指令"的对齐差。
+BRANCH_TARGET_TOL = 4
+
+
+def attribute(regions, declared, tol=None, patched=None, declared_spans=None):
     """给每个改动区段找归属；容差规则显式写出，免得后人猜。
 
-    两条独立的归属路径（任一命中即算已归属）：
-      A. **地址邻近**：区段起点与某声明地址距离 <= tol
-      B. **跳转目标命中**（关键补充）：该区段里的 `b` 指令目标落在某个声明地址
-         ± tol 范围内 —— 这说明"这里被改成一个跳到引擎 cave 的跳转"，
-         即使这个区段本身的位置没被 report 显式列出来。
+    三条独立的归属路径（任一命中即算已归属）：
+      A. **地址邻近**：区段起点与某声明地址距离 <= tol（默认 PROXIMITY_TOL=64B；
+         BUG-QA-3 前曾是 0x400=1KB，会掩盖 hook 落错函数中段的真实回归）
+      B. **跳转目标精确命中声明地址**：目标 == 声明地址 ±BRANCH_TARGET_TOL(4B)
+      C. **跳转目标落入声明区间**（BUG-QA-3 收紧时补上）：目标 ∈ [start, end)，
+         区间来自 hooks[].patch_offset+len 与嵌套 patches[]（declared_spans）。
+         引擎把 hook 函数体整体声明为 patch 区间，入口 trampoline 跳回函数
+         中段是合法形态（实测 0x38fcd4 → 0x24c04 ∈ do_execve [0x24bd4,0x24c78)），
+         B 的 ±4B 判不了这种"跳回体内"，必须有 C。
 
-    ⚠️ 为什么必须有 B：引擎的 `hooks[].patch_offset` 记的是**跳板/cave 侧**地址，
+    ⚠️ 为什么必须有 B/C：引擎的 `hooks[].patch_offset` 记的是**跳板/cave 侧**地址，
     而被它改写的**原函数入口**（例如 `do_execve` 的 `sub sp,sp,#0x70`）不在其中。
     只走 A 会把这类"入口 → cave"的 hook 判成未解释（实测 3 处）。
-    它们恰恰是最正常的 hook：入口换成 `b cave`，cave 里做活后跳回。
 
     返回 (attributed, unexplained, detail_list)。
     """
+    if tol is None:
+        tol = PROXIMITY_TOL
+    spans = declared_spans or []
     attr, unexplained, detail = 0, [], []
     for off, ln, _o, newb in regions:
         hits = [(a, g) for a, g in declared if abs(a - off) <= tol]
         reason = "addr-proximity"
         if not hits and patched is not None:
-            # 解析区段内的 AArch64 `b` 指令，看目标是否落在声明地址附近
+            # 解析区段内的 AArch64 `b` 指令，看目标是否命中声明地址/区间
             for i in range(0, max(0, ln - 3), 4):
                 w = struct.unpack_from("<I", newb, i)[0]
                 if (w >> 26) != 0x5:          # 不是 B 指令
@@ -150,9 +192,16 @@ def attribute(regions, declared, tol=0x400, patched=None):
                 if imm & (1 << 25):           # 符号扩展
                     imm -= (1 << 26)
                 tgt = off + i + imm * 4
-                near = [(a, g) for a, g in declared if abs(a - tgt) <= tol]
+                # B：精确命中声明地址（±4B 对齐余量）
+                near = [(a, g) for a, g in declared
+                        if abs(a - tgt) <= BRANCH_TARGET_TOL]
                 if near:
                     hits, reason = near, "branch-target"
+                    break
+                # C：目标落入声明区间 [start, end)
+                in_span = [(s, g) for s, e, g in spans if s <= tgt < e]
+                if in_span:
+                    hits, reason = in_span, "branch-target-span"
                     break
         if hits:
             attr += 1
@@ -266,13 +315,42 @@ def normalize_log(path, stop_at_panic=True):
 
 
 def compare_logs(a, b):
-    """返回 (ok, added, removed)。"""
-    la, lb = normalize_log(a), normalize_log(b)
+    """XV-5 日志对比（BUG-QA-4 修复：双判据，与 boot_qemu.diff_serial 对齐）。
+
+    旧实现只做顺序敏感的 unified_diff —— 异步 probe（cryptomgr_probe、
+    workqueue）在两次启动里落点不确定，同一内核的两份日志也会有几行重排，
+    逐行 diff 必报 +N/-N，从而与 boot_qemu 的 multiset 结论矛盾（两套体系
+    各说各话、无人仲裁）。现在返回双判据：
+
+      * ``identical_after_normalisation``：逐行相同（最强）
+      * ``same_line_multiset``：内容集合相同、仅顺序不同（异步 probe 抖动，
+        不判 FAIL，输出 note —— 与 boot_qemu 的判法一致）
+      * ``ok``：两者任一为真即 True；added/removed 仍原样返回供人过目
+
+    返回 dict（ok/added/removed/multiset/identical），比旧的裸三元组多带判据
+    明细；run.sh 的仲裁逻辑消费 multiset 字段。向后兼容：调用方按 dict 取值。
+    """
     import difflib
+    from collections import Counter
+    la, lb = normalize_log(a), normalize_log(b)
     diff = list(difflib.unified_diff(la, lb, lineterm="", n=0))
     added = [d[1:] for d in diff if d.startswith("+") and not d.startswith("+++")]
     removed = [d[1:] for d in diff if d.startswith("-") and not d.startswith("---")]
-    return (not added and not removed), added, removed
+    identical = not added and not removed and len(la) == len(lb)
+    ca, cb = Counter(la), Counter(lb)
+    only_a, only_b = ca - cb, cb - ca
+    multiset = not only_a and not only_b and len(la) == len(lb)
+    return {
+        "ok": identical or multiset,
+        "identical_after_normalisation": identical,
+        "same_line_multiset": multiset,
+        "added": added,
+        "removed": removed,
+        "lines_only_in_orig": [ln for ln in only_a][:20],
+        "lines_only_in_patched": [ln for ln in only_b][:20],
+        "orig_lines": len(la),
+        "patched_lines": len(lb),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -329,8 +407,9 @@ def main(argv=None):
     # ── XV-2 ──────────────────────────────────────────────────────────
     if args.report:
         report = json.load(open(args.report, encoding="utf-8"))
-        declared = collect_declared(report)
-        attr, unexp, detail = attribute(regions, declared, patched=patched)
+        declared, declared_spans = collect_declared(report)
+        attr, unexp, detail = attribute(regions, declared, patched=patched,
+                                        declared_spans=declared_spans)
         # ⚠️ 这里必须是 len(unexp) == 0 —— unexp 是列表，
         #    写成 `unexp == 0` 恒为 False（列表永不等于 int），
         #    会表现为"未解释 0 处却判 FAIL"的自伤 bug。
@@ -372,8 +451,7 @@ def main(argv=None):
         return out
 
     if args.report:
-        declared = collect_declared(report)
-        # 声明地址排序后，相邻两个之间的"中间区"就是引擎往里面写东西的 cave 区
+        declared, _declared_spans = collect_declared(report)
         addrs = sorted({a for a, _g in declared})
         spans = []
         for i in range(len(addrs) - 1):
@@ -420,8 +498,14 @@ def main(argv=None):
     # ── XV-4 ──────────────────────────────────────────────────────────
     # 启发式：AArch64 内核 Image 的 .text 通常在头部到 code_size 范围内。
     # Image header 的 image_size 字段（offset 0x10）给出有效镜像大小。
+    # BUG-QA-1 hardening（2026-11-12）：规范判据是 0x38 处魔数 ARM\x64
+    # （0x644D5241）；0x00 处的 branch-to-stub 编码 4d 5a 40 fa（ASCII "MZ@"）
+    # 是实测有效的固定首指令，但理论上可随内核构建配置变化，保留作 OR 条件。
     image_size = None
-    if len(orig) >= 0x14 and orig[:4] == b"MZ\x40\xfa":
+    _arm_magic = (len(orig) >= 0x3C
+                  and int.from_bytes(orig[0x38:0x3C], "little") == 0x644D5241)
+    _stub = len(orig) >= 0x14 and orig[:4] == b"MZ\x40\xfa"
+    if _arm_magic or _stub:
         image_size = struct.unpack_from("<Q", orig, 0x10)[0]
     beyond = []
     if image_size:
@@ -439,12 +523,25 @@ def main(argv=None):
 
     # ── XV-5 ──────────────────────────────────────────────────────────
     if args.log_orig and args.log_patched:
-        ok, added, removed = compare_logs(args.log_orig, args.log_patched)
-        xv5 = {"ok": ok, "added": len(added), "removed": len(removed)}
-        print("[XV-5] %s  归一化后差异：+%d / -%d 行"
-              % ("PASS" if ok else "FAIL", len(added), len(removed)))
+        cmp5 = compare_logs(args.log_orig, args.log_patched)
+        added, removed = cmp5["added"], cmp5["removed"]
+        xv5 = {"ok": cmp5["ok"], "added": len(added), "removed": len(removed),
+               "identical_after_normalisation": cmp5["identical_after_normalisation"],
+               "same_line_multiset": cmp5["same_line_multiset"]}
+        if cmp5["ok"] and not cmp5["identical_after_normalisation"]:
+            xv5["note"] = ("内容集合相同、仅 %d 行顺序不同（异步 probe 抖动，"
+                           "与 boot_qemu multiset 判法一致）" % (len(added) + len(removed)))
+            print("[XV-5] PASS  归一化后内容集合相同（NOTE: %s）" % xv5["note"])
+        else:
+            print("[XV-5] %s  归一化后差异：+%d / -%d 行"
+                  % ("PASS" if cmp5["ok"] else "FAIL", len(added), len(removed)))
         for line in (added[:5] + removed[:5]):
             print("        | %s" % line[:110])
+        if not cmp5["ok"] and (cmp5["lines_only_in_orig"] or cmp5["lines_only_in_patched"]):
+            for ln in cmp5["lines_only_in_orig"][:5]:
+                print("        ONLY-ORIG: %s" % ln[:110])
+            for ln in cmp5["lines_only_in_patched"][:5]:
+                print("        ONLY-PATCHED: %s" % ln[:110])
     else:
         xv5 = {"ok": None, "skipped": "未提供启动日志"}
         print("[XV-5] SKIP  未提供 --log-orig/--log-patched")
@@ -499,31 +596,55 @@ def self_test():
     cases.append(("XV-1 好输入：等长 2 处改动",
                   len(rs) == 2 and rs[0][0] == 1 and rs[1][0] == 4, True))
 
-    # XV-2 归因
+    # XV-2 归因（BUG-QA-3 收紧后：proximity 默认 64B）
     regs = [(0x1000, 4, b"", b""), (0x9000, 4, b"", b"")]
     decl = [(0x1000, "do_execve")]
-    attr, unexp, _d = attribute(regs, decl, tol=0x400)
+    attr, unexp, _d = attribute(regions=regs, declared=decl)
     cases.append(("XV-2 坏输入：有未声明改动 → 应报未解释",
                   len(unexp) == 1 and attr == 1, True))
-    attr2, unexp2, _d2 = attribute([(0x1000, 4, b"", b"")], decl, tol=0x400)
+    attr2, unexp2, _d2 = attribute([(0x1000, 4, b"", b"")], decl)
     cases.append(("XV-2 好输入：全部可归因 → 未解释 0",
                   len(unexp2) == 0, True))
+    # BUG-QA-3 负样本（收紧判据的鉴别力）：距离 0x400（旧容差会放行）必须仍判未解释
+    _attr_far, _unexp_far, _ = attribute([(0x1000 + 0x400, 4, b"", b"")], decl)
+    cases.append(("XV-2 收紧负样本：距声明地址 0x400（>64B）→ 未解释",
+                  len(_unexp_far) == 1 and _attr_far == 0, True))
+    # BUG-QA-3 好输入：落在 64B 容差内仍可归属
+    _attr_near, _unexp_near, _ = attribute([(0x1000 + 0x30, 4, b"", b"")], decl)
+    cases.append(("XV-2 收紧好样本：距声明地址 0x30（≤64B）→ 已归属",
+                  _attr_near == 1 and len(_unexp_near) == 0, True))
 
-    # XV-2b：**跳转目标归属**（本轮实测抓到的关键补充）
-    # 构造：0x9000 处一条 `b 0x1050`，0x1050 落在声明地址 0x1000 的 ±0x400 内
-    # → 虽然 0x9000 本身远离声明地址，但应经"跳转目标命中"归属成功。
-    imm = (0x1050 - 0x9000) // 4
+    # XV-2b：**跳转目标归属**（实测抓到的关键补充）
+    # 构造：0x9000 处一条 `b 0x1000`（精确命中声明地址）→ branch-target 归属
+    # BUG-QA-3：目标容差从 ±0x400 收紧为精确命中（±4B 对齐余量）
+    imm = (0x1000 - 0x9000) // 4
     w = 0x14000000 | (imm & 0x03FFFFFF)
     branch_new = struct.pack("<I", w)
     a3, u3, d3 = attribute([(0x9000, 4, b"", branch_new)], [(0x1000, "do_execve")],
-                           tol=0x400, patched=b"\x00" * 0x10000)
-    cases.append(("XV-2b 好输入：b 跳到声明地址附近 → 经跳转目标归属",
+                           patched=b"\x00" * 0x10000)
+    cases.append(("XV-2b 好输入：b 精确跳到声明地址 → 经跳转目标归属",
                   len(u3) == 0 and any(x["via"] == "branch-target" for x in d3), True))
+    # 好输入（±4B 余量）：b 跳到声明地址前一条指令（0x0FFC）
+    imm_p4 = (0x1000 - 4 - 0x9000) // 4
+    w_p4 = 0x14000000 | (imm_p4 & 0x03FFFFFF)
+    a3b, u3b, d3b = attribute([(0x9000, 4, b"", struct.pack("<I", w_p4))],
+                              [(0x1000, "do_execve")],
+                              patched=b"\x00" * 0x10000)
+    cases.append(("XV-2b 好输入：b 跳到声明地址-4B（对齐余量内）→ 已归属",
+                  len(u3b) == 0 and any(x["via"] == "branch-target" for x in d3b), True))
+    # BUG-QA-3 收紧负样本：b 跳到声明地址 +0x40（旧 ±0x400 会放行）→ 必须未解释
+    imm_near = (0x1000 + 0x40 - 0x9000) // 4
+    w_near = 0x14000000 | (imm_near & 0x03FFFFFF)
+    a4b, u4b, _d4b = attribute([(0x9000, 4, b"", struct.pack("<I", w_near))],
+                               [(0x1000, "do_execve")],
+                               patched=b"\x00" * 0x10000)
+    cases.append(("XV-2b 收紧负样本：b 跳到声明地址+0x40（>4B 余量）→ 未解释",
+                  len(u4b) == 1, True))
     # 负样本：b 跳到完全无关的远处 → 仍应判未解释
     imm2 = (0x100000 - 0x9000) // 4
     w2 = 0x14000000 | (imm2 & 0x03FFFFFF)
     a4, u4, _d4 = attribute([(0x9000, 4, b"", struct.pack("<I", w2))],
-                            [(0x1000, "do_execve")], tol=0x400,
+                            [(0x1000, "do_execve")],
                             patched=b"\x00" * 0x200000)
     cases.append(("XV-2b 坏输入：b 跳到无关远处 → 应仍判未解释",
                   len(u4) == 1, True))
@@ -563,10 +684,59 @@ def self_test():
     # 多一行真实差异 → 应判不同
     open(p3, "w", encoding="utf-8").write(
         "[    0.000000][0:0] Booting Linux\n[    0.100000][0:1] driver probe FAILED\n")
-    ok_same, _, _ = compare_logs(p1, p2)
-    ok_diff, add, _ = compare_logs(p1, p3)
+    ok_same = compare_logs(p1, p2)["ok"]
+    ok_diff = compare_logs(p1, p3)["ok"]
     cases.append(("XV-5 好输入：仅时间戳不同 → 判相同", ok_same, True))
     cases.append(("XV-5 坏输入：驱动行为不同 → 判不同", not ok_diff, True))
+
+    # XV-5c（BUG-QA-4）：仅顺序不同的两份日志——旧实现报 FAIL，与 boot_qemu
+    # 的 multiset 判法矛盾；现在 multiset 相同 → ok=True + note。
+    p4 = os.path.join(tmpd, "l4.log")
+    open(p4, "w", encoding="utf-8").write(
+        "[    0.000000][0:0] Booting Linux\n"
+        "[    0.100000][0:1] crypto probe ok\n"
+        "[    0.200000][0:1] net probe ok\n")
+    p5 = os.path.join(tmpd, "l5.log")
+    open(p5, "w", encoding="utf-8").write(
+        "[    0.000000][0:0] Booting Linux\n"
+        "[    0.150000][0:1] net probe ok\n"
+        "[    0.250000][0:1] crypto probe ok\n")
+    cmp_reorder = compare_logs(p4, p5)
+    cases.append(("XV-5c 好输入：仅顺序不同（异步 probe）→ multiset 判相同",
+                  cmp_reorder["ok"] and cmp_reorder["same_line_multiset"]
+                  and not cmp_reorder["identical_after_normalisation"], True))
+    # 鉴别力：真的少一行时 multiset 也必须为 False
+    p6 = os.path.join(tmpd, "l6.log")
+    open(p6, "w", encoding="utf-8").write(
+        "[    0.000000][0:0] Booting Linux\n[    0.200000][0:1] net probe ok\n")
+    cmp_missing = compare_logs(p4, p6)
+    cases.append(("XV-5c 坏输入：确实少一行 → multiset 必须为 False",
+                  not cmp_missing["ok"] and not cmp_missing["same_line_multiset"], True))
+
+    # XV-4（BUG-QA-1 hardening）：0x38 魔数判据的正/负样本 + stub 兼容
+    def _mk_arm_img(magic38=None, stub=None):
+        img = bytearray(0x100)
+        if stub is not False:
+            img[0:4] = b"MZ\x40\xfa"
+        if magic38 is not False:
+            img[0x38:0x3C] = (0x644D5241).to_bytes(4, "little")
+        struct.pack_into("<Q", img, 0x10, 0x100)   # image_size
+        return bytes(img)
+
+    def _xv4_image_size(data):
+        """复用 main 里 XV-4 的解析判据（抽出单点，便于自检驱动）。"""
+        _arm = len(data) >= 0x3C and int.from_bytes(data[0x38:0x3C], "little") == 0x644D5241
+        _stub = len(data) >= 0x14 and data[:4] == b"MZ\x40\xfa"
+        if _arm or _stub:
+            return struct.unpack_from("<Q", data, 0x10)[0]
+        return None
+
+    cases.append(("XV-4 好输入：0x38 魔数命中 → image_size 可解析",
+                  _xv4_image_size(_mk_arm_img()) == 0x100, True))
+    cases.append(("XV-4 好输入：仅 stub 无 0x38 魔数（旧判据兼容）→ 仍可解析",
+                  _xv4_image_size(_mk_arm_img(magic38=False)) == 0x100, True))
+    cases.append(("XV-4 坏输入：两者皆无 → SKIP（返回 None）",
+                  _xv4_image_size(_mk_arm_img(magic38=False, stub=False)) is None, True))
 
     # XV-6 kallsyms
     cases.append(("XV-6 坏输入：无 kallsyms 特征 → 可用性 False",

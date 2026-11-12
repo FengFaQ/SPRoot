@@ -1,4 +1,4 @@
-﻿#include "kallsyms_lookup_name_6_1_0.h"
+#include "kallsyms_lookup_name_6_1_0.h"
 #include "find_static_code_start.h"
 
 #include <set>
@@ -455,6 +455,8 @@ bool KallsymsLookupName_6_1_0::find_kallsyms_token_table(size_t markers_list_end
 		}
 		size_t off = x;
 		for (unsigned int i = 0; i < 256; i++) {
+			// ENG-5：strlen 无上界会读穿 vector 末尾（畸形内核）→ 堆越界读崩溃。
+			if (off >= m_file_buf.size()) return false;
 			const char* str = (const char*)&m_file_buf[off];
 			off += strlen(str) + 1;
 		}
@@ -518,30 +520,38 @@ unsigned int KallsymsLookupName_6_1_0::kallsyms_expand_symbol(unsigned int off, 
 	int len, skipped_first = 0;
 	const char* tptr;
 	const uint8_t* data;
+	const uint8_t* kallsyms_names = (uint8_t*)&m_file_buf[m_kallsyms_names.offset];
+	const uint16_t* kallsyms_token_index = (uint16_t*)&m_file_buf[m_kallsyms_token_index.offset];
+	const unsigned char* kallsyms_token_table = (unsigned char*)&m_file_buf[m_kallsyms_token_table.offset];
 
 	/* Get the compressed symbol length from the first symbol byte. */
-
-	data = (uint8_t*)&m_file_buf[m_kallsyms_names.offset + off * sizeof(uint8_t)];
-
+	data = &kallsyms_names[off];
 	len = *data;
 	data++;
+	off++;
+
+	/* If MSB is 1, it is a "big" symbol, so needs an additional byte.
+	 * 必须与 find_kallsyms_names_list() 的双字节长度解析逐字节一致（ENG-3）：
+	 * 否则含 len>=0x80 符号的内核会在这里偏移失步，后续所有"符号名→地址"
+	 * 映射错乱（补丁写错位置）。与 6_1_42/6_1_60/6_4_0/6_12_0 变体同构。 */
+	if ((len & 0x80) != 0) {
+		len = (len & 0x7F) | (*data << 7);
+		data++;
+		off++;
+	}
 
 	/*
 	 * Update the offset to return the offset for the next symbol on
 	 * the compressed stream.
 	 */
-	off += len + 1;
+	off += len;
 
 	/*
 	 * For every byte on the compressed symbol data, copy the table
 	 * entry for that byte.
 	 */
-
 	while (len) {
-		uint8_t x = *data;
-		short y = *(short*)&m_file_buf[m_kallsyms_token_index.offset + x * sizeof(uint16_t)];
-
-		tptr = &m_file_buf[m_kallsyms_token_table.offset + y * sizeof(unsigned char)];
+		tptr = (const char*)& kallsyms_token_table[kallsyms_token_index[*data]];
 		data++;
 		len--;
 

@@ -73,7 +73,12 @@ bool read_info(const std::vector<char>& buf, Info& info) {
                      std::to_string(info.header_version) + ")";
         return false;
     }
+    // ENG-6：v4 的 signature_size 位于 +1580..1584 —— 截断镜像（<1584B）直接读会堆越界。
     if (info.header_version == 4) {
+        if (buf.size() < 1584) {
+            info.error = "truncated boot header v4 (file < 1584B, cannot read signature_size)";
+            return false;
+        }
         info.signature_size = rd_u32_le(buf.data() + 1580);
     }
     info.kernel_offset = info.page_size;
@@ -84,15 +89,17 @@ bool read_info(const std::vector<char>& buf, Info& info) {
     }
     info.ramdisk_offset = info.kernel_offset + align_up(info.kernel_size, info.page_size);
 
-    // kernel 压缩格式识别（前 4 字节）
+    // kernel 压缩格式识别（前 4 字节）。ENG-6：kernel_size<4 时 k[0..3] 可能越过
+    // 缓冲末尾 → 先钳制再嗅探（不足 4 字节按 raw 处理即可）。
     const char* k = buf.data() + info.kernel_offset;
-    if (static_cast<uint8_t>(k[0]) == 0x1f && static_cast<uint8_t>(k[1]) == 0x8b) {
+    const size_t k_avail = static_cast<size_t>(buf.size() - info.kernel_offset);
+    if (k_avail >= 2 && static_cast<uint8_t>(k[0]) == 0x1f && static_cast<uint8_t>(k[1]) == 0x8b) {
         info.compression = Compression::Gzip;
-    } else if (rd_u32_le(k) == 0x184c2102u) {
+    } else if (k_avail >= 4 && rd_u32_le(k) == 0x184c2102u) {
         info.compression = Compression::Lz4Legacy;
-    } else if (rd_u32_le(k) == 0x184d2204u) {
+    } else if (k_avail >= 4 && rd_u32_le(k) == 0x184d2204u) {
         info.compression = Compression::Lz4Frame;
-    } else if (static_cast<uint8_t>(k[0]) == 0x4d && static_cast<uint8_t>(k[1]) == 0x5a) {
+    } else if (k_avail >= 2 && static_cast<uint8_t>(k[0]) == 0x4d && static_cast<uint8_t>(k[1]) == 0x5a) {
         // ARM64 Image header 以 "MZ"（code0 = b <...>）开头
         info.compression = Compression::Raw;
     } else {

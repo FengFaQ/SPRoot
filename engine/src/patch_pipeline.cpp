@@ -180,7 +180,19 @@ PatchKernelResult patch_kernel_handler(const std::vector<char>& file_buf, const 
 		PatchRcVirtualize pv(patchBase, sym);
 		RcVirtInfo info;
 		info.mode = "rc";
-		if (pv.precheck(off.cred_offset, info)) {
+		// ENG-1：把本 run 已被占用的写入区间传给 precheck——洞扫描排除与之相交的零区。
+		// <6.1 分支的 hook 链硬编码在 [0x200, 0x200+0x800)（含 hook_jump 尾洞），
+		// ≥6.1 分支写在 die/__drm_*_coredump 等真实符号区；vec_patch 里是逐处精确的
+		// [write_addr, write_addr+len)，两者一并排除（显式 +0x800 区间兜底 <6.1 的
+		// 逐条区间之外的零碎缝隙，那片零区正是事故现场）。
+		std::vector<RcVirtCave> occupied;
+		for (const auto& p : vec_patch_bytes_data) {
+			occupied.push_back({ p.write_addr, p.str_bytes.length() / 2 });
+		}
+		if (kernel_ver.is_kernel_version_less("6.1.0")) {
+			occupied.push_back({ 0x200, 0x800 });   // <6.1 硬编码 hook 区整段排除（含零碎缝隙）
+		}
+		if (pv.precheck(off.cred_offset, info, occupied)) {
 			RcVirtInfo out_info;
 			if (pv.weave(off.cred_offset, off.cred_uid_offset, info, vec_patch_bytes_data, out_info)) {
 				r.launcher = out_info;

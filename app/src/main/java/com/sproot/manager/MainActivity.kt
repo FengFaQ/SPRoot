@@ -24,7 +24,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // ① 首屏构建失败要落证据（崩溃兜底会写 crash 报告），不让"首次打开闪退"无迹可查
+        // ① 首屏构建失败要落证据（CrashHandler 写 crash 报告）。这里不用 runCatching 吞掉：
+        //    吞掉 = 永久白屏。改为捕获后设一个兜底错误 UI（compose 组合异常在首帧渲染时抛出，
+        //    setContent 本身几乎不抛；真正会抛的是 setContent 内部 lambda 的首次组合，
+        //    它发生在 onContent 签名之外，因此这里再兜一层 Recomposer 外的 setText 兜底）。
         runCatching {
         setContent {
             val darkMode = isSystemInDarkTheme()
@@ -44,8 +47,20 @@ class MainActivity : ComponentActivity() {
             }
             AppRoot(modifier = Modifier.fillMaxSize())
         }
-        }.onFailure {
-            com.sproot.manager.core.AppLog.error("Activity", "首屏 setContent 失败", it)
+        }.onFailure { error ->
+            // 首屏组合失败：落证据 + 设兜底错误 UI（不让用户面对白屏无提示）。
+            com.sproot.manager.core.AppLog.error("Activity", "首屏 setContent 失败（兜底 UI）", error)
+            runCatching {
+                android.widget.TextView(this).apply {
+                    text = "SPRoot 首屏加载失败\n\n${error.javaClass.simpleName}: ${error.message}\n\n" +
+                        "崩溃报告已写入 filesDir/crash/，请反馈日志。"
+                    setPadding(48, 96, 48, 48)
+                    setTextSize(16f)
+                }.also { setContentView(it) }
+            }.onFailure {
+                // 兜底也失败（Activity 已异常）→ 重新抛出走系统崩溃流程（CrashHandler 已落报告）
+                throw error
+            }
         }
     }
 }

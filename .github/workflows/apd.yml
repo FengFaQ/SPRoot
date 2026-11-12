@@ -200,6 +200,9 @@ jobs:
           python3 "$GATE" ../dist/libapd.so | tee ../dist/apd-capabilities.txt
 
       # Per-commit artifact (immutable, keeps history in the UI).
+      # BUG-QA-13：14 天 → 90 天（与下方 -latest 同步）。release.yml 的
+      # fetch_artifact 按 head_sha 检索本 artifact；native.lock.json 也可能
+      # 锁定 per-commit run_id —— 14 天过期会让锁定它的构建突然无源可下。
       - name: Upload artifact (commit-pinned)
         uses: actions/upload-artifact@v4
         with:
@@ -213,10 +216,14 @@ jobs:
             dist/apd-size-symbols.txt
             dist/apd-capabilities.txt
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 90
 
       # Fixed-name artifact for the app CI: stable download path + manifest.
       # Client usage: gh run download -n apd-aarch64-latest -R FengFaQ/SPRoot
+      # BUG-QA-13：retention 14 天 → 90 天。app/native.lock.json 的 apd 段锁定
+      # 的是本 artifact 的 run_id；14 天后 artifact 过期，APK CI 从第 15 天起
+      # 必红（上游 apd 没发新版时尤其如此），团队会被迫手改 lock 绕过。90 天
+      # 覆盖 lock 表平均升级周期；到期前 lock 必须已随 apd 升级换 run。
       - name: Upload artifact (fixed name for app CI)
         uses: actions/upload-artifact@v4
         with:
@@ -228,4 +235,4 @@ jobs:
             dist/apd-size-symbols.txt
             dist/apd-capabilities.txt
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 90

@@ -31,9 +31,12 @@ import re
 import sys
 from pathlib import Path
 
-# LICENSES.md §2.1 行格式：| 1 | `engine/src/patch_base.cpp` | 7,485 | `sha256...` | 完全相同 |
+# LICENSES.md 表格行格式，两种都识别：
+#   §2.1: | 1 | `engine/src/patch_base.cpp` | 7,485 | `sha256...` | 完全相同 |
+#   §2.2: | `engine/src/patch_base.cpp` | 9,489 | `sha256...` | 上游对应（7,485） | **改造衍生**... |
+# 差异仅在首列有无序号，其余（path/size/sha 三元组）一致。
 ROW_RE = re.compile(
-    r"^\|\s*\d+\s*\|\s*`(?P<path>[^`]+)`\s*\|\s*(?P<size>[\d,]+)\s*\|\s*`(?P<sha>[0-9a-f]{64})`\s*\|",
+    r"^\|\s*(?:\d+\s*\|)?\s*`(?P<path>[^`]+)`\s*\|\s*(?P<size>[\d,]+)\s*\|\s*`(?P<sha>[0-9a-f]{64})`\s*\|",
     re.MULTILINE,
 )
 
@@ -107,10 +110,27 @@ def main() -> int:
 
     # ---- 3. 上游文件 sha256 指纹一致性（核心） ----
     rows = list(ROW_RE.finditer(lic_text))
+    # 语义：上游同名文件总数 ≥15，且**每一个都必须被声明**——不管它在 §2.1（逐字节相同）
+    # 还是 §2.2（改造衍生）。原版只统计 §2.1 行数，当文件从 §2.1 移入 §2.2 时会假红
+    # （2026-11-12：patch_base.cpp / patch_kernel_root.h 因边界守卫修复移入 §2.2）。
+    # 现改为：按 15 个已知上游文件名逐一断言"在表格中被声明且 sha256/size 与实文件一致"。
+    UPSTREAM_FILES = [
+        "engine/src/patch_base.cpp", "engine/src/patch_base.h",
+        "engine/src/patch_do_execve.cpp", "engine/src/patch_do_execve.h",
+        "engine/src/patch_avc_denied.cpp", "engine/src/patch_avc_denied.h",
+        "engine/src/patch_audit_log_start.cpp", "engine/src/patch_audit_log_start.h",
+        "engine/src/patch_current_avc_check.cpp", "engine/src/patch_current_avc_check.h",
+        "engine/src/patch_filldir64.cpp", "engine/src/patch_filldir64.h",
+        "engine/src/patch_compat_filldir.cpp", "engine/src/patch_compat_filldir.h",
+        "engine/src/patch_kernel_root.h",
+    ]
+    declared_paths = {m.group("path") for m in rows}
+    missing = [f for f in UPSTREAM_FILES if f not in declared_paths]
     check(
         "licenses:upstream-table",
-        len(rows) >= 15,
-        f"LICENSES.md §2.1 应声明 ≥15 个上游文件，实际解析到 {len(rows)} 行",
+        len(missing) == 0 and len(rows) >= 15,
+        f"15 个上游文件必须全部在 LICENSES.md 表格中声明（§2.1 或 §2.2 均可），"
+        f"实际解析到 {len(rows)} 行；缺失: {missing or '无'}",
     )
 
     for m in rows:

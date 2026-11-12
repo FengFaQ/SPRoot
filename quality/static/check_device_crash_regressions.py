@@ -194,6 +194,146 @@ def check_engine_key_abi(path: str) -> list:
     return problems
 
 
+# ── BUSY-1 ──────────────────────────────────────────────────────────────────
+# busy 标志（AtomicBoolean.compareAndSet 串行闸门）+ 同函数内的 try/finally 恢复
+BUSY_GATE_RE = re.compile(r"busy\.compareAndSet\s*\(\s*false\s*,\s*true\s*\)")
+BUSY_RELEASE_RE = re.compile(r"busy\.set\s*\(\s*false\s*\)")
+FUN_DECL_RE = re.compile(r"^\s*(?:private\s+|internal\s+|public\s+|protected\s+)?"
+                         r"(?:suspend\s+)?fun\s+(\w+)\s*\(")
+
+
+def _extract_function_blocks(lines):
+    """提取 (函数名, 起始行0基, 结束行0基) 列表（按花括号深度，保守实现）。"""
+    blocks = []
+    i = 0
+    while i < len(lines):
+        m = FUN_DECL_RE.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        depth = 0
+        started = False
+        end = i
+        for j in range(i, len(lines)):
+            for ch in lines[j]:
+                if ch == "{":
+                    depth += 1
+                    started = True
+                elif ch == "}":
+                    depth -= 1
+            if started and depth <= 0:
+                end = j
+                break
+        blocks.append((m.group(1), i, end))
+        i = end + 1
+    return blocks
+
+
+def check_busy_finally_coverage(path: str) -> list:
+    """BUSY-1：含 busy 闸门的函数里，busy.set(false) 必须出现在 finally 块内，
+    且函数体内 try 块开始之前的任何 return 都被禁止。
+
+    真机根因（bug-app 2026-11-12 审计）：PatchPipeline.execute() 的密钥获取
+    `getOrElse { finishFailure(...); return }` 写在 try 之前 → 该 return 跳过
+    finally 的 busy.set(false) → busy 永久 true → 修补功能整个进程内锁死。
+    这类缺陷编译器不报、运行期才炸，固化为静态规则。
+    """
+    problems = []
+    lines = _read_lines(path)
+    if lines is None:
+        return problems
+    text = "\n".join(lines)
+    if not BUSY_GATE_RE.search(text):
+        return problems  # 本文件不用 busy 闸门
+    for fname, start, end in _extract_function_blocks(lines):
+        body = lines[start:end + 1]
+        body_text = "\n".join(body)
+        if not BUSY_GATE_RE.search(body_text):
+            continue
+        # 找 finally { 的行（该函数内）
+        finally_line = None
+        depth = 0
+        j = 0
+        while j < len(body):
+            code = _strip_line_comment(body[j])
+            if re.search(r"\bfinally\s*\{", code):
+                finally_line = j
+                break
+            j += 1
+        if finally_line is None:
+            # 无 finally 模式：允许"每个非闸门 return 紧邻之前显式 busy.set(false)"
+            # （如 start() 的 early-return 分支）；检查每个 return 前 3 行内是否有释放。
+            gate_line = None
+            for k in range(0, len(body)):
+                if BUSY_GATE_RE.search(_strip_line_comment(body[k])):
+                    gate_line = k
+                    break
+            for k in range(0, len(body)):
+                # 放行两类不持有闸门的 return：
+                # ① 闸门行自身的 compareAndSet 失败快速退出；
+                # ② 闸门行之后紧随的 if(!gate) 块内 return（compareAndSet 失败分支，
+                #    例如 start() 的 `if (current.running || !busy.compareAndSet(...)) return`）。
+                if gate_line is not None and k <= gate_line + 2:
+                    # 只放行闸门行与其 if 条件块（缩进更深且在闸门行后的前 2 行内）
+                    if k == gate_line:
+                        continue
+                    gate_indent = len(body[gate_line]) - len(body[gate_line].lstrip())
+                    k_indent = len(body[k]) - len(body[k].lstrip())
+                    if k_indent > gate_indent:
+                        continue
+                code = _strip_line_comment(body[k])
+                if re.search(r"(?:^|[^\w])return\b", code):
+                    window = "\n".join(_strip_line_comment(x) for x in body[max(0, k - 3):k])
+                    if not BUSY_RELEASE_RE.search(window):
+                        problems.append((
+                            start + k + 1,
+                            "BUSY-1：函数 %s 的 return（第 %d 行）之前没有 finally，"
+                            "且前 3 行内也没有 busy.set(false)——该路径不释放闸门，"
+                            "操作入口此后整个进程内锁死。修法：用 try/finally 包住主逻辑。"
+                            % (fname, start + k + 1),
+                        ))
+            continue
+        # try { 的行（finally 之前最后一个 try）
+        try_line = None
+        for k in range(finally_line - 1, -1, -1):
+            if re.search(r"(?:^|[=\(\)\s])try\s*\{", _strip_line_comment(body[k])):
+                try_line = k
+                break
+        if try_line is None:
+            problems.append((
+                start + 1,
+                "BUSY-1：函数 %s 使用 busy 闸门且有 finally，但找不到配对的 try 块" % fname,
+            ))
+            continue
+        # try 之前（函数头到 try_line）出现裸 return → 会跳过 finally，判 FAIL。
+        # 例外：闸门行自身（busy.compareAndSet 失败快速退出）不持有闸门，放行。
+        gate_line = None
+        for k in range(0, try_line):
+            if BUSY_GATE_RE.search(_strip_line_comment(body[k])):
+                gate_line = k
+                break
+        for k in range(0, try_line):
+            if gate_line is not None and k == gate_line:
+                continue
+            code = _strip_line_comment(body[k])
+            if re.search(r"(?:^|[^\w])return\b", code):
+                problems.append((
+                    start + k + 1,
+                    "BUSY-1：函数 %s 在 try/finally 之前出现 return（第 %d 行）——"
+                    "该路径会跳过 finally 的 busy.set(false)，busy 永久为 true，"
+                    "修补/操作入口整个进程内锁死。修法：把这段逻辑挪进 try 内首个出口。"
+                    % (fname, start + k + 1),
+                ))
+        # finally 块内必须有 busy.set(false)
+        finally_text = "\n".join(body[finally_line:])
+        if not BUSY_RELEASE_RE.search(finally_text):
+            problems.append((
+                start + finally_line + 1,
+                "BUSY-1：函数 %s 的 finally 块内没有 busy.set(false)——闸门不会被释放" % fname,
+            ))
+    return problems
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="真机崩溃回归门禁（THREAD-1 Toast 跨线程 / KEYABI-1 密钥 ABI 48→47）"
@@ -222,7 +362,11 @@ def main(argv=None) -> int:
                 bad += 1
                 print("%s:0: READ-1：无法按 UTF-8 读取（门禁无法判定，按失败处理）" % path)
                 continue
-            for line, msg in check_thread_toast(path) + check_engine_key_abi(path):
+            for line, msg in (
+                check_thread_toast(path)
+                + check_engine_key_abi(path)
+                + check_busy_finally_coverage(path)
+            ):
                 bad += 1
                 print("%s:%d: %s" % (path, line, msg))
 
@@ -266,16 +410,52 @@ fun bad() {
 }
 """
 
+_GOOD_BUSY = """\
+package x
+object Pipeline {
+    private val busy = java.util.concurrent.atomic.AtomicBoolean(false)
+    fun execute() {
+        if (!busy.compareAndSet(false, true)) return
+        try {
+            val key = runCatching { SecretStore.get() }.getOrElse {
+                fail(); return
+            }
+            work(key)
+        } finally {
+            busy.set(false)
+        }
+    }
+}
+"""
+
+_BAD_BUSY = """\
+package x
+object Pipeline {
+    private val busy = java.util.concurrent.atomic.AtomicBoolean(false)
+    fun execute() {
+        if (!busy.compareAndSet(false, true)) return
+        val key = runCatching { SecretStore.get() }.getOrElse {
+            fail(); return
+        }
+        try {
+            work(key)
+        } finally {
+            busy.set(false)
+        }
+    }
+}
+"""
+
 
 def _run_snippet(src: str):
-    """把片段写成临时文件，跑两条规则，返回 (thread_problems, keyabi_problems)。"""
+    """把片段写成临时文件，跑三条规则，返回 (thread, keyabi, busy) 问题列表。"""
     import tempfile
 
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "S.kt")
         with open(p, "w", encoding="utf-8") as f:
             f.write(src)
-        return check_thread_toast(p), check_engine_key_abi(p)
+        return check_thread_toast(p), check_engine_key_abi(p), check_busy_finally_coverage(p)
 
 
 def _self_test() -> int:
@@ -288,12 +468,14 @@ def _self_test() -> int:
         ("THREAD-1 负样本：后台 Thread 直接 Toast", _BAD_THREAD, "thread", True),
         ("KEYABI-1 正样本：normalizeEngineKey 归一", _GOOD_KEYABI, "keyabi", False),
         ("KEYABI-1 负样本：lastRootKey 直接 kernelKeyOf", _BAD_KEYABI, "keyabi", True),
+        ("BUSY-1 正样本：密钥获取在 try 内", _GOOD_BUSY, "busy", False),
+        ("BUSY-1 负样本：try 前 return 跳过 finally", _BAD_BUSY, "busy", True),
     ]
     failures = 0
     print("== check_device_crash_regressions --self-test ==")
     for title, src, kind, expect_problem in cases:
-        tp, kp = _run_snippet(src)
-        got = bool(tp) if kind == "thread" else bool(kp)
+        tp, kp, bp = _run_snippet(src)
+        got = {"thread": bool(tp), "keyabi": bool(kp), "busy": bool(bp)}[kind]
         ok = got == expect_problem
         print("  %-46s 期望%s  实得%s  %s" % (
             title,
@@ -308,7 +490,7 @@ def _self_test() -> int:
     if failures:
         print("判定：SELF-TEST FAIL —— 有规则在负样本上没有变红（已退化为永远 PASS），禁止合入。")
         return 1
-    print("判定：SELF-TEST PASS —— 两条规则均在坏样本上变红、在好样本上放行。")
+    print("判定：SELF-TEST PASS —— 三条规则均在坏样本上变红、在好样本上放行。")
     return 0
 
 

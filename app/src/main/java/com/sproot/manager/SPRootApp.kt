@@ -16,6 +16,16 @@ class SPRootApp : Application() {
         runCatching {
             AppLog.info("App", "SPRoot Manager 启动 v${BuildConfig.VERSION_NAME} (${BuildConfig.BUILD_TYPE})")
         }
+        // 启动期清理 root-exec 临时密钥残留（ApdClient/DaemonBootstrap 的 finally 删除失败时
+        // 承诺"下次启动清理"——兑现它；正常删除成功的场景此目录为空，成本可忽略）。
+        runCatching {
+            val dir = java.io.File(filesDir, "exec-keys")
+            val stale = dir.listFiles()?.filter { it.isFile } ?: emptyList()
+            stale.forEach { f ->
+                if (!f.delete()) AppLog.warn("App", "临时密钥残留删除失败：${f.absolutePath}")
+            }
+            if (stale.isNotEmpty()) AppLog.warn("App", "启动清理 exec-keys 残留 ${stale.size} 个")
+        }.onFailure { android.util.Log.e("SPRootApp", "exec-keys 启动清理失败", it) }
         // App 自引导（人类指令 A）：冷启动时确保 AP 守护在运行。
         // 内部先 apd selftest 探测（stage=daemon_ready 即在跑），未部署视为正常初始态；
         // 已部署但未运行 → 通过 root-exec 拉起 daemon。结果落 SharedPreferences，主页只读展示。

@@ -41,15 +41,52 @@ def run(step: str, cmd: list[str]) -> tuple[int, str]:
     return proc.returncode, out
 
 
-def check_ok(cmd: list[str]) -> None:
+def check_ok(path: str | None, label: str) -> None:
     """Fail loudly on a required input that does not exist.
 
     A missing ``--report`` used to make the audit silently report
     ``attributed_regions: 0`` and still exit 0. The audit itself now blocks on
     that (PA-0), but a caller-side check gives a much better error message and
     stops the whole run before it produces a misleading summary.
+
+    BUG-QA-12（2026-11-12 审计）：旧版此函数只有 docstring 没有 body（``pass``），
+    文档承诺的预检从未发生；现已真实实现并在 main() 的 --report/--orig/--patched
+    处调用。
     """
-    pass
+    if not path:
+        print(f"\n[FATAL] 缺少 --{label}：无法继续（{label} 是本层验证的必需输入）",
+              file=sys.stderr)
+        sys.exit(2)
+    if not os.path.isfile(path):
+        print(f"\n[FATAL] --{label} 指向的文件不存在: {path}", file=sys.stderr)
+        sys.exit(2)
+
+
+def arbitration(results: dict[str, dict]) -> tuple[int, list[str]]:
+    """BUG-QA-4：两套体系（bootability A/B/C）结论聚合 + 冲突显式化。
+
+    本入口只代表 bootability 一套；crossverify 由 quality/crossverify/run.sh
+    独立执行。run.sh 汇入 crossverify 的 JSON 后以本函数同样的规则仲裁：
+    任一 FAIL 即 FAIL（更严格者为准），冲突时必须显式输出 CONFLICT。
+
+    返回 (exit_code, conflict_notes)。
+    """
+    notes: list[str] = []
+    failed = [k for k, v in results.items() if v.get("ok") is False]
+    passed = [k for k, v in results.items() if v.get("ok") is True]
+    infeasible = [k for k, v in results.items() if v.get("ok") is None
+                  and (v.get("infeasible") or v.get("skipped"))]
+    # 冲突定义：同一对象上既存在 PASS 又存在 FAIL 的层级
+    if failed and passed:
+        notes.append(
+            "CONFLICT: bootability 内部层级结论不一致 —— PASS=%s FAIL=%s；"
+            "以更严格（FAIL）为准，PASS 层的证据仍有效，需人工归因差异"
+            % (",".join(passed), ",".join(failed)))
+    if infeasible and (failed or passed):
+        notes.append(
+            "NOTE: 部分层不可执行（%s）——不可执行不等于通过，结论覆盖度受限"
+            % ",".join(infeasible))
+    return (1 if failed else 0), notes
 
 
 def stage_status(json_path: str, rc: int) -> dict:
@@ -132,18 +169,10 @@ def main(argv: list[str]) -> int:
     # 没有 report 时 patch_audit 只能做字节 diff、无法回答「改的是哪里」，
     # 而「归属到具体函数」正是本层的价值。虽然 PA-0 会让它判 FAIL，这里
     # 提前拦一次，给出比 `blocking: 1` 更直接的原因。
-    if not args.report:
-        print(
-            "\n[FATAL] 缺少 --report：无法把字节改动归属到 hook 组。\n"
-            "        「逐代码检查」的价值在于回答『改的是哪个函数』；"
-            "只有字节 diff 等于没做这一层。\n"
-            "        请传 --report <kernel.patched.report.json>（引擎会自动生成）。",
-            file=sys.stderr,
-        )
-        return 2
-    if not os.path.isfile(args.report):
-        print(f"\n[FATAL] --report 指向的文件不存在: {args.report}", file=sys.stderr)
-        return 2
+    # （BUG-QA-12：预检由 check_ok 真实执行，不再只是 docstring 承诺。）
+    check_ok(args.orig, "orig")
+    check_ok(args.patched, "patched")
+    check_ok(args.report, "report")
 
     a_json = os.path.join(args.out, "patch-audit.json")
     base = [py, os.path.join(HERE, "patch_audit.py"), "--orig", args.orig,
@@ -203,8 +232,11 @@ def main(argv: list[str]) -> int:
     with open(os.path.join(args.out, "summary.json"), "w", encoding="utf-8") as fh:
         json.dump(results, fh, ensure_ascii=False, indent=2)
 
-    failed = [k for k, v in results.items() if v.get("ok") is False]
-    if failed:
+    rc, conflict_notes = arbitration(results)
+    for note in conflict_notes:
+        print(f"\n{note}")
+    if rc:
+        failed = [k for k, v in results.items() if v.get("ok") is False]
         print(f"\n判定：FAIL（{', '.join(failed)}）")
         return 1
     print("\n判定：PASS（A/B 无阻断发现，C 无回归）")

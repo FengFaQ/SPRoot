@@ -189,17 +189,21 @@ object PatchPipeline {
         var bootRcInjected = false
         var rcTarget = "boot"
         val initBootUriString = state.value.initBootSourceUri
-        val key = runCatching { SecretStore.get(context).getOrCreateRootKey() }.getOrElse {
-            finishFailure(
-                title = "无法取得 Root 密钥",
-                detail = "读写本地加密密钥失败：${it.javaClass.simpleName}: ${it.message}\n" +
-                    "请到「设置 → Root 密钥」重新生成后再试。",
-                code = null,
-            )
-            return
-        }
 
         try {
+            // 密钥获取必须放在 try 内：此前在 try 之前 return 会跳过 finally 的 busy.set(false)，
+            // 导致 Keystore 失败一次后 busy 永久为 true → 本次进程内所有"开始修补"点击
+            // 在 start() 的 compareAndSet 处被静默忽略（修补功能锁死）。
+            val key = runCatching { SecretStore.get(context).getOrCreateRootKey() }.getOrElse {
+                finishFailure(
+                    title = "无法取得 Root 密钥",
+                    detail = "读写本地加密密钥失败：${it.javaClass.simpleName}: ${it.message}\n" +
+                        "请到「设置 → Root 密钥」重新生成后再试。",
+                    code = null,
+                )
+                return
+            }
+
             // ---------- ① 环境自检 ----------
             stage(PatchStage.PREFLIGHT, 2f, "检查 ABI / 引擎 / magiskboot / 存储")
             val caps = Capabilities.collect(context)
@@ -807,6 +811,7 @@ object PatchPipeline {
             )
             // P2：自启注入产物 init_boot（与内核修补产物 boot 同批导出；
             // 此前任一校验失败都已中止，不会只出一半）
+            // 注：导出失败语义（boot 已出、init_boot 失败时是否回滚）待产品决策，维持原顺序。
             if (initBootUriString.isNullOrBlank()) {
                 state.value = state.value.copy(initBootOutputPath = null)
             } else {
@@ -829,6 +834,9 @@ object PatchPipeline {
                 )
             }
 
+            // 引擎 report 的 root_key 是**调引擎时传入的 48 字符**（47 字符 + 1 位填充），
+            // 内核真正内嵌的只是前 47 位。这里必须先归一到 47 再交给 kernelKeyOf，
+            // 否则会在 require(isValidKey) 处抛 IllegalArgumentException。
             // 引擎 report 的 root_key 是**调引擎时传入的 48 字符**（47 字符 + 1 位填充），
             // 内核真正内嵌的只是前 47 位。这里必须先归一到 47 再交给 kernelKeyOf，
             // 否则会在 require(isValidKey) 处抛 IllegalArgumentException。
@@ -912,9 +920,10 @@ object PatchPipeline {
     // ------------------------------------------------------------ 引擎进度事件
     private fun onEngineEvent(evt: String) {
         val event = MiniJson.string(evt, "event")
-        // 容错：个别引擎实现可能只写 pct/phase 而不带 event 字段；两种都按进度处理
+        // 容错：个别引擎实现可能只写 pct/phase 而不带 event 字段；两种都按进度处理。
+        // phase 缺失也不能整条丢弃（否则 UI 卡在 35% 不动），给默认文案继续推进。
         if (event == null || event == "progress") {
-            val phase = MiniJson.string(evt, "phase") ?: return
+            val phase = MiniJson.string(evt, "phase") ?: "working"
             val pct = (MiniJson.int(evt, "pct") ?: MiniJson.int(evt, "percent"))?.coerceIn(0, 100) ?: 0
             val detail = MiniJson.string(evt, "detail") ?: ""
             // 引擎 0..100 映射到流水线 35..80（修补是主耗时段；80→100 留给回压/重打包/校验/导出）

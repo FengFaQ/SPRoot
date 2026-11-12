@@ -86,9 +86,17 @@ std::vector<const char*> rc_virt_required_symbols() {
 }
 
 std::vector<RcVirtCave> rc_virt_scan_caves(const std::vector<char>& buf, size_t lo, size_t hi,
-                                           size_t min_size, size_t max_out) {
+                                           size_t min_size, size_t max_out,
+                                           const std::vector<RcVirtCave>& excluded) {
 	std::vector<RcVirtCave> out;
 	if (min_size == 0 || lo >= hi || hi > buf.size() || max_out == 0) return out;
+	// 区间相交判定（ENG-1）：[a0,a1) 与 [b0,b1) 相交 ⇔ a0 < b1 && b0 < a1
+	auto overlaps_any = [&](size_t s, size_t e) {
+		for (const auto& x : excluded) {
+			if (s < x.offset + x.size && x.offset < e) return true;
+		}
+		return false;
+	};
 	size_t i = lo;
 	while (i < hi && out.size() < max_out) {
 		if (static_cast<unsigned char>(buf[i]) != 0) { ++i; continue; }
@@ -96,7 +104,8 @@ std::vector<RcVirtCave> rc_virt_scan_caves(const std::vector<char>& buf, size_t 
 		while (j < hi && static_cast<unsigned char>(buf[j]) == 0) ++j;
 		// 起点必须是 4 字节对齐（指令取指要求）
 		size_t start = (i + 3) & ~static_cast<size_t>(3);
-		if (start < j && (j - start) >= min_size) out.push_back({ start, j - start });
+		if (start < j && (j - start) >= min_size && !overlaps_any(start, j))
+			out.push_back({ start, j - start });
 		i = j;
 	}
 	return out;
@@ -144,7 +153,8 @@ PatchRcVirtualize::PatchRcVirtualize(const PatchBase& patch_base, const KernelSy
 	: PatchBase(patch_base), m_sym(sym) {}
 PatchRcVirtualize::~PatchRcVirtualize() {}
 
-bool PatchRcVirtualize::precheck(size_t cred_offset, RcVirtInfo& info) {
+bool PatchRcVirtualize::precheck(size_t cred_offset, RcVirtInfo& info,
+                                 const std::vector<RcVirtCave>& occupied) {
 	info.mode = "rc";
 	info.reason.clear();
 	info.caves.clear();
@@ -188,8 +198,11 @@ bool PatchRcVirtualize::precheck(size_t cred_offset, RcVirtInfo& info) {
 	const RcVirtDataLayout layout = rc_virt_data_layout();
 	if (!layout.ok) { info.reason = "data layout unsafe: " + layout.reason; return false; }
 
-	// 扫描 .text 内的零填充洞（铁律：不硬编码地址）
-	info.caves = rc_virt_scan_caves(m_file_buf, m_sym._stext, m_sym._etext, RC_VIRT_MIN_CAVE_BYTES);
+	// 扫描 .text 内的零填充洞（铁律：不硬编码地址）。
+	// occupied = 本 run 已被其它补丁占用的区间（ENG-1）：相交的零区不算合法洞，
+	// 否则 <6.1 分支会把 rc blob 织进 [0x200,0x200+0x800) 的硬编码 hook 区 → 互踩变砖。
+	info.caves = rc_virt_scan_caves(m_file_buf, m_sym._stext, m_sym._etext,
+	                                RC_VIRT_MIN_CAVE_BYTES, RC_VIRT_MAX_REPORT_CAVES, occupied);
 	if (info.caves.empty()) {
 		info.reason = "no zero-filled cave >= " + std::to_string(RC_VIRT_MIN_CAVE_BYTES) + " B in .text";
 		return false;
@@ -212,11 +225,17 @@ bool PatchRcVirtualize::precheck(size_t cred_offset, RcVirtInfo& info) {
 
 std::vector<uint8_t> PatchRcVirtualize::build_blob(size_t blob_base, size_t hook_addr,
                                                    size_t cred_offset, size_t cred_uid_offset,
-                                                   size_t& restore_insn_offset) {
+                                                   size_t& restore_insn_offset, bool* ok) {
 	const RcVirtDataLayout layout = rc_virt_data_layout();
 	const std::vector<char> data = build_data(layout);
 	const std::string tmpl = rc_virt_template();
 	restore_insn_offset = 0;
+	if (ok) *ok = false;
+
+	// 华为内核：emit_get_current 需要 ADRP 的"当前指令绝对地址"，必须以 blob 实际
+	// 落位地址为基（ENG-2）。此前拷贝构造不携带 m_huawei_kti_calc_base 且这里从不
+	// 设置 → page_delta 超出 ±4GB → emit_huawei_kti_add _exit 猝死（绕过统一失败出口）。
+	if (is_huawei()) update_huawei_kti_calc_base(blob_base);
 
 	const size_t sym_strncpy = m_sym.strncpy_from_user_fn.offset;
 	const size_t sym_strcmp = m_sym.str_cmp.offset;
@@ -371,6 +390,7 @@ std::vector<uint8_t> PatchRcVirtualize::build_blob(size_t blob_base, size_t hook
 	uint32_t orig_insn = 0;
 	memcpy(&orig_insn, m_file_buf.data() + hook_addr, sizeof(orig_insn));
 	memcpy(bytes.data() + restore_insn_offset, &orig_insn, sizeof(orig_insn));
+	if (ok) *ok = true;
 	return bytes;
 }
 
@@ -381,12 +401,33 @@ bool PatchRcVirtualize::weave(size_t cred_offset, size_t cred_uid_offset, const 
 	const size_t hook_addr = skip_pac_bti_at_func_start(static_cast<uint32_t>(m_sym.openat_sys.offset));
 	for (const auto& cave : info.caves) {
 		size_t restore_off = 0;
-		std::vector<uint8_t> blob = build_blob(cave.offset, hook_addr, cred_offset, cred_uid_offset, restore_off);
-		if (blob.empty()) { cand.reason = "blob generation failed"; out_info = cand; return false; }
+		bool blob_ok = false;
+		std::vector<uint8_t> blob = build_blob(cave.offset, hook_addr, cred_offset, cred_uid_offset,
+		                                       restore_off, &blob_ok);
+		if (!blob_ok || blob.empty()) { cand.reason = "blob generation failed"; out_info = cand; return false; }
 		if (blob.size() > cave.size) continue;   // 洞放不下 → 试下一个
+		// ENG-1 防线（weave 侧兜底断言）：落位前确认 cave 与 vec_out 已占用的每个
+		// [write_addr, write_addr+len) 都不相交。precheck 的洞扫描已排除，这里是
+		// 独立的第二道闸（调用方若没传 occupied 也不会静默互踩）。
+		bool overlaps_existing = false;
+		for (const auto& p : vec_out) {
+			const size_t plen = p.str_bytes.length() / 2;
+			if (cave.offset < p.write_addr + plen && p.write_addr < cave.offset + blob.size()) {
+				overlaps_existing = true;
+				break;
+			}
+		}
+		if (overlaps_existing) continue;         // 相交 → 试下一个洞（绝不覆盖活补丁）
+		// 入口跳转生成失败（±128MB 越界等）→ 该洞作废，试下一个（ENG-4）：
+		// 绝不"blob 已写、入口没跳"地留下 enabled=true 的半成品（report 谎报）。
+		const size_t before_jump = vec_out.size();
+		const size_t jump_bytes = patch_jump(hook_addr, cave.offset + restore_off, vec_out);
+		if (jump_bytes == 0 || vec_out.size() != before_jump + 1) {
+			vec_out.resize(before_jump);         // 回滚（保险：patch_jump 失败本就不 push）
+			continue;
+		}
 		const std::string hex = bytes2hex(blob.data(), blob.size());
 		vec_out.push_back({ hex, cave.offset });
-		patch_jump(hook_addr, cave.offset + restore_off, vec_out);
 		out_info = cand;
 		out_info.enabled = true;
 		out_info.cave_offset = cave.offset;

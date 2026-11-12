@@ -81,7 +81,18 @@ object DaemonBootstrap {
     private const val PROBE_TIMEOUT_SEC = 5
 
     @Synchronized
-    fun ensure(context: Context, source: String): Result {
+    fun ensure(context: Context, source: String): Result = ensure(context, source, startAttempts = 6)
+
+    /**
+     * 带预算的幂等自引导。
+     *
+     * @param startAttempts 拉起后的确认轮询次数（每轮 sleep(400) + 一次 5s 超时探测）。
+     *   冷启动路径（无时限约束）用默认 6 次（最坏 ~2 分钟）；
+     *   BOOT_COMPLETED 广播路径必须用 2 次——goAsync 时限约 10s，
+     *   否则 receiver 超时被系统冻结，pending.finish() 迟迟不执行（ANR 记录）。
+     */
+    @Synchronized
+    fun ensure(context: Context, source: String, startAttempts: Int): Result {
         // 人类真机反馈：冷启动路径绝不能有同步 root-exec（慢设备会 ANR/被杀 → "首次打开闪退"）。
         // 调用方已在后台线程；这里再兜一层，误用直接返回失败而不是阻塞主线程。
         if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
@@ -155,8 +166,8 @@ object DaemonBootstrap {
             builder.redirectError(ProcessBuilder.Redirect.to(devNull))
             proc = builder.start()
 
-            // 轮询确认（最多 ~2.4s；daemon 首次启动要做 auth store/事件阶段）
-            repeat(6) { index ->
+            // 轮询确认（次数由 startAttempts 决定；daemon 首次启动要做 auth store/事件阶段）
+            repeat(startAttempts.coerceIn(1, 6)) { index ->
                 Thread.sleep(400)
                 val p = runCatching { ApdSelfTest.run(context, timeoutSec = PROBE_TIMEOUT_SEC) }.getOrNull() ?: return@repeat
                 lastProbe = p

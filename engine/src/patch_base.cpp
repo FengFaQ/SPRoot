@@ -1,5 +1,7 @@
-﻿#include "patch_base.h"
+#include "patch_base.h"
 #include "3rdparty/find_mrs_register.h"
+
+#include <cstdlib>
 
 using namespace asmjit;
 using namespace asmjit::a64;
@@ -17,11 +19,16 @@ PatchBase::PatchBase(const PatchBase& other)
 	: m_file_buf(other.m_file_buf)
 	, m_kernel_ver_parser(other.m_file_buf)
 	, m_init_cred_searcher(other.m_init_cred_searcher)
-	, m_huawei_extra(other.m_huawei_extra) {}
+	, m_huawei_extra(other.m_huawei_extra)
+	// ENG-2：必须携带 kti 计算基址——否则华为内核的拷贝副本（PatchDoExecve 等）在
+	// 自己的 update_huawei_kti_calc_base 之前就带着 0 基址生成 ADRP，page_delta
+	// 超界 → emit_huawei_kti_add _exit 猝死（绕过统一失败出口，无 report/NDJSON/ROOT_KEY 行）。
+	, m_huawei_kti_calc_base(other.m_huawei_kti_calc_base) {}
 
 PatchBase::~PatchBase() {}
 
 uint32_t PatchBase::skip_pac_bti_at_func_start(uint32_t addr) {
+	if ((uint64_t)addr + sizeof(uint32_t) > m_file_buf.size()) return addr;   // ENG-7
 	uint32_t instr = *reinterpret_cast<const uint32_t*>(&m_file_buf[addr]);
 	if (aarch64_insn_is_pac_or_bti(instr)) return addr + 4;
 	return addr;
@@ -36,7 +43,8 @@ SymbolRegion PatchBase::skip_pac_bti_at_func_start(const SymbolRegion& sym) {
 size_t PatchBase::patch_jump(size_t patch_addr, size_t jump_addr, std::vector<patch_bytes_data>& vec_out_patch_bytes_data) {
 	aarch64_asm_ctx asm_ctx = init_aarch64_asm();
 	auto a = asm_ctx.assembler();
-	aarch64_asm_b(a, (int32_t)(jump_addr - patch_addr));
+	// ENG-4：检查 aarch64_asm_b 的返回值（±128MB/4 对齐守卫失败时它不 embed 任何字节）。
+	if (!aarch64_asm_b(a, (int32_t)(jump_addr - patch_addr))) return 0;
 	std::vector<uint8_t> bytes = aarch64_asm_to_bytes(a);
 	if (bytes.size() == 0) return 0;
 	std::string str_bytes = bytes2hex((const unsigned char*)bytes.data(), bytes.size());
@@ -111,7 +119,16 @@ void PatchBase::emit_safe_bl(Assembler* a, size_t func_base_addr, size_t target)
 	RegProtectGuard g1(a, x29, x30);
 	size_t bl_addr = func_base_addr + a->offset();
 	int64_t diff = (int64_t)target - (int64_t)bl_addr;
-	aarch64_asm_bl_raw(a, (int32_t)diff);
+	// ENG-4：检查返回值——守卫失败时 aarch64_asm_bl_raw 不 embed 任何字节，继续
+	// 组装会生成"调用了不存在调用"的残缺 blob。失败时记入 errorHandler（
+	// assemble_aarch64 会因此返回空 → 上层统一失败路径），并 emit nop 占位维持形状。
+	if (!aarch64_asm_bl_raw(a, (int32_t)diff)) {
+		if (auto* eh = a->errorHandler()) eh->handleError(kErrorInvalidState,
+		                                                  "bl_raw failed (range guard)",
+		                                                  a);
+		a->nop();
+		a->nop();
+	}
 }
 
 std::vector<uint8_t> PatchBase::assemble_aarch64(std::function<void(asmjit::a64::Assembler* a)> fn) {
@@ -136,7 +153,8 @@ int PatchBase::count_mrs_sp_el0() {
 std::vector<size_t> PatchBase::find_all_aarch64_ret_offsets(size_t offset, size_t size) {
 	std::vector<size_t> v_ret_addr;
 	std::string mode;
-	for (size_t i = offset; i < offset + size; i += 4) {
+	// ENG-7：range 尾部可能越界（size 来自符号表），逐条钳制到缓冲内。
+	for (size_t i = offset; i + sizeof(uint32_t) <= m_file_buf.size() && i < offset + size; i += 4) {
 		uint32_t instr = *reinterpret_cast<const uint32_t*>(&m_file_buf[i]);
 		std::string cur;
 		if (aarch64_insn_is_ret(instr)) cur = "ret";
@@ -197,9 +215,18 @@ void PatchBase::emit_huawei_kti_add(Assembler* a, GpX x) {
 	if (!is_huawei()) return;
 	RegProtectGuard g1(a, x1);
 	uint64_t cur_abs_addr = (uint64_t)m_huawei_kti_calc_base + (uint64_t)a->offset();
+	// ENG-2：编码失败不再 _exit 猝死（那会绕过统一失败出口——无 report/NDJSON/ROOT_KEY）。
+	// 改为记入 errorHandler：assemble_aarch64 检查 isError() 后返回空 vector →
+	// build_blob/weave 失败 → pipeline 降级（enabled=false+reason）/ main 走 fail()。
 	if (!aarch64_asm_adrp_x(a, x1, cur_abs_addr, (uint64_t)m_huawei_extra.kti_addr)) {
-		std::cout << "[发生错误] aarch64_asm_adrp_x failed" << std::endl;
-		_exit(EXIT_FAILURE);
+		std::cout << "[发生错误] aarch64_asm_adrp_x failed (kti base=0x" << std::hex
+		          << m_huawei_kti_calc_base << ", kti=0x" << m_huawei_extra.kti_addr << ")"
+		          << std::endl;
+		if (auto* eh = a->errorHandler()) eh->handleError(kErrorInvalidState,
+		                                                  "adrp_x failed (huawei kti)",
+		                                                  a);
+		a->mov(x1, 0);   // 占位维持指令流形状（结果会因 errorHandler 置错被上层丢弃）
+		return;
 	}
 	uint32_t lo12 = (uint32_t)(m_huawei_extra.kti_addr & 0xFFF);
 	a->ldr(x1, ptr(x1, lo12));

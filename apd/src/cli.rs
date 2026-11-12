@@ -462,6 +462,14 @@ pub fn run() -> Result<()> {
                     }
                 }
                 Module::Config { internal, command } => {
+                    // BUG-APD-10 fix (2026-11-12): the internal name becomes a
+                    // directory component under MODULE_CONFIG_DIR, so it must
+                    // pass the same id rule as module.prop ids (module.rs) —
+                    // the previous raw `format!("internal.{name}")` let
+                    // `--internal ../../x` traverse out of the config root.
+                    if let Some(internal_name) = &internal {
+                        module_config::validate_module_id(internal_name)?;
+                    }
                     let module_id = match internal {
                         Some(internal_name) => format!("internal.{internal_name}"),
                         None => std::env::var("AP_MODULE").map_err(|_| {

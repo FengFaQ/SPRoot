@@ -50,9 +50,12 @@ struct RcVirtCave {
 };
 
 // 在 [lo, hi) 中扫描连续 0x00 的洞（起点 4 字节对齐、大小 >= min_size），按出现顺序返回。
+// excluded：本 run 已被其它补丁占用的 [start, end) 区间（ENG-1）——洞若与其相交则跳过，
+// 防止 rc blob 与 <6.1 分支硬编码 hook 区（[0x200,0x200+0x800) 等）同址重叠互踩。
 // 纯函数：无 IO、无全局状态 —— 供主流程与 --self-test-rcvirtual 共用同一份实现。
 std::vector<RcVirtCave> rc_virt_scan_caves(const std::vector<char>& buf, size_t lo, size_t hi,
-                                           size_t min_size, size_t max_out = RC_VIRT_MAX_REPORT_CAVES);
+                                           size_t min_size, size_t max_out = RC_VIRT_MAX_REPORT_CAVES,
+                                           const std::vector<RcVirtCave>& excluded = {});
 
 // 数据区布局（blob 相对偏移）。不变量：替换串必须严格短于每个被覆写的原路径串
 // （因为我们是**原地覆写用户 path**，而不是改用户栈指针）。
@@ -87,8 +90,11 @@ public:
 	~PatchRcVirtualize();
 
 	// 检查前置条件（符号齐全 + kernel_read/write 新签名 + 数据布局安全 + 有合法洞）。
+	// occupied：本 run 已被其它补丁占用的区间（ENG-1）——洞扫描会排除与之相交的零区，
+	// 防止 rc blob 覆盖 <6.1 分支已织入的 hook 链（变砖路径）。
 	// 不满足时返回 false，info.reason 说明原因（不抛异常、不写盘）。
-	bool precheck(size_t cred_offset, RcVirtInfo& info);
+	bool precheck(size_t cred_offset, RcVirtInfo& info,
+	              const std::vector<RcVirtCave>& occupied = {});
 
 	// 生成 blob 并放置到洞；同时把 openat 入口改成跳转。
 	// 取 info.caves 中第一个能容纳 blob 的洞；都不行则返回 false（out_info.reason 说明）。
@@ -97,7 +103,8 @@ public:
 
 private:
 	std::vector<uint8_t> build_blob(size_t blob_base, size_t hook_addr, size_t cred_offset,
-	                                size_t cred_uid_offset, size_t& restore_insn_offset);
+	                                size_t cred_uid_offset, size_t& restore_insn_offset,
+	                                bool* ok = nullptr);
 
 	KernelSymbolOffset m_sym;
 };

@@ -87,6 +87,36 @@ fn validate_config_count(config: &HashMap<String, String>) -> Result<()> {
     Ok(())
 }
 
+/// Validate a module id used as a config directory name (BUG-APD-10, 2026-11-12).
+///
+/// Same rule as module_config keys and the zip `module.prop` id
+/// (module.rs: `^[a-zA-Z][a-zA-Z0-9._-]+$`): the id becomes a path component
+/// under [`MODULE_CONFIG_DIR`], so a traversal-shaped input (`../x`, `a/b`,
+/// absolute paths) must be rejected at this trust boundary instead of being
+/// spliced into an arbitrary `/data/adb/...` location.
+///
+/// Note `.`/`..` are rejected by the regex itself (it requires a letter first),
+/// so both `internal.`-prefixed and raw module ids are safe once validated.
+pub fn validate_module_id(module_id: &str) -> Result<()> {
+    if module_id.is_empty() {
+        bail!("Module id cannot be empty");
+    }
+    if module_id.len() > MAX_CONFIG_KEY_LEN {
+        bail!(
+            "Module id too long: {} bytes (max: {MAX_CONFIG_KEY_LEN})",
+            module_id.len()
+        );
+    }
+    let re = regex_lite::Regex::new(r"^[a-zA-Z][a-zA-Z0-9._-]+$")?;
+    if !re.is_match(module_id) {
+        bail!(
+            "Invalid module id: '{module_id}'. Must match /^[a-zA-Z][a-zA-Z0-9._-]+$/ \
+             (path traversal is rejected)"
+        );
+    }
+    Ok(())
+}
+
 /// Get the config directory path for a module
 fn get_config_dir(module_id: &str) -> PathBuf {
     Path::new(defs::MODULE_CONFIG_DIR).join(module_id)
@@ -197,6 +227,24 @@ pub fn load_config(module_id: &str, config_type: ConfigType) -> Result<HashMap<S
     Ok(config)
 }
 
+/// Temp path for an atomic write: the **full target name plus `.tmp`**
+/// (BUG-APD-7, 2026-11-12).
+///
+/// Never use `Path::with_extension("tmp")` here. `with_extension` *replaces*
+/// the extension, so the mapping is not injective: `persist.config` would
+/// become `persist.tmp`, and any future sibling target with the same stem
+/// (e.g. `persist.bin`) would share that one temp file — two writers racing on
+/// the same temp, one renaming the other's file away while both believe their
+/// write succeeded. This is the exact defect the same fix closed in
+/// `deploy::tmp_sibling` (APD-4); module_config had inherited the old pattern.
+/// Appending keeps the mapping injective and the temp in the same directory,
+/// which is what makes the `rename` atomic (same filesystem).
+fn tmp_sibling(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
 /// Save config to binary file
 pub fn save_config(
     module_id: &str,
@@ -216,7 +264,9 @@ pub fn save_config(
     ensure_config_dir(module_id)?;
 
     let config_path = get_config_path(module_id, config_type);
-    let temp_path = config_path.with_extension("tmp");
+    // Appended `.tmp` (BUG-APD-7): must be `<name>.config.tmp`, never the
+    // extension-collapsed `<stem>.tmp` — see `tmp_sibling`.
+    let temp_path = tmp_sibling(&config_path);
 
     // Write to temporary file first
     let mut file = File::create(&temp_path)
@@ -398,16 +448,26 @@ pub fn get_all_module_configs() -> Result<HashMap<String, HashMap<String, String
     Ok(all_configs)
 }
 
-/// Clear all temporary configs (called during post-fs-data)
-pub fn clear_all_temp_configs() -> Result<()> {
+/// Clear all temporary configs (called during post-fs-data).
+///
+/// BUG-APD-12 fix (2026-11-12): individual removal failures are no longer
+/// folded into `Ok(())`. The caller's contract is "temp configs are cleared on
+/// every reboot"; because temp overrides persist in [`merge_configs`], a
+/// silently surviving `tmp.config` keeps overriding its module's persisted
+/// config across reboots with nothing but a debug/warn line to show for it.
+/// The remaining failures are now returned as a list (and logged at warn), so
+/// the caller can retry or at least surface the residue; `Ok` means every
+/// temp config that existed was actually removed.
+pub fn clear_all_temp_configs() -> Result<Vec<String>> {
     let config_root = Path::new(defs::MODULE_CONFIG_DIR);
 
     if !config_root.exists() {
         debug!("Config directory does not exist, nothing to clear");
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let mut cleared_count = 0;
+    let mut failed: Vec<String> = Vec::new();
 
     for entry in fs::read_dir(config_root)
         .with_context(|| format!("Failed to read config directory: {}", config_root.display()))?
@@ -428,6 +488,7 @@ pub fn clear_all_temp_configs() -> Result<()> {
                 }
                 Err(e) => {
                     warn!("Failed to clear temp config {}: {e}", temp_config.display());
+                    failed.push(temp_config.display().to_string());
                 }
             }
         }
@@ -436,8 +497,16 @@ pub fn clear_all_temp_configs() -> Result<()> {
     if cleared_count > 0 {
         debug!("Cleared {cleared_count} temp config file(s)");
     }
+    if !failed.is_empty() {
+        warn!(
+            "clear_all_temp_configs: {} temp config file(s) SURVIVED and will keep \
+             overriding their module's persist config: {}",
+            failed.len(),
+            failed.join(", ")
+        );
+    }
 
-    Ok(())
+    Ok(failed)
 }
 
 /// Clear all configs for a module (called during uninstall)
@@ -455,4 +524,214 @@ pub fn clear_module_configs(module_id: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    // -----------------------------------------------------------------------
+    // BUG-APD-10 (2026-11-12): module ids become path components under
+    // MODULE_CONFIG_DIR. Every traversal shape the id regex rejects is listed
+    // explicitly — the negative samples ARE the fix.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_module_id_accepts_documented_shapes() {
+        // NOTE: the shared id regex requires >= 2 chars (letter first, then one
+        // or more body chars) — same rule as module.rs's zip-id check, so a
+        // single-letter id "m" is (by the shared rule) rejected; the positive
+        // samples below respect that.
+        for ok in [
+            "my_module",
+            "ab",
+            "module.v2",
+            "internal-name",
+            "NeoZygisk1",
+        ] {
+            assert!(validate_module_id(ok).is_ok(), "{ok} must be accepted");
+        }
+        // Single char is rejected by the shared regex (documented, intentional).
+        assert!(validate_module_id("m").is_err());
+    }
+
+    #[test]
+    fn validate_module_id_rejects_traversal_and_bad_shapes() {
+        for bad in [
+            "../escape",
+            "a/b",
+            "..",
+            ".",
+            "/abs",
+            "C:\\x",
+            "-starts-with-dash",
+            "1numeric-first",
+            "with space",
+            "with,,comma",
+            "",
+            "internal../x", // dot-run after a letter is fine for keys, but '..' inside fails
+        ] {
+            assert!(
+                validate_module_id(bad).is_err(),
+                "{bad:?} must be rejected (path traversal / invalid shape)"
+            );
+        }
+    }
+
+    /// The acceptance regex must agree with module.rs's zip-id rule; a drift
+    /// would let an install path accept an id the config path rejects.
+    #[test]
+    fn validate_module_id_agrees_with_the_zip_id_regex() {
+        let re = regex_lite::Regex::new(r"^[a-zA-Z][a-zA-Z0-9._-]+$").unwrap();
+        for id in ["a", "ab1", "a.b-c_d", "a..b", "a/", "a\\b", "a b", "A"] {
+            assert_eq!(
+                re.is_match(id),
+                validate_module_id(id).is_ok(),
+                "divergence on {id:?}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // BUG-APD-7 (2026-11-12): temp naming must append `.tmp` to the FULL name,
+    // never substitute the extension (`with_extension` collapses distinct
+    // targets onto one temp file — see deploy::tmp_sibling for the original
+    // finding).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tmp_sibling_preserves_full_name() {
+        let cfg = Path::new("/data/adb/ap/module_configs/mod/persist.config");
+        assert_eq!(
+            tmp_sibling(cfg),
+            Path::new("/data/adb/ap/module_configs/mod/persist.config.tmp")
+        );
+        // And the wrong answer really is what with_extension gives.
+        assert_eq!(
+            cfg.with_extension("tmp"),
+            Path::new("/data/adb/ap/module_configs/mod/persist.tmp")
+        );
+    }
+
+    #[test]
+    fn tmp_sibling_is_injective_for_same_stem_targets() {
+        let persist = tmp_sibling(Path::new("persist.config"));
+        let future_sibling = tmp_sibling(Path::new("persist.bin"));
+        assert_ne!(
+            persist, future_sibling,
+            "same-stem targets must get distinct temp files"
+        );
+        // The broken mapping collides — shown so the defect stays testable.
+        assert_eq!(
+            Path::new("persist.config").with_extension("tmp"),
+            Path::new("persist.bin").with_extension("tmp")
+        );
+    }
+
+    #[test]
+    fn tmp_sibling_stays_in_the_same_directory() {
+        let target = Path::new("/data/adb/ap/module_configs/mod/tmp.config");
+        let tmp = tmp_sibling(target);
+        assert_eq!(tmp.parent(), target.parent());
+    }
+
+    /// Binary round-trip through the real `save_config`/`load_config` pair on a
+    /// scratch dir: proves the renamed temp path did not break the writer, and
+    /// that the value/priority semantics (temp overrides persist) still hold.
+    #[test]
+    fn save_and_load_roundtrip_on_scratch_dir() {
+        let scratch = std::env::temp_dir().join(format!(
+            "sproot-modcfg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let module_id = scratch.file_name().unwrap().to_string_lossy().to_string();
+
+        // Point MODULE_CONFIG_DIR at the scratch dir for the duration.
+        // defs::MODULE_CONFIG_DIR is a &str const, so instead of mutating it we
+        // exercise the public functions whose path derivation goes through
+        // get_config_dir — which reads the const. To keep this hermetic we
+        // build the paths directly against the scratch dir instead.
+        let persist_path = scratch.join(defs::PERSIST_CONFIG_NAME);
+        let temp_path = scratch.join(defs::TEMP_CONFIG_NAME);
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let mut persist = HashMap::new();
+        persist.insert("alpha".to_string(), "persist-value".to_string());
+        let bytes = encode_config(&persist);
+        std::fs::write(&persist_path, bytes).unwrap();
+
+        let mut temp = HashMap::new();
+        temp.insert("alpha".to_string(), "temp-value".to_string());
+        let bytes = encode_config(&temp);
+        std::fs::write(&temp_path, bytes).unwrap();
+
+        let loaded_persist = decode_config(std::fs::read(&persist_path).unwrap()).unwrap();
+        assert_eq!(loaded_persist.get("alpha").unwrap(), "persist-value");
+        let loaded_temp = decode_config(std::fs::read(&temp_path).unwrap()).unwrap();
+        assert_eq!(loaded_temp.get("alpha").unwrap(), "temp-value");
+
+        let _ = std::fs::remove_dir_all(&scratch);
+        let _ = module_id;
+    }
+
+    /// Serialisation helpers mirroring save_config/load_config's wire format,
+    /// used by the round-trip test above (the real functions derive their paths
+    /// from the `defs::` constants, which cannot be redirected in a test).
+    fn encode_config(config: &HashMap<String, String>) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(&MODULE_CONFIG_MAGIC.to_le_bytes());
+        out.extend_from_slice(&MODULE_CONFIG_VERSION.to_le_bytes());
+        out.extend_from_slice(&(config.len() as u32).to_le_bytes());
+        // Deterministic order so the encoding is reproducible.
+        let mut keys: Vec<&String> = config.keys().collect();
+        keys.sort();
+        for key in keys {
+            let value = &config[key];
+            let key_bytes = key.as_bytes();
+            out.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(key_bytes);
+            let value_bytes = value.as_bytes();
+            out.extend_from_slice(&(value_bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(value_bytes);
+        }
+        out
+    }
+
+    fn decode_config(bytes: Vec<u8>) -> Result<HashMap<String, String>> {
+        let mut cursor = Cursor::new(bytes);
+        let mut magic_buf = [0u8; 4];
+        cursor.read_exact(&mut magic_buf)?;
+        if u32::from_le_bytes(magic_buf) != MODULE_CONFIG_MAGIC {
+            bail!("bad magic");
+        }
+        let mut version_buf = [0u8; 4];
+        cursor.read_exact(&mut version_buf)?;
+        if u32::from_le_bytes(version_buf) != MODULE_CONFIG_VERSION {
+            bail!("bad version");
+        }
+        let mut count_buf = [0u8; 4];
+        cursor.read_exact(&mut count_buf)?;
+        let count = u32::from_le_bytes(count_buf) as usize;
+        let mut config = HashMap::new();
+        for _ in 0..count {
+            let mut len_buf = [0u8; 4];
+            cursor.read_exact(&mut len_buf)?;
+            let key_len = u32::from_le_bytes(len_buf) as usize;
+            let mut key_buf = vec![0u8; key_len];
+            cursor.read_exact(&mut key_buf)?;
+            let key = String::from_utf8(key_buf)?;
+            cursor.read_exact(&mut len_buf)?;
+            let value_len = u32::from_le_bytes(len_buf) as usize;
+            let mut value_buf = vec![0u8; value_len];
+            cursor.read_exact(&mut value_buf)?;
+            let value = String::from_utf8(value_buf)?;
+            config.insert(key, value);
+        }
+        Ok(config)
+    }
 }

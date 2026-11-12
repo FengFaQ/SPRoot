@@ -1,4 +1,4 @@
-﻿#include "kallsyms_lookup_name.h"
+#include "kallsyms_lookup_name.h"
 #include "find_static_code_start.h"
 
 #ifndef MIN
@@ -247,6 +247,8 @@ bool KallsymsLookupName::find_kallsyms_token_table(size_t markers_list_end_offse
 		}
 		size_t off = x;
 		for (unsigned int i = 0; i < 256; i++) {
+			// ENG-5：strlen 无上界会读穿 vector 末尾（畸形内核）→ 堆越界读崩溃。
+			if (off >= m_file_buf.size()) return false;
 			const char* str = (const char*)&m_file_buf[off];
 			off += strlen(str) + 1;
 		}

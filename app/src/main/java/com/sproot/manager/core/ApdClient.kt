@@ -334,11 +334,24 @@ object ApdClient {
         val argv = listOf(bin.absolutePath, "version", "--json")
         return runCatching {
             val process = ProcessBuilder(argv).redirectErrorStream(true).start()
-            val out = process.inputStream.bufferedReader().readText()
+            val stdout = StringBuilder()
+            val reader = Thread {
+                runCatching {
+                    process.inputStream.bufferedReader().useLines { seq ->
+                        seq.take(2000).forEach { line -> stdout.append(line).append('\n') }
+                    }
+                }
+            }.apply { isDaemon = true; start() }
             val finished = process.waitFor(10, TimeUnit.SECONDS)
+            if (!finished) {
+                process.destroy()
+                runCatching { process.waitFor(2, TimeUnit.SECONDS) }
+                process.destroyForcibly()
+            }
+            runCatching { reader.join(2000) }
             Result(
-                exitCode = if (finished) process.exitValue() else EXIT_TIMEOUT,
-                stdout = out,
+                exitCode = if (finished) runCatching { process.exitValue() }.getOrDefault(EXIT_FAIL) else EXIT_TIMEOUT,
+                stdout = stdout.toString(),
                 stderr = "",
                 timedOut = !finished,
                 argv = argv,

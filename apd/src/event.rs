@@ -215,9 +215,18 @@ pub fn on_post_data_fs(superkey: Option<&str>) -> Result<()> {
     info!("Re-privilege apd profile after injecting sepolicy");
     privilege_apd_profile(superkey);
 
-    // Clear all temporary module configs early
-    if let Err(e) = crate::module_config::clear_all_temp_configs() {
-        warn!("clear temp configs failed: {e}");
+    // Clear all temporary module configs early. `clear_all_temp_configs` now
+    // returns the SURVIVING files (BUG-APD-12): a temp config that survives the
+    // clear keeps overriding its module's persist config across reboots, so the
+    // residue is logged loudly instead of folded into a silent Ok.
+    if let Ok(failed) = crate::module_config::clear_all_temp_configs()
+        && !failed.is_empty()
+    {
+        warn!(
+            "clear temp configs: {} file(s) survived and keep overriding their module: {}",
+            failed.len(),
+            failed.join(", ")
+        );
     }
 
     if utils::has_magisk() {
@@ -349,12 +358,24 @@ pub fn on_post_data_fs(superkey: Option<&str>) -> Result<()> {
     }
 
     if Path::new(defs::MODULE_UPDATE_DIR).exists() {
-        if let Err(e) = module::handle_updated_modules() {
-            warn!("handle_updated_modules failed: {e} — new module versions stay in \
-                   modules_update for the next boot");
-        }
-        if let Err(e) = fs::remove_dir_all(module_update_dir) {
-            warn!("cannot clean modules_update: {e}");
+        // BUG-APD-2 fix (2026-11-12): modules_update is the ONLY surviving copy
+        // of a staged module while handle_updated_modules is running. Deleting
+        // it unconditionally after a failure destroyed modules whose swap had
+        // failed midway (old version already moved, staged copy then removed).
+        // Now the staged directory is removed only when every swap succeeded;
+        // on failure it stays on disk for the next boot.
+        match module::handle_updated_modules() {
+            Ok(()) => {
+                if let Err(e) = fs::remove_dir_all(module_update_dir) {
+                    warn!("cannot clean modules_update: {e}");
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "handle_updated_modules failed: {e} — modules_update is KEPT so the \
+                     staged module versions are not lost; they will be retried next boot"
+                );
+            }
         }
     }
 
@@ -446,14 +467,14 @@ fn exec_budgeted(
     let mut exhausted = false;
     let r = module::exec_common_scripts_bounded(dir, wait, |_path| {
         if exhausted {
-            return None;
+            return module::ScriptBudget::Skip;
         }
         match budget.timeout_for_script(defs::SCRIPT_TIMEOUT_SECS) {
-            Some(t) => Some(t),
+            Some(t) => module::ScriptBudget::Timeout(t),
             None => {
                 exhausted = true;
                 *skipped += 1;
-                None
+                module::ScriptBudget::Skip
             }
         }
     });
@@ -478,14 +499,14 @@ fn exec_stage_budgeted(
     let r = module::exec_stage_script_bounded(stage, block, |_module| {
         if exhausted {
             skipped_here += 1;
-            return None;
+            return module::ScriptBudget::Skip;
         }
         match budget.timeout_for_script(defs::SCRIPT_TIMEOUT_SECS) {
-            Some(t) => Some(t),
+            Some(t) => module::ScriptBudget::Timeout(t),
             None => {
                 exhausted = true;
                 skipped_here += 1;
-                None
+                module::ScriptBudget::Skip
             }
         }
     });
@@ -573,7 +594,14 @@ pub fn start_uid_listener() -> Result<()> {
         let mutex_clone = mutex.clone();
         thread::spawn(move || {
             let mut signals = Signals::new([SIGTERM, SIGINT, SIGPWR]).unwrap();
-            if let Some(sig) = signals.forever().next() {
+            // BUG-APD-5 fix (2026-11-12): `forever().next()` consumed only the
+            // FIRST signal and then the thread exited — the registered handlers
+            // stayed installed but nobody read them, so every later SIGTERM /
+            // SIGINT / SIGPWR was silently swallowed (the process stopped
+            // responding to stop signals and the shutdown refresh ran once, on
+            // the first signal only). `for sig in signals.forever()` keeps
+            // consuming for the thread's whole life.
+            for sig in signals.forever() {
                 log::warn!("[shutdown] Caught signal {sig}, refreshing package list...");
                 refresh_allow_list(&mutex_clone);
             }

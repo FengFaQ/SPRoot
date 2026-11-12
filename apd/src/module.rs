@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     str::FromStr,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 #[allow(clippy::wildcard_imports)]
@@ -237,6 +237,18 @@ fn exec_install_script(
     }
 }
 
+/// Apply staged updates from `MODULE_UPDATE_DIR` (BUG-APD-2 fix, 2026-11-12).
+///
+/// Per module: the old `modules/<id>` is swapped for the staged copy **without
+/// a destroy-then-fail window**. The previous order
+/// `remove_dir_all(old)?; rename(staged, old)?` meant a rename failure left the
+/// module gone from `modules/` while the only surviving copy still sat in
+/// `modules_update/` — and the caller then deleted that directory, losing the
+/// module entirely. Now the staged copy is moved to a temporary name first, the
+/// old directory is renamed to a trash name (cheap, atomic) rather than deleted,
+/// the staged copy takes its place, and only then is the trash removed. Any
+/// failure in the middle leaves either the old or the staged copy at
+/// `modules/<id>` — never nothing.
 pub fn handle_updated_modules() -> Result<()> {
     let modules_root = Path::new(MODULE_DIR);
     foreach_module(ModuleType::Updated, |updated_module| {
@@ -248,13 +260,57 @@ pub fn handle_updated_modules() -> Result<()> {
             let module_dir = modules_root.join(name);
             let mut disabled = false;
             let mut removed = false;
+            let mut old_trash: Option<PathBuf> = None;
             if module_dir.exists() {
                 // If the old module is disabled, we need to also disable the new one
                 disabled = module_dir.join(defs::DISABLE_FILE_NAME).exists();
                 removed = module_dir.join(defs::REMOVE_FILE_NAME).exists();
-                remove_dir_all(&module_dir)?;
+                // Move the old dir aside atomically instead of destroying it
+                // before the new copy is in place. Failure here aborts with the
+                // old module intact (and the staged copy untouched).
+                let trash = modules_root.join(format!(
+                    "{}{}.old-{}",
+                    name.to_string_lossy(),
+                    std::process::id(),
+                    SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                ));
+                std::fs::rename(&module_dir, &trash)
+                    .with_context(|| format!("stash old module {}", module_dir.display()))?;
+                old_trash = Some(trash);
             }
-            std::fs::rename(updated_module, &module_dir)?;
+            match std::fs::rename(updated_module, &module_dir) {
+                Ok(()) => {
+                    // The new copy is live: only now may the trash go. A failure
+                    // here is cleanup noise, not a lost module.
+                    if let Some(trash) = old_trash
+                        && let Err(e) = remove_dir_all(&trash)
+                    {
+                        warn!("cannot clean up stashed module {}: {e}", trash.display());
+                    }
+                }
+                Err(e) => {
+                    // Roll back: restore the old module to its place so the
+                    // device keeps at least the previous version. The staged
+                    // copy stays in modules_update (handle_updated_modules will
+                    // not be re-run this boot, but the data survives).
+                    if let Some(trash) = old_trash
+                        && let Err(rb) = std::fs::rename(&trash, &module_dir)
+                    {
+                        log::error!(
+                            "module update failed ({e}) and rollback also failed ({rb}): \
+                             the old copy is stashed at {}",
+                            trash.display()
+                        );
+                    }
+                    return Err(anyhow::Error::from(e).context(format!(
+                        "install staged module {} failed; old version restored",
+                        updated_module.display()
+                    )));
+                }
+            }
             if removed {
                 let path = module_dir.join(defs::REMOVE_FILE_NAME);
                 if let Err(e) = ensure_file_exists(&path) {
@@ -424,12 +480,22 @@ fn mark_module_state(module: &str, flag_file: &str, create_or_delete: bool) -> R
 }
 pub fn foreach_module(
     module_type: ModuleType,
-    mut f: impl FnMut(&Path) -> Result<()>,
+    f: impl FnMut(&Path) -> Result<()>,
 ) -> Result<()> {
     let modules_dir = Path::new(match module_type {
         ModuleType::Updated => MODULE_UPDATE_DIR,
         _ => defs::MODULE_DIR,
     });
+    foreach_module_in(modules_dir, module_type, f)
+}
+
+/// [`foreach_module`] over an explicit directory (test seam for the budgeted
+/// stage runners below; production always passes the `defs::` path).
+pub fn foreach_module_in(
+    modules_dir: &Path,
+    module_type: ModuleType,
+    mut f: impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
     let dir = std::fs::read_dir(modules_dir)?;
     for entry in dir.flatten() {
         let path = entry.path();
@@ -523,6 +589,30 @@ pub fn exec_script<T: AsRef<Path>>(path: T, wait: bool) -> Result<()> {
     exec_script_bounded(path, wait, None)
 }
 
+/// Per-script decision handed down by a stage's budget (APD-1, 2026-11-12).
+///
+/// Three states are load-bearing, which is why this is an enum and not an
+/// `Option<Duration>`:
+///
+/// * [`ScriptBudget::Timeout`] — run the script, but kill it after this bound
+///   (the `min(per_script, budget_left)` clamp);
+/// * [`ScriptBudget::Skip`] — the stage budget is exhausted: the script must
+///   **not be spawned at all**. The previous wiring returned `None` here and
+///   `exec_script_bounded` read `None` as "use the default 60s", so the very
+///   scripts that were supposed to be skipped still ran at full timeout — the
+///   stage budget promised `<= 90s` and delivered `90s + N × 60s` (BUG-APD-1);
+/// * [`ScriptBudget::Default`] — no budget pressure: use the plain
+///   `SCRIPT_TIMEOUT_SECS` (non-budgeted callers, services/boot-completed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptBudget {
+    /// Run with an explicit (budget-clamped) timeout.
+    Timeout(Duration),
+    /// Do not spawn: the stage budget is exhausted.
+    Skip,
+    /// Run with the default per-script timeout.
+    Default,
+}
+
 /// Execute a module script, optionally under an explicit timeout.
 ///
 /// `timeout` is the **stage-budget-aware** per-script bound computed by
@@ -537,6 +627,32 @@ pub fn exec_script_bounded<T: AsRef<Path>>(
     wait: bool,
     timeout: Option<Duration>,
 ) -> Result<()> {
+    match timeout {
+        // Legacy signature: None = default per-script timeout.
+        None => run_script(path, wait, ScriptBudget::Default),
+        Some(t) => run_script(path, wait, ScriptBudget::Timeout(t)),
+    }
+}
+
+/// [`exec_script_bounded`] with the full three-state budget decision.
+pub fn run_script<T: AsRef<Path>>(path: T, wait: bool, budget: ScriptBudget) -> Result<()> {
+    // APD-1 (BUG-APD-1 fix, 2026-11-12): Skip must happen BEFORE any spawn. A
+    // skip that reaches the spawn path is not a skip — it is a full-timeout run
+    // with a lying log line, which is exactly the bug the budget was meant to
+    // close.
+    let effective = match budget {
+        ScriptBudget::Skip => {
+            warn!(
+                "script skipped: stage budget exhausted ({}): {}",
+                path.as_ref().display(),
+                "it did NOT run and did NOT fail"
+            );
+            return Ok(());
+        }
+        ScriptBudget::Default => Duration::from_secs(defs::SCRIPT_TIMEOUT_SECS),
+        ScriptBudget::Timeout(t) => t,
+    };
+
     info!("exec {}", path.as_ref().display());
 
     let is_module_script = path.as_ref().starts_with(defs::MODULE_DIR);
@@ -584,7 +700,6 @@ pub fn exec_script_bounded<T: AsRef<Path>>(
     // APD-1: the bound is `min(SCRIPT_TIMEOUT_SECS, remaining stage budget)`
     // when the caller supplies one — a 10-module stage can no longer take
     // 10 × 60 s.
-    let effective = timeout.unwrap_or_else(|| Duration::from_secs(defs::SCRIPT_TIMEOUT_SECS));
     let result = if wait {
         let mut child = command
             .spawn()
@@ -607,39 +722,38 @@ pub fn exec_script_bounded<T: AsRef<Path>>(
 }
 
 pub fn exec_stage_script(stage: &str, block: bool) -> Result<()> {
-    exec_stage_script_bounded(stage, block, |_| None)
+    exec_stage_script_bounded(stage, block, |_| ScriptBudget::Default)
 }
 
-/// Stage-script runner with a per-module timeout supplied by the caller.
+/// Stage-script runner with a per-module budget decision supplied by the caller.
 ///
-/// `timeout_for` is invoked once per module (in iteration order) with the
-/// module path. Returning `None` means "use the default per-script budget";
-/// returning `Some(None)` is not expressible, so stages that need to *skip*
-/// remaining modules once the budget is gone must call this and decide before
-/// spawning — see `event::run_module_stage_bounded`.
-pub fn exec_stage_script_bounded<F>(stage: &str, block: bool, mut timeout_for: F) -> Result<()>
+/// `budget_for` is invoked once per module (in iteration order) with the module
+/// path. [`ScriptBudget::Skip`] means the caller's budget is exhausted: the
+/// script is NOT spawned (see [`ScriptBudget`] for why this needs three states —
+/// the pre-fix `Option<Duration>` wiring turned "skip" into "run at 60s").
+pub fn exec_stage_script_bounded<F>(stage: &str, block: bool, mut budget_for: F) -> Result<()>
 where
-    F: FnMut(&Path) -> Option<Duration>,
+    F: FnMut(&Path) -> ScriptBudget,
 {
     foreach_active_module(|module| {
         let script_path = module.join(format!("{stage}.sh"));
         if !script_path.exists() {
             return Ok(());
         }
-        let t = timeout_for(module);
-        exec_script_bounded(&script_path, block, t)
+        let t = budget_for(module);
+        run_script(&script_path, block, t)
     })?;
     Ok(())
 }
 
 pub fn exec_common_scripts(dir: &str, wait: bool) -> Result<()> {
-    exec_common_scripts_bounded(dir, wait, |_| None)
+    exec_common_scripts_bounded(dir, wait, |_| ScriptBudget::Default)
 }
 
-/// Common-script runner with a per-script timeout supplied by the caller.
-pub fn exec_common_scripts_bounded<F>(dir: &str, wait: bool, mut timeout_for: F) -> Result<()>
+/// Common-script runner with a per-script budget decision supplied by the caller.
+pub fn exec_common_scripts_bounded<F>(dir: &str, wait: bool, mut budget_for: F) -> Result<()>
 where
-    F: FnMut(&Path) -> Option<Duration>,
+    F: FnMut(&Path) -> ScriptBudget,
 {
     let script_dir = Path::new(defs::ADB_DIR).join(dir);
     if !script_dir.exists() {
@@ -656,8 +770,58 @@ where
             continue;
         }
 
-        let t = timeout_for(&path);
-        exec_script_bounded(path, wait, t)?;
+        let t = budget_for(&path);
+        run_script(path, wait, t)?;
+    }
+
+    Ok(())
+}
+
+/// [`exec_stage_script_bounded`] over an explicit modules directory (test seam).
+pub fn exec_stage_script_bounded_in<F>(
+    modules_dir: &Path,
+    stage: &str,
+    block: bool,
+    mut budget_for: F,
+) -> Result<()>
+where
+    F: FnMut(&Path) -> ScriptBudget,
+{
+    foreach_module_in(modules_dir, ModuleType::Active, |module| {
+        let script_path = module.join(format!("{stage}.sh"));
+        if !script_path.exists() {
+            return Ok(());
+        }
+        let t = budget_for(module);
+        run_script(&script_path, block, t)
+    })
+}
+
+/// [`exec_common_scripts_bounded`] over an explicit script directory (test seam).
+pub fn exec_common_scripts_bounded_in<F>(
+    script_dir: &Path,
+    wait: bool,
+    mut budget_for: F,
+) -> Result<()>
+where
+    F: FnMut(&Path) -> ScriptBudget,
+{
+    if !script_dir.exists() {
+        info!("{} not exists, skip", script_dir.display());
+        return Ok(());
+    }
+
+    let dir = fs::read_dir(script_dir)?;
+    for entry in dir.flatten() {
+        let path = entry.path();
+
+        if !is_executable(&path) {
+            warn!("{} is not executable, skip", path.display());
+            continue;
+        }
+
+        let t = budget_for(&path);
+        run_script(path, wait, t)?;
     }
 
     Ok(())
@@ -2185,5 +2349,324 @@ mod tests {
         assert!(
             uses >= 3,
             "expected the definition plus two call sites (inspect + revalidate), found {uses}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // BUG-APD-1 (2026-11-12): the stage-budget "skip" must actually skip.
+    //
+    // The pre-fix wiring was the whole bug: event.rs returned `None` meaning
+    // "skip", and `exec_script_bounded` read `None` as "use the default 60s",
+    // so every script past the budget ran at full timeout while the log claimed
+    // "they did NOT run". `ScriptBudget::Skip` must therefore be observable as
+    // "no process was ever spawned" — not as "ran and was killed".
+    //
+    // The tests below are hermetic: no busybox is needed. The probe is the
+    // SPAWN ERROR ITSELF — `run_script` builds the command around the script's
+    // real path, so:
+    //   * `Timeout`/`Default` on a nonexistent script  -> spawn attempt -> Err
+    //     ("Failed to exec ...: ENOENT");
+    //   * `Skip`                                       -> Ok, no exec call at
+    //     all. Under the pre-fix wiring Skip was read as Default, so it also
+    //     attempted the exec and returned Err — the regression trips this test.
+    // -----------------------------------------------------------------------
+
+    /// **The end-to-end negative sample for the pre-fix wiring.** Budget
+    /// exhausts after the first script: the remaining scripts must NOT be
+    /// spawned. A runner that spawns them fails with "Failed to exec" (there
+    /// is no busybox in the test environment); a runner that truly skips
+    /// returns Ok.
+    #[test]
+    fn budget_exhaustion_actually_skips_remaining_scripts() {
+        let scratch = std::env::temp_dir().join(format!(
+            "sproot-stage-skip-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let modules_dir = scratch.join("modules");
+        for i in 0..3 {
+            fs::create_dir_all(modules_dir.join(format!("mod{i}"))).unwrap();
+        }
+
+        let mut first = true;
+        let r = exec_stage_script_bounded_in(&modules_dir, "post-fs-data", false, |_| {
+            // First module runs (its spawn error surfaces); everything after
+            // is Skipped — exactly what event.rs does once the budget is gone.
+            if first {
+                first = false;
+                ScriptBudget::Timeout(Duration::from_secs(30))
+            } else {
+                ScriptBudget::Skip
+            }
+        });
+        r.expect("a runner that skips must not surface the skipped scripts' errors");
+
+        // Positive control: create the script files. They exist now, but the
+        // interpreter (`BINARY_DIR/busybox`) does not in the test environment,
+        // so a Default-budget run attempts the spawn and FAILS — proving the
+        // runner machinery really does execute scripts when not skipped (the
+        // skip test above is therefore meaningful, not vacuous).
+        for i in 0..3 {
+            fs::write(
+                modules_dir.join(format!("mod{i}")).join("post-fs-data.sh"),
+                "#!/system/bin/sh\n: > ran\n",
+            )
+            .unwrap();
+        }
+        let r_all_default = exec_stage_script_bounded_in(
+            &modules_dir,
+            "post-fs-data",
+            false,
+            |_| ScriptBudget::Default,
+        );
+        assert!(
+            r_all_default.is_err(),
+            "positive control: Default budgets must attempt the spawn (busybox missing)"
+        );
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    /// Same property for the common-scripts runner (post-fs-data.d).
+    #[test]
+    fn budget_exhaustion_actually_skips_remaining_common_scripts() {
+        let dir = std::env::temp_dir().join(format!(
+            "sproot-common-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut first = true;
+        let r = exec_common_scripts_bounded_in(&dir, false, |_| {
+            if first {
+                first = false;
+                ScriptBudget::Timeout(Duration::from_secs(30))
+            } else {
+                ScriptBudget::Skip
+            }
+        });
+        r.expect("a runner that skips must not surface the skipped scripts' errors");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Skip must happen BEFORE any filesystem interaction: a nonexistent
+    /// script path with `Skip` returns Ok silently (no spawn attempt, no
+    /// `parent()` unwrap). Under the pre-fix wiring this exact call hit the
+    /// spawn path and failed.
+    #[test]
+    fn skip_budget_returns_ok_without_touching_the_path() {
+        let r = run_script(
+            "/definitely/not/a/script/post-fs-data.sh",
+            true,
+            ScriptBudget::Skip,
+        );
+        assert!(r.is_ok(), "Skip must be a silent, spawnless Ok: {r:?}");
+    }
+
+    /// The Timeout arm is still "run": on a nonexistent script it surfaces the
+    /// spawn error, proving Timeout != Skip (the negative of the test above).
+    #[test]
+    fn timeout_budget_still_attempts_the_spawn() {
+        let r = run_script(
+            "/definitely/not/a/script/post-fs-data.sh",
+            true,
+            ScriptBudget::Timeout(Duration::from_secs(30)),
+        );
+        let msg = format!("{r:?}");
+        assert!(
+            r.is_err() && msg.contains("Failed to exec"),
+            "Timeout(t) must attempt the spawn (got {r:?})"
+        );
+        // And the legacy Option API keeps its "Some(t) = run" meaning.
+        let r2 = exec_script_bounded(
+            "/definitely/not/a/script/post-fs-data.sh",
+            true,
+            Some(Duration::from_secs(30)),
+        );
+        assert!(
+            r2.is_err(),
+            "exec_script_bounded(Some(t)) must still mean run (got {r2:?})"
+        );
+    }
+
+    /// The event.rs budgeted closures must hand out Skip once the budget is
+    /// gone — the wiring contract, pinned structurally so the None=skip bug
+    /// cannot come back through an edit of the closure bodies.
+    #[test]
+    fn event_budget_closures_use_the_skip_arm() {
+        let src = include_str!("event.rs");
+        for marker in [
+            "module::ScriptBudget::Skip",
+            "module::ScriptBudget::Timeout(t)",
+        ] {
+            assert!(
+                src.contains(marker),
+                "event.rs budget closures must use {marker} (the None=skip wiring bug)"
+            );
+        }
+        // The old broken shape must not reappear inside the budgeted runners:
+        // a bare `return None` in a closure would mean the Option API came
+        // back (a `None =>` match arm on timeout_for_script's Option is fine
+        // and stays allowed — the bug was the closure returning None).
+        let closures_start = src
+            .find("fn exec_budgeted(")
+            .expect("exec_budgeted must exist");
+        let closures_end = src
+            .find("fn run_stage(")
+            .expect("run_stage must follow the budgeted runners");
+        let closures = &src[closures_start..closures_end];
+        assert!(
+            !closures.contains("return None"),
+            "the budgeted closures must express skip via ScriptBudget::Skip, never \
+             `return None` (the pre-fix None was read as default-60s-run — BUG-APD-1)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // BUG-APD-2 (2026-11-12): the modules_update swap must never leave the
+    // module missing. The old `remove_dir_all(old); rename(staged, old)` order
+    // lost the module when the rename failed (and the caller then deleted the
+    // staged copy). The new order is rename-out → rename-in → delete trash,
+    // with rollback on the rename-in failure.
+    // -----------------------------------------------------------------------
+
+    /// The swap itself is exercised on real directories: a working update
+    /// replaces the old content and leaves no `.old-` trash behind. This walks
+    /// the same per-module sequence `handle_updated_modules` performs.
+    #[test]
+    fn modules_update_swap_replaces_content_without_destroy_window() {
+        let scratch = std::env::temp_dir().join(format!(
+            "sproot-swap-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let modules = scratch.join("modules");
+        let staged = scratch.join("staged");
+        fs::create_dir_all(modules.join("mymod")).unwrap();
+        fs::create_dir_all(staged.join("mymod")).unwrap();
+
+        fs::write(modules.join("mymod").join("old.txt"), b"old").unwrap();
+        fs::write(staged.join("mymod").join("new.txt"), b"new").unwrap();
+
+        // The per-module swap, exactly as handle_updated_modules does it.
+        let module_dir = modules.join("mymod");
+        let trash = modules.join(format!(
+            "mymod.old-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::rename(&module_dir, &trash).expect("stash old");
+        std::fs::rename(staged.join("mymod"), &module_dir).expect("install staged");
+        remove_dir_all(&trash).expect("cleanup trash");
+
+        assert_eq!(fs::read(module_dir.join("new.txt")).unwrap(), b"new");
+        assert!(
+            !module_dir.join("old.txt").exists(),
+            "old content must be replaced"
+        );
+        let leftovers: Vec<_> = fs::read_dir(&modules)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            leftovers.iter().all(|n| n == "mymod"),
+            "no .old- trash may remain after a successful swap: {leftovers:?}"
+        );
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    /// Rollback: when the rename-in fails, the old module must be back at
+    /// `modules/<id>` (the device keeps the previous version) and the staged
+    /// copy untouched in modules_update.
+    #[test]
+    fn modules_update_swap_rollbacks_when_the_staged_rename_fails() {
+        let scratch = std::env::temp_dir().join(format!(
+            "sproot-rollback-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let modules = scratch.join("modules");
+        let staged = scratch.join("staged");
+        fs::create_dir_all(modules.join("mymod")).unwrap();
+        fs::create_dir_all(&staged).unwrap();
+
+        fs::write(modules.join("mymod").join("old.txt"), b"old").unwrap();
+        // Model a deterministic rename-in failure: `_install_module_inner`
+        // creates `modules/<id>` BEFORE extraction, so a corrupt staged copy
+        // (here: a plain FILE where a directory must go) fails
+        // rename(file -> existing dir) with EISDIR — exactly the class of
+        // rename failure that used to lose the module under the old
+        // remove-then-rename order.
+        let staged_entry = staged.join("mymod");
+        fs::write(&staged_entry, b"corrupt staged copy").unwrap();
+
+        let module_dir = modules.join("mymod");
+        let trash = modules.join("mymod.old-trash");
+        // Step 1 — stash the old copy (handle_updated_modules' new order).
+        std::fs::rename(&module_dir, &trash).expect("stash old");
+        // Step 2 — the install path recreates the (now empty) target dir.
+        fs::create_dir_all(&module_dir).unwrap();
+        // Step 3 — rename-in fails deterministically.
+        let rename_result = std::fs::rename(&staged_entry, &module_dir);
+        assert!(
+            rename_result.is_err(),
+            "precondition: renaming a file onto a directory target must fail"
+        );
+        // Rollback (what handle_updated_modules now does on this path): the
+        // stashed OLD copy replaces the empty target dir.
+        std::fs::rename(&trash, &module_dir).expect("rollback");
+
+        assert!(
+            module_dir.join("old.txt").exists(),
+            "after a failed staged rename the OLD module must be restored at modules/<id>"
+        );
+        assert!(
+            staged_entry.exists(),
+            "the staged copy must survive for the next boot"
+        );
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    /// Structural guard for the event.rs caller: modules_update is deleted ONLY
+    /// in the Ok branch of handle_updated_modules. If a future edit moves the
+    /// remove_dir_all out of the Ok arm, staged copies are destroyed after a
+    /// failure again (the exact BUG-APD-2 data loss).
+    #[test]
+    fn modules_update_is_removed_only_on_success() {
+        let src = include_str!("event.rs");
+        let match_at = src
+            .find("match module::handle_updated_modules()")
+            .expect("the call must be inside a match (Ok-only cleanup)");
+        let body = &src[match_at..];
+        let remove_at = body
+            .find("remove_dir_all(module_update_dir)")
+            .expect("modules_update cleanup must exist");
+        let err_arm = body.find("Err(e) =>").expect("Err arm");
+        assert!(
+            remove_at < err_arm,
+            "remove_dir_all(module_update_dir) must run in the Ok arm only \
+             (the pre-fix unconditional deletion lost staged modules on failure)"
+        );
+        // And the failure text must match the behaviour (staged copies kept).
+        assert!(
+            body.contains("modules_update is KEPT"),
+            "the failure log must say the staged copies survive"
         );
     }

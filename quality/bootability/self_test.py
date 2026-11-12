@@ -212,6 +212,71 @@ def test_pa0_report_without_hooks_is_blocking() -> None:
     )
 
 
+def test_pa0_low_coverage_is_blocking() -> None:
+    """BUG-QA-10：coverage < 50% 必须阻断（旧阈值 ==0 放过 1/19 形态）。
+
+    构造 4 处改动、report 只声明其中 1 处 → coverage 25% < 50% → blocking。
+    旧判据（attributed==0 才红）会放行这条；收紧后必须红。
+    """
+    orig = mk_image([0xD503201F] * 32, total=0x8000)
+    patched = bytearray(orig)
+    sites = [HDR_SIZE, HDR_SIZE + 0x100, HDR_SIZE + 0x200, HDR_SIZE + 0x300]
+    for s in sites:
+        struct.pack_into("<I", patched, s, enc_b(0x100 // 4))
+    # 只声明第 1 处
+    rep = {"hooks": [{"group": "do_execve",
+                      "patch_offset": f"0x{sites[0]:x}", "len": 4}]}
+    res = patch_audit.audit(orig, bytes(patched), rep)
+    cov = res["attribution"]["coverage_ratio"]
+    ok = (
+        res["attribution"]["attributed_regions"] == 1
+        and cov is not None and cov < 0.5
+        and any("PA-0" in b for b in res["blocking"])
+    )
+    record(
+        "NEG-PA0-low-coverage",
+        ok,
+        f"coverage 25%（1/4）< 50% 阈值必须 blocking；实得 coverage={cov}, "
+        f"blocking={len(res['blocking'])}",
+    )
+
+
+def test_pa0_branch_target_attributes() -> None:
+    """BUG-QA-10：入口 trampoline（b 跳进声明函数体）必须经 branch-target 归属。
+
+    构造：改动在 0x2000（远离声明区间），但写入的 `b` 目标 0x1000 落在
+    声明区间 [0x1000, 0x1040) 内 —— 只走区间重叠的旧判据判 unattributed，
+    补上 branch-target 路径后必须归属。注意 runs_of(max_merge_gap=8) 会把
+    4B 写入连同相邻 diff 合并，因此夹具写入 4 条 B 指令（16B 连续改动），
+    保证 finding 完整含一条可解码的 b。
+    """
+    orig = mk_image([0xD503201F] * 32, total=0x8000)
+    patched = bytearray(orig)
+    # 入口 trampoline 在 0x2000，4 条 b 全部跳回"函数体"0x1004（声明区间内）。
+    # 注意夹具细节：mk_image 填充为 0，b -0x1000 的最低字节恰好也是 0x00，
+    # diff 会把 run 起点推到 0x2001（非 4B 对齐）→ decode 永远失配。真实引擎
+    # 的 trampoline 站点必然 4B 对齐且首字节非零，这里用 0x1004 保证首字节非零，
+    # 与生产形态一致。
+    for k in range(4):
+        struct.pack_into("<I", patched, 0x2000 + 4 * k,
+                         enc_b((0x1004 - 0x2000) // 4))
+    rep = {"hooks": [{"group": "do_execve",
+                      "patch_offset": "0x1000", "len": 0x40}]}
+    res = patch_audit.audit(orig, bytes(patched), rep)
+    f0 = res["findings"][0]
+    ok = (
+        f0["group"] == "do_execve"
+        and any("branch-target" in n for n in f0["notes"])
+        and not any("PA-0" in b for b in res["blocking"])
+    )
+    record(
+        "POS-PA0-branch-target",
+        ok,
+        f"入口 trampoline b→声明函数体内必须归属；实得 group={f0['group']}, "
+        f"notes={f0['notes'][:1]}",
+    )
+
+
 def test_pa0_with_real_report_attributes() -> None:
     """Positive control: a proper hooks[] report must attribute the change."""
     orig = mk_image([0xD503201F] * 16, total=0x4000)
@@ -518,6 +583,8 @@ TESTS = [
     test_pa1_identical_images,
     test_pa0_no_report_is_blocking,
     test_pa0_report_without_hooks_is_blocking,
+    test_pa0_low_coverage_is_blocking,
+    test_pa0_branch_target_attributes,
     test_pa0_with_real_report_attributes,
     test_di_expected_hook_allowed,
     test_di_driver_symbol_blocks,

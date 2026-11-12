@@ -31,10 +31,18 @@ pub fn load_all_lua_modules(lua: &Lua) -> LuaResult<()> {
     };
 
     if modules_dir.exists() {
-        for entry in fs::read_dir(modules_dir)
-            .unwrap_or_else(|_| fs::read_dir("/dev/null").unwrap())
-            .flatten()
-        {
+        // BUG-APD-8 fix (2026-11-12): the old fallback
+        // `unwrap_or_else(|_| fs::read_dir("/dev/null").unwrap())` panicked
+        // whenever modules/ existed but read_dir failed (ENOTDIR: replaced by a
+        // plain file; or EACCES) — read_dir("/dev/null") is always ENOTDIR, so
+        // the fallback itself blew up, and a panic here (release = abort)
+        // killed the whole post-fs-data process. A failed read_dir just means
+        // "no modules to load": continue with an empty table.
+        let Ok(entries) = fs::read_dir(modules_dir) else {
+            warn!("cannot read {}, skipping lua module load", modules_dir.display());
+            return Ok(());
+        };
+        for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
                 let id = path.file_name().unwrap().to_string_lossy().to_string();

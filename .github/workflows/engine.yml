@@ -46,28 +46,39 @@ jobs:
           mkdir -p "$HOME/ndk" && unzip -q /tmp/ndk.zip -d "$HOME/ndk"
           echo "ANDROID_NDK_HOME=$HOME/ndk/android-ndk-r27c" >> "$GITHUB_ENV"
 
-      - name: Install qemu (契约自检用，非致命)
+      - name: Install qemu (契约自检用；三层 fallback，全部失败即显式失败)
         # ubuntu-latest 的默认源里没有 qemu-user-static 包名（run 42486267958 报
         # "Package 'qemu-user-static' has no installation candidate"）。按序尝试：
         #   1) qemu-user（含 qemu-aarch64，静态产物无需 -L sysroot）
         #   2) qemu-user-static
         #   3) multiarch 预编译静态 qemu-aarch64-static
-        # 本步失败不阻断后续 ELF 架构断言（契约自检在没有 qemu 时自动 SKIP）。
-        continue-on-error: true
+        #
+        # BUG-QA-5（2026-11-12 审计）：旧版本步 continue-on-error: true —— 对
+        # 「apt 源暂时故障」与「真没有 qemu」不做区分，apt 故障时契约自检整代
+        # 静默 SKIP 而 CI 全绿（正是"门禁存在但没执行"的事故形态）。现改为
+        # **无 continue-on-error**：三层 fallback 最后必须 `command -v` 成功，
+        # 否则 exit 1 显式红。理由：qemu 是本 workflow 唯一能抓"修补成功但
+        # 内核跑飞"的运行时契约环节（ELF 断言只比头、asm oracle 只比字节），
+        # 它的缺失应当红得可见，而不是被 continue-on-error 吞成静默跳过。
+        # 若确需在无 qemu 环境跑（极端情况），契约步会写 qemu_contract=SKIPPED
+        # 到 step summary（见下一步），人工可审计——但安装失败本身仍然红。
         run: |
           set -uo pipefail
           sudo apt-get update -o Acquire::Retries=3 || true
           if sudo apt-get install -y --no-install-recommends qemu-user; then
-            echo "installed qemu-user"; command -v qemu-aarch64
+            echo "installed qemu-user"
           elif sudo apt-get install -y --no-install-recommends qemu-user-static; then
-            echo "installed qemu-user-static"; command -v qemu-aarch64-static
+            echo "installed qemu-user-static"
           else
             echo "apt 均失败，回落 multiarch 静态二进制"
             curl -sSL -o /tmp/qemu-aarch64-static \
               https://github.com/multiarch/qemu-user-static/releases/download/v7.2.0-1/qemu-aarch64-static || true
             sudo install -m 0755 /tmp/qemu-aarch64-static /usr/local/bin/qemu-aarch64-static 2>/dev/null || true
-            command -v qemu-aarch64-static || echo "NO_QEMU"
           fi
+          # 三层 fallback 后必须真的有 qemu 可用，否则显式失败（不静默）
+          command -v qemu-aarch64-static || command -v qemu-aarch64 || {
+            echo "::error::三层 fallback 后仍无 qemu-aarch64（契约自检无法进行）"; exit 1
+          }
 
       - name: Build arm64 artifacts (exec + JNI)
         run: bash engine/android/build_arm64.sh both
@@ -93,14 +104,20 @@ jobs:
           test -z "$bad" || { echo "JNI 存在非系统依赖: $bad"; exit 1; }
 
       - name: Contract assertions (qemu-user 真实执行 arm64 产物)
+        id: contract
         run: |
           set -euo pipefail
           E=engine/android/build/arm64/exec/skroot-patch
           Q="$(command -v qemu-aarch64-static || command -v qemu-aarch64 || true)"
           if [ -z "$Q" ]; then
+            # BUG-QA-5：SKIPPED 必须显式可见（输出 + step summary），
+            # 由本 workflow 末尾的 sentinel 步骤消费；不允许静默 SKIP。
+            echo "qemu_contract=SKIPPED" >> "$GITHUB_OUTPUT"
             echo "::warning::qemu 不可用，跳过运行时契约自检（ELF 架构断言已在上一 step 通过）"
+            echo "## ⚠️ 运行时契约自检 SKIPPED：本 step 未执行（qemu 缺失）" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
+          echo "qemu_contract=RAN" >> "$GITHUB_OUTPUT"
           # 说明：本步全篇 set -euo pipefail；所有"预期失败"的调用统一用
           #   rc=0; cmd ... || rc=$?
           # 硬编码 expected-rc 断言。**不要**用 `cmd; rc=$?`（set -e 下会直接中止整步，
@@ -230,3 +247,19 @@ jobs:
             dist/magiskboot
             dist/magiskboot-meta.txt
           retention-days: 30
+
+      # BUG-QA-5 哨兵步：契约自检 SKIPPED 必须在 job 结论里显式可见。
+      # 选择「success + summary 供人审」而非「连续 SKIP 即红」：SKIPPED 的根因
+      # 已被上一步的显式 exit 1 挡住（三层 fallback 失败 = job 红），能走到
+      # 这里的 SKIPPED 只剩"安装成功但 command -v 意外为空"的罕见态，红整套
+      # 构建的代价（阻断 artifact 产出、阻塞 APK/release 链）与其信息量不成
+      # 比例；summary + warning 足以让人审发现并追溯。若未来 SKIPPED 连续
+      # 出现，应优先修环境而不是把门禁改红。
+      - name: Contract sentinel — SKIPPED 必须显式可见
+        if: always()
+        run: |
+          V="${{ steps.contract.outputs.qemu_contract }}"
+          echo "qemu_contract=${V:-UNKNOWN}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${V:-}" != "RAN" ]; then
+            echo "::warning::本代运行时契约自检未执行（qemu_contract=${V:-UNKNOWN}）——ELF 架构断言已过，但 rc=101/102/key-abi 等运行时契约未验证，请在 summary 中人工确认"
+          fi

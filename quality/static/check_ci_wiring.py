@@ -32,20 +32,50 @@ WF_DIR = os.path.join(REPO, ".github", "workflows")
 Q_DIR = os.path.join(REPO, "quality", "static")
 
 
+def _gh_paths_match(pattern: str, rel: str) -> bool:
+    """按 GitHub Actions paths 过滤的语义判「改动 rel 是否命中 pattern」。
+
+    依据官方文档 filter-pattern-cheat-sheet（2026-11 实查）：
+      * `*`   匹配除 `/` 外的任意字符（只匹配一层）——`quality/static/*`
+              只命中 `quality/static/x.py`，**不**命中 `quality/static/sub/x.py`；
+      * `**`  匹配含 `/` 的任意字符——`quality/static/**` 命中任意深度；
+      * `quality/**` 命中 `quality/` 下一切（含所有子目录）；
+      * 精确路径全等才命中；
+      * `!` 前缀为负模式（本判据保守处理：出现负模式时按"可能不命中"返回
+        False——负模式语义复杂，宁可让 WIRE-2 人工复核也不静默放行）。
+    """
+    p = pattern.strip("'\"")
+    if p.startswith("!"):
+        return False  # 负模式：保守按不命中处理（WIRE-2 会要求人工复核）
+    if p == rel:
+        return True
+    # 目录前缀 + /** （或裸 /**）：递归命中
+    if p.endswith("/**"):
+        base = p[:-3]
+        if base == "" or rel.startswith(base + "/") or rel == base:
+            return True
+    if p.endswith("/"):
+        return rel.startswith(p)          # 裸目录名（quality/static/）等价递归
+    # 普通含 * 的模式：GitHub 用 * ≠ / 、** 含 / 的分段 glob。
+    # 转成 regex：** → .+（含 /），* → [^/]+
+    rx = re.escape(p).replace(r"\*\*", "\x00").replace(r"\*", "[^/]+").replace("\x00", ".+")
+    return re.fullmatch(rx, rel) is not None
+
+
 def _verdict_wire2(paths, has_paths, script):
     """WIRE-2 判据（与 main 里同一逻辑，抽出来便于自检驱动）。
 
     返回 True = 接线正确；False = 改了门禁不会重跑（应判红）。
+
+    BUG-QA-7（2026-11-12 审计）：旧判据只做字符串 startswith，把
+    `quality/static/*`（GitHub 语义=仅一层）与 `quality/static/**`（递归）
+    视作等价，且不认识 `quality/**` 这类父目录通配（会被误判 FAIL→假红）。
+    现按 _gh_paths_match 对齐官方 glob 语义。
     """
     if not has_paths:
         return True  # 无 paths 过滤 = 每次都跑，天然安全
     rel = "quality/static/" + script
-    return any(
-        p.strip("'\"") == rel
-        or p.strip("'\"") in ("quality/static/**", "quality/static/")
-        or p.strip("'\"").startswith("quality/static/*")
-        for p in paths
-    )
+    return any(_gh_paths_match(p, rel) for p in paths)
 
 
 def _verdict_wire3(text, script):
@@ -101,6 +131,37 @@ def _self_test() -> int:
         "WIRE-2 好输入：paths 用 quality/static/** 通配 → 应判绿",
         _verdict_wire2(["quality/static/**"], True, "g.py"),
         True,
+    ))
+    # ── WIRE-2 glob 语义（BUG-QA-7，按官方 filter-pattern-cheat-sheet）──
+    # `quality/**` 命中 quality/ 下一切（含子目录）→ 应判绿
+    cases.append((
+        "WIRE-2 glob 好输入：paths 用父目录通配 quality/** → 应判绿",
+        _verdict_wire2(["quality/**"], True, "g.py"),
+        True,
+    ))
+    # `quality/static/*` 在 GitHub 语义=仅一层，g.py 就在顶层 → 应判绿
+    cases.append((
+        "WIRE-2 glob 好输入：quality/static/*（单层）对顶层脚本 → 应判绿",
+        _verdict_wire2(["quality/static/*"], True, "g.py"),
+        True,
+    ))
+    # 负模式 `!` 保守按不命中 → 应判红（要求人工复核）
+    cases.append((
+        "WIRE-2 glob 坏输入：负模式 !quality/** → 应判红（保守）",
+        _verdict_wire2(["!quality/**"], True, "g.py"),
+        False,
+    ))
+    # 完全无关的 ** 目录 → 应判红
+    cases.append((
+        "WIRE-2 glob 坏输入：app/** 不命中 quality/static/g.py → 应判红",
+        _verdict_wire2(["app/**"], True, "g.py"),
+        False,
+    ))
+    # docs/* 之类的他目录单层通配不命中 → 应判红
+    cases.append((
+        "WIRE-2 glob 坏输入：docs/* 不命中 → 应判红",
+        _verdict_wire2(["docs/*"], True, "g.py"),
+        False,
     ))
 
     # ── WIRE-3 ──────────────────────────────────────────────────────
@@ -230,10 +291,30 @@ def main(argv=None) -> int:
     runtext = {n: job_steps_text(w) for n, w in wfs.items()}
 
     # ── WIRE-1：每个门禁都被调用 ────────────────────────────────────────
+    def _push_triggered(wf: dict) -> bool:
+        """该 workflow 是否会在 push 事件上触发（WIRE-5 判据）。"""
+        on = wf.get("on") or wf.get(True) or {}
+        if isinstance(on, str):
+            return on == "push"
+        if isinstance(on, dict):
+            return "push" in on
+        return False
+
     for s in scripts:
         callers = [n for n, t in runtext.items() if s in t]
         rec("WIRE-1", bool(callers),
             "%s <- %s" % (s, ", ".join(callers) if callers else "⚠️ 未被任何 workflow 调用"))
+        # ── WIRE-5（BUG-QA-8）：调用它的 workflow 若没有任何会在 push 上
+        # 触发的事件（如仅 workflow_dispatch），则改了门禁后 push 不会跑它
+        # ——「门禁存在但从未执行」的另一种静默形态。判 WARN（计入 fails，
+        # 让人处理），因为 dispatch-only 也可能是有意为之（手工证据流程）。
+        if callers:
+            pushable = [n for n in callers if _push_triggered(wfs[n])]
+            rec("WIRE-5", bool(pushable),
+                ("%s 的调用方 %s 会在 push 上触发" % (s, ", ".join(pushable)))
+                if pushable
+                else ("⚠️ %s 只被 %s 调用，而它没有 push 触发（如仅 workflow_dispatch）"
+                      "——push 不会执行该门禁" % (s, ", ".join(callers))))
 
     # ── WIRE-2：被调用 → paths 必须含该脚本 ─────────────────────────────
     # 判据逻辑在 _verdict_wire2（自检驱动同一函数，避免"两套实现"漂移）

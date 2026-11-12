@@ -186,7 +186,10 @@ object MiniJson {
         val sb = StringBuilder()
         body.forEach { c ->
             when {
-                escaped -> { sb.append(c); escaped = false }
+                // ⚠️ 必须原样保留反斜杠：这里产出的 pair 会被 parseFlatObject 的
+                // readString 再解一遍转义；把 '\\' 剥掉会让 \" 还原成裸引号，
+                // 字符串被提前截断（description 含 \" 时值丢失后半段）。
+                escaped -> { sb.append('\\'); sb.append(c); escaped = false }
                 inString && c == '\\' -> { sb.append(c); escaped = true }
                 c == '"' -> { inString = !inString; sb.append(c) }
                 inString -> sb.append(c)

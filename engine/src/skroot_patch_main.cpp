@@ -885,6 +885,23 @@ static int self_test_rcvirtual_contract() {
         if (!ok && !detail.empty()) std::cout << " (" << detail << ")";
         std::cout << "\n";
     };
+    // ENG-3 夹具：kallsyms 名字表形态（头字节按 [4.14+] 编码，MSB=1 表示双字节长度）。
+    //   sym0: len=0x10（单字节头）+ 0x10 个数据字节
+    //   sym1: 头 0x80 + 第二字节 0x01 → len = 0 | (1<<7) = 0x80（双字节头）+ 0x80 个数据字节
+    //   sym2: len=0x04 + 0x04 个数据字节
+    // （kallsyms 实际是 token 压缩数据，这里数据字节用 0x41/0x42/0x43 填充——步进公式
+    //   只关心头字节与长度，不解码 token，故夹具对"步进一致性"是完备的。）
+    static const std::vector<uint8_t> msb_fixture = [] {
+        std::vector<uint8_t> v;
+        v.push_back(0x10);
+        v.insert(v.end(), 0x10, 0x41);
+        v.push_back(0x80);
+        v.push_back(0x01);
+        v.insert(v.end(), 0x80, 0x42);
+        v.push_back(0x04);
+        v.insert(v.end(), 0x04, 0x43);
+        return v;
+    }();
     const std::string tmpl = rc_virt_template();
     auto has = [&](const char* needle) { return tmpl.find(needle) != std::string::npos; };
 
@@ -1021,6 +1038,113 @@ static int self_test_rcvirtual_contract() {
     check("groups_rc_61_huawei", hook_groups_expected_count(true, true, true) == 16);
     check("groups_rc_510", hook_groups_expected_count(false, false, true) == 12);
     check("groups_rc_510_huawei", hook_groups_expected_count(false, true, true) == 13);
+
+    // ⑪ ENG-1 回归：洞扫描的排除区间（occupied）语义。
+    // 事故现场：<6.1 分支 hook 链硬编码在 [0x200, ~0x470)，0x200 处的连续零区本身
+    // 就是合格 cave → 修复前 rc blob 会与之同址互踩（变砖）。修复后：传入排除区间
+    // [0x200, 0x200+0x800) → 该区必须被跳过，cave 只能落在排除区之外。
+    {
+        // 夹具：0..0x200 非零（打断洞），0x200..0x1000 零（与排除区相交的洞），
+        //       0x1000 非零标记（分裂点），0x1004..0x4000 零（排除区之外的洞）。
+        std::vector<char> z(0x4000, 0);
+        for (size_t i = 0; i < 0x200; ++i) z[i] = 0x7F;
+        z[0x1000] = 0x7F; z[0x1001] = 0x7F; z[0x1002] = 0x7F; z[0x1003] = 0x7F;
+        // 不排除：0x200 起的洞（0x1000-0x200=0xE00=3584B ≥ 2048）是合格 cave
+        auto c_plain = rc_virt_scan_caves(z, 0, z.size(), RC_VIRT_MIN_CAVE_BYTES, 16, {});
+        bool plain_has_200 = std::any_of(c_plain.begin(), c_plain.end(),
+            [](const RcVirtCave& c) { return c.offset == 0x200 && c.size >= RC_VIRT_MIN_CAVE_BYTES; });
+        check("cave_excl_no_exclude_still_finds_0x200", plain_has_200,
+              "负样本通道：排除逻辑未启用时必须仍能选到 0x200（否则本组断言是空断言）");
+        // 排除 [0x200, 0xA00)（事故同参）：相交洞 [0x200,0x1000) 必须整块跳过，
+        // 且区外洞 [0x1004,0x4000) 仍可选出。
+        const std::vector<RcVirtCave> excl = { { 0x200, 0x800 } };
+        auto c_excl = rc_virt_scan_caves(z, 0, z.size(), RC_VIRT_MIN_CAVE_BYTES, 16, excl);
+        bool any_overlap = false, got_beyond = false;
+        for (const auto& c : c_excl) {
+            if (c.offset < 0xA00 && 0x200 < c.offset + c.size) any_overlap = true;
+            if (c.offset >= 0xA00 && c.size >= RC_VIRT_MIN_CAVE_BYTES) got_beyond = true;
+        }
+        check("cave_excl_0x200_hook_zone_skipped", !any_overlap && got_beyond,
+              "排除 [0x200,0xA00) 后必须跳过该区且在区外仍有洞");
+        // 部分相交的洞也必须整块跳过（洞跨在排除区边界上：排除 {0x100,0x400} 与
+        // 洞 [0x200,0x1000) 部分相交 → 跳过）
+        const std::vector<RcVirtCave> excl2 = { { 0x100, 0x400 } };
+        auto c_excl2 = rc_virt_scan_caves(z, 0, z.size(), RC_VIRT_MIN_CAVE_BYTES, 16, excl2);
+        bool partial_overlap = false;
+        for (const auto& c : c_excl2) {
+            if (c.offset < 0x500 && 0x100 < c.offset + c.size) partial_overlap = true;
+        }
+        check("cave_excl_partial_overlap_skipped", !partial_overlap);
+        // weave 兜底闸（第二道防线）：模拟调用方没传 occupied 的最坏情形——
+        // vec_out 已有写入落在候选洞内时，weave 必须 continue 而不是覆盖。
+        // 这里不构造完整 weave（需符号/镜像），改用与 weave 相同的区间相交判据直测。
+        {
+            const RcVirtCave cave = { 0x200, 0x800 };
+            const std::string existing_hex(0x20, 'A');   // 16B 已占用
+            const patch_bytes_data existing = { existing_hex, 0x210 };
+            const size_t blob_len = 512;
+            const bool would_overlap = (cave.offset < existing.write_addr + existing_hex.size() / 2)
+                                    && (existing.write_addr < cave.offset + blob_len);
+            check("cave_excl_weave_guard_predicate", would_overlap,
+                  "weave 兜底闸的相交判据必须能在 0x210 处识别重叠（负样本通道）");
+        }
+    }
+
+    // ⑫ ENG-3 回归：kallsyms 名字表的双字节长度（MSB）解析必须与 expand 步进一致。
+    // 纯逻辑夹具：构造 [6.1.0,6.1.42) 名字表形态（len=0x80 的大符号 + 正常符号），
+    // 逐符号用 expand 同款步进公式推进，断言 offset 序列与 find 的解析一致。
+    // （expand 本体依赖 token 表等全套结构，这里锁死的是**步进公式**这一失步根因。）
+    {
+        // 夹具：sym0 正常(0x10 数据字节, 单字节头) + sym1 大符号(头 0x80,0x01 →
+        //       len=0x80，双字节头) + 0x80 个数据字节 + sym2 正常(0x04)。
+        // 修复前 expand 对 sym1 按 len=0x80、off+=len+1 推进（把头当数据），
+        // 与 find 的 2 字节头 + off += sym_len 失步 1 字节。
+        auto step_expand_style = [&](unsigned off) -> unsigned {
+            // 与 kallsyms_expand_symbol（修复后）逐行同款：
+            // 读 len；若 MSB=1 读第二字节；off 前进头字节数 + len（数据字节数）。
+            const std::vector<uint8_t>& buf = msb_fixture;
+            unsigned pos = off;
+            unsigned len = buf[pos]; ++pos;
+            if (len & 0x80) { len = (len & 0x7F) | (unsigned(buf[pos]) << 7); ++pos; }
+            pos += len;
+            return pos;
+        };
+        unsigned o = 0;
+        const unsigned o1 = step_expand_style(o);
+        const unsigned o2 = step_expand_style(o1);
+        const unsigned o3 = step_expand_style(o2);
+        // find 风格步进（find_kallsyms_names_list 同款：1~2 字节头 + sym_len 数据字节）
+        auto step_find_style = [&](size_t off) -> size_t {
+            const std::vector<uint8_t>& buf = msb_fixture;
+            size_t pos = off;
+            unsigned ch = buf[pos]; ++pos;
+            unsigned sym_len;
+            if (ch <= 0x7F) sym_len = ch;
+            else { sym_len = (ch & 0x7F) | (unsigned(buf[pos]) << 7); ++pos; }
+            return pos + sym_len;
+        };
+        size_t f = 0;
+        const size_t f1 = step_find_style(f);
+        const size_t f2 = step_find_style(f1);
+        const size_t f3 = step_find_style(f2);
+        check("msb_expand_step_matches_find",
+              o1 == f1 && o2 == f2 && o3 == f3 && o3 == msb_fixture.size(),
+              "expand 与 find 的步进必须在含 len>=0x80 符号的表上逐符号一致");
+        // 负样本通道：若把 MSB 分支拿掉（退回修复前行为），步进必须失步 → 本组断言变红
+        {
+            auto step_pre200610_style = [&](unsigned off) -> unsigned {
+                const std::vector<uint8_t>& buf = msb_fixture;
+                unsigned pos = off;
+                unsigned len = buf[pos]; ++pos;
+                pos += len + 1;   // 旧实现：off += len + 1，不处理 MSB
+                return pos;
+            };
+            unsigned q0 = 0, q1 = step_pre200610_style(q0), q2 = step_pre200610_style(q1);
+            bool desyncs_on_big_symbol = !(q1 == f1 && q2 == f2);
+            check("msb_neg_old_style_desyncs", desyncs_on_big_symbol,
+                  "旧步进公式在含 0x80 头的夹具上必须失步（证明本组断言会红）");
+        }
+    }
 
     std::cout << "RCVRESULT " << (failures == 0 ? "PASS" : "FAIL")
               << " " << (total - failures) << "/" << total << " cases\n";
@@ -1824,8 +1948,14 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
         J rep = build_report(opt, st, root_key);
         std::string rerr;
         write_file_atomic(opt.report_path, rep.dump(2), rerr);   // 失败仅记日志，不影响主产物
+        // ENG-8（V-18 口径统一）：NDJSON result 事件**不再携带明文 root_key**——
+        // 事件流（--json）常被客户端归档/上传，明文密钥等于外发。密钥权威源仍是
+        // report.json 顶层 root_key（自带 contains_secret 标记）+ stdout 末行兜底，
+        // 两处都是"留在本机的会签口径"；事件流只给非密钥字段。
         J extra;
-        extra.set("root_key", root_key).set("report_ref", opt.report_path).set("hook_count", static_cast<int>(vec_patch.size()));
+        extra.set("root_key_sensitive", true)   // 机器可读：此事件不含密钥，勿在下游拼接
+              .set("root_key_len", static_cast<long long>(root_key.size()))
+              .set("report_ref", opt.report_path).set("hook_count", static_cast<int>(vec_patch.size()));
         emit_result(OK, std::move(extra));
         // ROOT_KEY 兜底行必须是 stdout 的**最后一行**（C1 §2.2：客户端会签口径）。
         // 旧顺序把它打印在 result 事件之前，末行实际是 NDJSON result —— 与失败分支

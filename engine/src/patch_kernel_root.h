@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include <iostream>
 #include <filesystem>
 #include "analyze/base_func.h"
@@ -24,6 +24,8 @@ struct patch_bytes_data {
 
 static size_t patch_ret_cmd(const std::vector<char>& file_buf, size_t start, std::vector<patch_bytes_data>& vec_out_patch_bytes_data) {
 	if (start == 0) return 0;
+	// ENG-7：符号地址贴近缓冲末尾时读首指令会越界（最多 3 字节）→ 直接拒绝。
+	if (start + sizeof(uint32_t) > file_buf.size()) return 0;
 	uint32_t insn = *(uint32_t*)&file_buf[start];
 	patch_bytes_data blob;
 	if (aarch64_insn_is_paciaz(insn) || aarch64_insn_is_paciasp(insn)
@@ -35,6 +37,7 @@ static size_t patch_ret_cmd(const std::vector<char>& file_buf, size_t start, std
 
 static size_t patch_ret_1_cmd(const std::vector<char>& file_buf, size_t start, std::vector<patch_bytes_data>& vec_out_patch_bytes_data) {
 	if (start == 0) return 0;
+	if (start + sizeof(uint32_t) > file_buf.size()) return 0;   // ENG-7
 	uint32_t insn = *(uint32_t*)&file_buf[start];
 	patch_bytes_data blob;
 	if (aarch64_insn_is_paciaz(insn) || aarch64_insn_is_paciasp(insn)
@@ -46,6 +49,7 @@ static size_t patch_ret_1_cmd(const std::vector<char>& file_buf, size_t start, s
 
 static size_t patch_ret_0_cmd(const std::vector<char>& file_buf, size_t start, std::vector<patch_bytes_data>& vec_out_patch_bytes_data) {
 	if (start == 0) return 0;
+	if (start + sizeof(uint32_t) > file_buf.size()) return 0;   // ENG-7
 	uint32_t insn = *(uint32_t*)&file_buf[start];
 	patch_bytes_data blob;
 	if (aarch64_insn_is_paciaz(insn) || aarch64_insn_is_paciasp(insn)
@@ -57,6 +61,7 @@ static size_t patch_ret_0_cmd(const std::vector<char>& file_buf, size_t start, s
 
 static size_t patch_data(const std::vector<char>& file_buf, size_t start, void* buf, size_t buf_size, std::vector<patch_bytes_data>& vec_out_patch_bytes_data) {
 	if (start == 0) return 0;
+	if (start + buf_size > file_buf.size()) return 0;   // ENG-7：数据写入越界同样拒绝
 	std::string str_bytes = bytes2hex((const unsigned char*)buf, buf_size);
 	vec_out_patch_bytes_data.push_back({ str_bytes, start });
 	return buf_size;
