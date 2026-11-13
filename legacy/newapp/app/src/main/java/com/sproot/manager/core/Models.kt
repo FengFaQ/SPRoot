@@ -1,0 +1,95 @@
+package com.sproot.manager.core
+
+/** 日志级别（与 UI 配色一一对应） */
+enum class LogLevel { DEBUG, INFO, WARN, ERROR }
+
+/** 单条日志；timeMs 为 epoch millis */
+data class LogEntry(
+    val timeMs: Long,
+    val level: LogLevel,
+    val tag: String,
+    val message: String,
+)
+
+/** 修补流水线阶段。UI 进度条直接映射该枚举，避免"闪一下就没"的观感。 */
+enum class PatchStage(val title: String) {
+    IDLE("就绪"),
+    PREFLIGHT("环境自检"),
+    COPY_INPUT("准备镜像"),
+    UNPACK("解包 boot.img"),
+    DECOMPRESS("解压内核"),
+    PATCH_KERNEL("修补内核"),
+    RECOMPRESS("回压内核"),
+    REPACK("重打包 boot.img"),
+    VERIFY("校验产物"),
+    DONE("完成"),
+    FAILED("失败"),
+}
+
+/**
+ * 修补页 UI 状态。
+ *
+ * 设计铁律（来自旧版失败根因）：
+ *  - [errorTitle]/[errorDetail] 一旦写入，**不得**因阶段变化被清空；只有用户点"重置"才清。
+ *  - [logPath] 始终指向落盘日志，失败后用户可复读/分享。
+ */
+data class PatchUiState(
+    val stage: PatchStage = PatchStage.IDLE,
+    val progress: Float = 0f,
+    val phase: String = "",
+    val running: Boolean = false,
+    val sourceUri: String? = null,
+    val sourceName: String? = null,
+    val workDir: String? = null,
+    val outputPath: String? = null,
+    val reportPath: String? = null,
+    val logPath: String? = null,
+    val rootKey: String? = null,
+    val errorCode: String? = null,
+    val errorTitle: String? = null,
+    val errorDetail: String? = null,
+    val startedAt: Long = 0L,
+    val finishedAt: Long = 0L,
+) {
+    val hasError: Boolean get() = errorTitle != null || errorDetail != null
+}
+
+/** 能力自检条目（入口自检 + 每次修补前必查） */
+data class CapabilityItem(
+    val key: String,
+    val label: String,
+    val ok: Boolean,
+    val detail: String,
+    val blocking: Boolean = true,
+)
+
+/** 修补引擎 JNI 返回码（与 SPROOT-DOC-C1 §3 退出码枚举一致） */
+object EngineExitCode {
+    const val OK = 0
+    const val E_USAGE = 101
+    const val E_INPUT = 102
+    const val E_KALLSYMS = 201
+    const val E_SYMBOL_MISSING = 202
+    const val E_OFFSET_DERIVE = 210
+    const val E_INIT_CRED_NOT_FOUND = 211
+    const val E_NO_HOOK_SPACE = 220
+    const val E_UNSUPPORTED_VERSION = 230
+    const val E_WRITE = 240
+    const val E_INTERNAL = 250
+
+    /** 码 → 给人看的解释；未知码回退为通用描述，绝不吞掉原始码。 */
+    fun describe(code: Int): String = when (code) {
+        OK -> "成功"
+        E_USAGE -> "E_USAGE($code)：调用参数错误（引擎实现或调用方 bug）"
+        E_INPUT -> "E_INPUT($code)：输入内核不可读 / 仍是 .img/.gz / 非 arm64 Image"
+        E_KALLSYMS -> "E_KALLSYMS($code)：kallsyms 解析失败，该内核暂不支持"
+        E_SYMBOL_MISSING -> "E_SYMBOL_MISSING($code)：关键符号缺失，该内核暂不支持"
+        E_OFFSET_DERIVE -> "E_OFFSET_DERIVE($code)：cred/uid/seccomp 偏移推导失败"
+        E_INIT_CRED_NOT_FOUND -> "E_INIT_CRED_NOT_FOUND($code)：init_cred 模式搜索失败"
+        E_NO_HOOK_SPACE -> "E_NO_HOOK_SPACE($code)：shellcode 空间不足（die/cfi 区域过小）"
+        E_UNSUPPORTED_VERSION -> "E_UNSUPPORTED_VERSION($code)：内核版本超出 3.10~6.18 支持域"
+        E_WRITE -> "E_WRITE($code)：输出写失败（磁盘/权限）"
+        E_INTERNAL -> "E_INTERNAL($code)：引擎内部未分类错误"
+        else -> "E_UNKNOWN($code)：引擎返回了契约外的退出码"
+    }
+}

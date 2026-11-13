@@ -1,0 +1,223 @@
+package com.sproot.manager.ui.pages
+
+import android.content.Context
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import com.sproot.manager.BuildConfig
+import com.sproot.manager.core.ApdClient
+import com.sproot.manager.core.AppLog
+import com.sproot.manager.core.SecretStore
+import com.sproot.manager.ui.components.ActionRow
+import com.sproot.manager.ui.components.BodyText
+import com.sproot.manager.ui.components.HSpacer
+import com.sproot.manager.ui.components.InfoRow
+import com.sproot.manager.ui.components.SectionCard
+import com.sproot.manager.ui.components.VSpacer
+import com.sproot.manager.ui.components.copyToClipboard
+import com.sproot.manager.ui.components.maskSecret
+import top.yukonga.miuix.kmp.basic.Button
+import top.yukonga.miuix.kmp.basic.ButtonDefaults
+import top.yukonga.miuix.kmp.basic.Switch
+import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.theme.MiuixTheme
+
+/**
+ * 设置页：主题 / Root 密钥 / 日志 / AP 部署 / 关于。
+ */
+@Composable
+fun SettingsPage(
+    modifier: Modifier = Modifier,
+    colorMode: Int = 0,
+    onColorModeChange: (Int) -> Unit = {},
+) {
+    val context = LocalContext.current
+    val store = remember { SecretStore.get(context) }
+    var key by remember { mutableStateOf(runCatching { store.readRootKey() }.getOrNull()) }
+    var showKey by remember { mutableStateOf(false) }
+    var deployResult by remember { mutableStateOf<String?>(null) }
+    var deploying by remember { mutableStateOf(false) }
+
+    LazyColumn(modifier = modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp)) {
+        item {
+            SectionCard(title = "外观", subtitle = "Miuix 主题；默认跟随系统亮暗") {
+                Column {
+                    ActionRow {
+                        Button(
+                            onClick = { onColorModeChange(0) },
+                            colors = if (colorMode == 0) ButtonDefaults.buttonColorsPrimary() else ButtonDefaults.buttonColors(),
+                        ) { Text("跟随系统", style = MiuixTheme.textStyles.button) }
+                        HSpacer(8)
+                        Button(
+                            onClick = { onColorModeChange(1) },
+                            colors = if (colorMode == 1) ButtonDefaults.buttonColorsPrimary() else ButtonDefaults.buttonColors(),
+                        ) { Text("浅色", style = MiuixTheme.textStyles.button) }
+                        HSpacer(8)
+                        Button(
+                            onClick = { onColorModeChange(2) },
+                            colors = if (colorMode == 2) ButtonDefaults.buttonColorsPrimary() else ButtonDefaults.buttonColors(),
+                        ) { Text("深色", style = MiuixTheme.textStyles.button) }
+                    }
+                }
+            }
+        }
+
+        item { VSpacer(14) }
+
+        item {
+            SectionCard(
+                title = "Root 密钥",
+                subtitle = "48 位 [A-Za-z0-9]；前 47 位写入内核，前 16 位即隐藏目录前缀。debug/release 行为一致",
+            ) {
+                Column {
+                    InfoRow(
+                        label = "当前密钥",
+                        value = when {
+                            key == null -> "不可用（点击下方重新生成）"
+                            showKey -> key!!
+                            else -> maskSecret(key!!)
+                        },
+                        monospace = true,
+                    )
+                    VSpacer(10)
+                    ActionRow {
+                        Button(onClick = { showKey = !showKey }) {
+                            Text(if (showKey) "隐藏" else "显示", style = MiuixTheme.textStyles.button)
+                        }
+                        HSpacer(8)
+                        Button(onClick = { key?.let { context.copyToClipboard("Root 密钥", it) } }) {
+                            Text("复制", style = MiuixTheme.textStyles.button)
+                        }
+                        HSpacer(8)
+                        Button(
+                            onClick = {
+                                key = runCatching { store.rotate() }.onFailure {
+                                    AppLog.error("Settings", "轮换密钥失败", it)
+                                }.getOrNull()
+                                AppLog.warn("Settings", "已轮换 Root 密钥：旧密钥修补的内核必须重新修补并刷入")
+                            },
+                            colors = ButtonDefaults.buttonColorsPrimary(),
+                        ) { Text("重新生成", style = MiuixTheme.textStyles.button) }
+                    }
+                    VSpacer(8)
+                    BodyText("⚠️ 重新生成后，已刷入的旧内核将无法提权，必须重新走一遍「修补 → 刷入」。")
+                }
+            }
+        }
+
+        item { VSpacer(14) }
+
+        item {
+            SectionCard(title = "日志", subtitle = "每条日志实时落盘，进程被杀也不丢") {
+                Column {
+                    InfoRow("日志文件", AppLog.currentLogFile()?.absolutePath ?: "未初始化", monospace = true)
+                    InfoRow("内存条数", "${AppLog.entries.value.size}（上限 4000，滚动淘汰）")
+                    VSpacer(10)
+                    ActionRow {
+                        Button(onClick = { context.copyToClipboard("全部日志", AppLog.dumpText()) }) {
+                            Text("复制全部日志", style = MiuixTheme.textStyles.button)
+                        }
+                        HSpacer(8)
+                        Button(onClick = { AppLog.clearMemory() }) {
+                            Text("清空内存日志", style = MiuixTheme.textStyles.button)
+                        }
+                    }
+                }
+            }
+        }
+
+        item { VSpacer(14) }
+
+        item {
+            SectionCard(
+                title = "AP 部署（特权链）",
+                subtitle = "修补链不需要 root；部署/模块/授权全部经 AP",
+            ) {
+                Column {
+                    InfoRow("AP 二进制", ApdClient.status(context).detail, monospace = true)
+                    deployResult?.let {
+                        VSpacer(6)
+                        InfoRow("最近一次部署结果", it, monospace = true)
+                    }
+                    VSpacer(10)
+                    ActionRow {
+                        Button(
+                            onClick = {
+                                if (deploying) return@Button
+                                deploying = true
+                                deployResult = "部署中…"
+                                Thread {
+                                    val k = runCatching { store.getOrCreateRootKey() }.getOrNull()
+                                    if (k == null) {
+                                        deployResult = "失败：Root 密钥不可用"
+                                        deploying = false
+                                        return@Thread
+                                    }
+                                    val nativeLib = context.applicationInfo.nativeLibraryDir
+                                    val r = ApdClient.apd(
+                                        context = context,
+                                        superKey = k,
+                                        subCommand = listOf("deploy", "--source", nativeLib),
+                                        timeoutSec = 120,
+                                    )
+                                    deployResult = buildString {
+                                        append("exit=").append(r.exitCode).append("（").append(r.describe()).append("）")
+                                        if (r.stdout.isNotBlank()) append("\n").append(r.stdout.trim())
+                                        if (r.stderr.isNotBlank()) append("\nstderr: ").append(r.stderr.trim())
+                                    }
+                                    deploying = false
+                                }.start()
+                            },
+                            enabled = !deploying,
+                            colors = ButtonDefaults.buttonColorsPrimary(),
+                        ) {
+                            Text(if (deploying) "部署中…" else "部署 / 更新 AP", style = MiuixTheme.textStyles.button)
+                        }
+                    }
+                    VSpacer(8)
+                    BodyText("退出码 125 = 密钥无效或需重新修补（不自动重试）；126/127 = 需重新部署；124 = 超时。")
+                }
+            }
+        }
+
+        item { VSpacer(14) }
+
+        item {
+            SectionCard(title = "关于") {
+                Column {
+                    InfoRow("SPRoot 管理器", "${BuildConfig.VERSION_NAME} (${BuildConfig.BUILD_TYPE}) / code ${BuildConfig.VERSION_CODE}")
+                    InfoRow("UI", "Miuix 0.9.4（Compose Multiplatform 1.12.0 坐标）")
+                    InfoRow("工具链", "AGP 9.4.1 / Kotlin 2.4.20 / Gradle 9.7.1 / JDK 21")
+                    InfoRow("修补引擎绑定契约", "JNI v${com.sproot.manager.core.PatchEngine.JNI_BINDING_VERSION}（C1 §1 参数语义）")
+                    InfoRow("AP 调用契约", "v1.1 §8（root-exec 唯一入口，只认 exit code）")
+                    VSpacer(8)
+                    BodyText("本 App 全程离线工作：不申请网络权限，不在构建期或运行期下载任何二进制。")
+                }
+            }
+        }
+
+        item {
+            SectionCard(title = "诊断开关", subtitle = "骨架阶段占位") {
+                var checked by remember { mutableStateOf(false) }
+                Column {
+                    InfoRow("详细引擎日志", "（占位：接入后控制 --verbose）")
+                    Switch(checked = checked, onCheckedChange = { checked = it })
+                }
+            }
+        }
+
+        item { VSpacer(24) }
+    }
+}
+
+private fun secretOrNull(context: Context): String? =
+    runCatching { SecretStore.get(context).readRootKey() }.getOrNull()

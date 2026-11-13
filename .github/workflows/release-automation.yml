@@ -1,0 +1,244 @@
+# SPRoot 发布自动化
+#
+# 双轨制（2026-11-13 重构，替代旧 release-gate 的人工发布模式）：
+#
+#   job 1  pre-release —— 每次成功构建后自动创建 pre-release：
+#     - tag: pre-<short-sha>
+#     - 标记 pre-release，changelog（更新日志）只写在 pre 里
+#     - 附件：APK / skroot-patch / libskrootpatch.so / magiskboot / apd / 校验和
+#
+#   job 2  rolling-stable —— 把"正式版"指向最新：
+#     - tag: v2-stable（固定 tag，强制移动到最新成功构建的 commit）
+#     - **不含 changelog**（更新日志只在 pre），正文只写"指向 pre-<sha>"
+#     - 标记 pre-release=false（GitHub 把它排在 Releases 顶部的 Latest 位置）
+#     - 用户语义："正式版始终指向最新构建"
+#
+# 门禁：本工作流只做基本完整性断言（LIC 存在、APK AArch64、无 x86-64 混入），
+#       保留旧 release-gate 的 LIC/ARCH/VER 精神但精简；engine 再许可确认门禁
+#       按用户决定（2026-11-13）对 pre 与 stable 均**免除**。
+#
+# 触发：push 到 main（本工作流所在分支）成功跑完 build 链后自动执行；
+#       也可手动触发（跳过等待构建，直接聚合最新可用 artifacts）。
+
+name: Release automation
+
+on:
+  workflow_run:
+    workflows: ["Build SPRoot Manager APK"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "强制发布（忽略 completed 检查）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Auto pre-release + rolling stable
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve target commit
+        id: meta
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SHA="${{ github.sha }}"
+          else
+            SHA="${{ github.event.workflow_run.head_sha }}"
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          echo "发布目标 commit: $SHA"
+
+      - name: Collect artifacts for this commit
+        id: collect
+        run: |
+          set -euo pipefail
+          SHA="${{ steps.meta.outputs.sha }}"
+          WORK="$RUNNER_TEMP/release"
+          mkdir -p "$WORK"
+          echo "work=$WORK" >> "$GITHUB_OUTPUT"
+
+          fetch_artifact() { # $1=name $2=destdir
+            local name="$1" dest="$2" deadline=$(( $(date +%s) + 1200 ))
+            mkdir -p "$dest"
+            while :; do
+              local id
+              id=$(gh api "/repos/$REPO/actions/artifacts?name=$name&per_page=100" 2>/dev/null \
+                | python3 -c 'import json,sys;d=json.load(sys.stdin);c=[a for a in d.get("artifacts",[]) if (a.get("workflow_run") or {}).get("head_sha")==sys.argv[1] and not a.get("expired")];c.sort(key=lambda a:a["id"]);print(c[-1]["id"] if c else "")' "$SHA" || true)
+              if [ -n "${id:-}" ] && gh api "/repos/$REPO/actions/artifacts/$id/zip" > "/tmp/$name.zip" 2>/dev/null \
+                 && unzip -o -q "/tmp/$name.zip" -d "$dest"; then
+                echo "OK $name (artifact $id)"
+                return 0
+              fi
+              if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "::error::artifact '$name' for $SHA 未在 20 分钟内出现"
+                return 1
+              fi
+              echo "… waiting for $name"
+              sleep 20
+            done
+          }
+
+          fetch_artifact SPRoot-APK          "$WORK/apk"
+          fetch_artifact skroot-engine-arm64 "$WORK/engine"
+          fetch_artifact magiskboot-arm64    "$WORK/magiskboot"
+          fetch_artifact apd-aarch64-latest  "$WORK/apd"
+
+      - name: Assert — LIC files exist & APK is AArch64-only
+        run: |
+          set -euo pipefail
+          WORK="${{ steps.collect.outputs.work }}"
+          for f in LICENSE LICENSES.md NOTICE; do
+            test -s "$f" || { echo "::error::缺少 $f"; exit 1; }
+          done
+          APK=$(find "$WORK/apk" -name '*.apk' | head -1)
+          test -n "$APK" || { echo "::error::APK artifact 为空"; exit 1; }
+          mkdir -p "$WORK/apkx"
+          unzip -o -q "$APK" 'lib/*' -d "$WORK/apkx"
+          BAD=$(find "$WORK/apkx/lib" -type f ! -path '*arm64-v8a*' | wc -l)
+          [ "$BAD" -eq 0 ] || { echo "::error::APK 含非 arm64-v8a native $BAD 个"; exit 1; }
+          while IFS= read -r f; do
+            machine=$(od -An -tu2 -j18 -N2 "$f" | tr -d ' \n')
+            [ "$machine" = "183" ] || { echo "::error::$f 非 AArch64"; exit 1; }
+          done < <(find "$WORK/apkx/lib" -type f)
+          echo "OK: APK AArch64-only, LIC files present"
+
+      - name: Stage release files
+        id: stage
+        run: |
+          set -euo pipefail
+          WORK="${{ steps.collect.outputs.work }}"
+          SHORT="${{ steps.meta.outputs.short }}"
+          OUT="$RUNNER_TEMP/staged"
+          mkdir -p "$OUT"
+          APK=$(find "$WORK/apk" -name '*.apk' | head -1)
+          cp "$APK" "$OUT/SPRoot-${SHORT}.apk"
+          find "$WORK/engine" -name 'skroot-patch'  -exec cp {} "$OUT/skroot-patch-${SHORT}" \; -quit
+          find "$WORK/engine" -name 'libskrootpatch.so' -exec cp {} "$OUT/libskrootpatch-${SHORT}.so" \; -quit
+          find "$WORK/magiskboot" -type f ! -name '*.txt' ! -name '.*' -exec cp {} "$OUT/magiskboot-${SHORT}" \; -quit
+          find "$WORK/apd" -name 'libapd*.so' -exec cp {} "$OUT/libapd-${SHORT}.so" \; -quit
+          # 校验和
+          ( cd "$OUT" && sha256sum --tag ./* > SHA256SUMS-${SHORT}.txt )
+          # 更新日志（只属于 pre）
+          {
+            echo "## SPRoot pre-release \`pre-$SHORT\`"
+            echo ""
+            echo "- **构建时间**: ${{ steps.meta.outputs.date }} (UTC)"
+            echo "- **commit**: [$SHORT](https://github.com/$REPO/commit/${{ steps.meta.outputs.sha }})"
+            echo ""
+            echo "### 本次包含的变更"
+            echo ""
+            gh api "/repos/$REPO/commits/${{ steps.meta.outputs.sha }}" --jq '.commit.message' | head -40 || true
+            echo ""
+            echo "### 附件校验"
+            echo '```'
+            cat "$OUT/SHA256SUMS-${SHORT}.txt"
+            echo '```'
+            echo ""
+            echo "> ⚠️ pre-release：自动构建，未经真机验证。稳定性以真机测试为准。"
+            echo "> 引擎含 SKRoot 上游代码（见 LICENSES.md），分发请遵循其标注。"
+          } > "$OUT/CHANGELOG-pre-${SHORT}.md"
+          echo "staged=$OUT" >> "$GITHUB_OUTPUT"
+          ls -la "$OUT"
+
+      - name: Create / update pre-release
+        env:
+          SHORT: ${{ steps.meta.outputs.short }}
+        run: |
+          set -euo pipefail
+          OUT="${{ steps.stage.outputs.staged }}"
+          TAG="pre-${SHORT}"
+          # 已存在则删除重建（同 sha 重新构建时覆盖）
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          git push origin :refs/tags/"$TAG" 2>/dev/null || true
+          gh release create "$TAG" \
+            --target "${{ steps.meta.outputs.sha }}" \
+            --title "SPRoot pre-$SHORT (${{ steps.meta.outputs.date }})" \
+            --prerelease \
+            --notes-file "$OUT/CHANGELOG-pre-${SHORT}.md"
+          # 传附件
+          find "$OUT" -type f ! -name 'CHANGELOG*' -exec gh release upload "$TAG" {} --clobber \;
+          echo "OK pre-release $TAG"
+
+      - name: Move rolling stable (v2-stable) to this build
+        env:
+          SHORT: ${{ steps.meta.outputs.short }}
+        run: |
+          set -euo pipefail
+          OUT="${{ steps.stage.outputs.staged }}"
+          TAG="v2-stable"
+          {
+            echo "## SPRoot 正式版（滚动最新）"
+            echo ""
+            echo "此 Release **始终指向最新一次成功构建**（滚动更新，不含更新日志）。"
+            echo ""
+            echo "- **当前指向**: [pre-$SHORT](https://github.com/$REPO/releases/tag/pre-$SHORT)（commit [\`$SHORT\`](https://github.com/$REPO/commit/${{ steps.meta.outputs.sha }})）"
+            echo "- **发布时间**: ${{ steps.meta.outputs.date }} UTC"
+            echo "- **更新日志**: 见对应 pre-release 页"
+            echo ""
+            echo "### 下载"
+            echo ""
+            for f in "$OUT"/*; do
+              echo "- \`$(basename "$f")\`"
+            done
+            echo ""
+            echo "> ⚠️ 引擎含 SKRoot 上游代码（见 LICENSES.md），分发请遵循其标注。"
+          } > /tmp/stable-notes.md
+          # 移动 tag 到本 commit（强制）
+          git tag -f "$TAG" "${{ steps.meta.outputs.sha }}"
+          git push origin "refs/tags/$TAG" --force
+          # release 存在则改指向，否则创建
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --title "SPRoot 正式版（滚动最新）— pre-$SHORT" \
+              --notes-file /tmp/stable-notes.md \
+              --latest
+            # 清旧附件、传新附件
+            for old in $(gh release view "$TAG" --json assets --jq '.assets[].name' 2>/dev/null); do
+              gh release delete-asset "$TAG" "$old" --yes 2>/dev/null || true
+            done
+          else
+            gh release create "$TAG" \
+              --target "${{ steps.meta.outputs.sha }}" \
+              --title "SPRoot 正式版（滚动最新）— pre-$SHORT" \
+              --latest \
+              --notes-file /tmp/stable-notes.md
+          fi
+          find "$OUT" -type f ! -name 'CHANGELOG*' -exec gh release upload "$TAG" {} --clobber \;
+          echo "OK stable $TAG → pre-$SHORT"
+
+      - name: Summary
+        run: |
+          SHORT="${{ steps.meta.outputs.short }}"
+          {
+            echo "## 发布完成"
+            echo ""
+            echo "- pre-release: [pre-$SHORT](https://github.com/$REPO/releases/tag/pre-$SHORT)"
+            echo "- rolling stable: [v2-stable](https://github.com/$REPO/releases/tag/v2-stable) → pre-$SHORT"
+            echo "- commit: ${{ steps.meta.outputs.sha }}"
+          } >> "$GITHUB_STEP_SUMMARY"

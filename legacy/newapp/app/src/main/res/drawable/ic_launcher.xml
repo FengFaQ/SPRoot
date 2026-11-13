@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 占位启动图标：几何化 SP 盾牌，纯矢量，避免引入位图资源 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#3482FF"
+        android:pathData="M54,10 L92,26 L92,54 C92,76 76,92 54,100 C32,92 16,76 16,54 L16,26 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,28 L74,36 L74,54 C74,66 66,76 54,82 C42,76 34,66 34,54 L34,36 Z" />
+    <path
+        android:fillColor="#3482FF"
+        android:pathData="M50,44 L58,44 L58,72 L50,72 Z M44,50 L64,50 L64,58 L44,58 Z" />
+</vector>
