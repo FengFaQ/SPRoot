@@ -20,9 +20,9 @@ name: ci-static
 
 on:
   push:
-    branches: [ "v2" ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ "v2" ]
+    branches: [ "main" ]
   workflow_dispatch:
 
 concurrency:

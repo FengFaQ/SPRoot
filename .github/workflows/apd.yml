@@ -12,7 +12,7 @@ name: apd (Rust, aarch64-android)
 
 on:
   push:
-    branches: [v2]
+    branches: [ main ]
     paths:
       - "apd/**"
       - ".github/workflows/apd.yml"
@@ -20,7 +20,7 @@ on:
       # 反馈，正是「门禁形同虚设」的成因之一。
       - "quality/static/check_apd_capabilities.py"
   pull_request:
-    branches: [v2]
+    branches: [ main ]
     paths:
       - "apd/**"
       - ".github/workflows/apd.yml"

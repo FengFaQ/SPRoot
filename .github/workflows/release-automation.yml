@@ -74,17 +74,35 @@ jobs:
           echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
           echo "发布目标 commit: $SHA"
 
+      - name: Fallback — find latest successful APK build commit
+        id: fallback
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          # 手动触发时不依赖事件携带的 commit（可能是任意 commit），
+          # 直接找最近一次成功的 Build SPRoot Manager APK run 的 head_sha
+          SHA=$(gh api "/repos/$REPO/actions/workflows/apk.yml/runs?status=success&per_page=1" \
+            --jq '.workflow_runs[0].head_sha')
+          test -n "$SHA" || { echo "::error::找不到任何成功的 APK 构建"; exit 1; }
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          echo "兜底目标（最近成功 APK 构建）: $SHA"
+
       - name: Collect artifacts for this commit
         id: collect
         run: |
           set -euo pipefail
-          SHA="${{ steps.meta.outputs.sha }}"
+          SHA="${{ steps.fallback.outputs.sha || steps.meta.outputs.sha }}"
           WORK="$RUNNER_TEMP/release"
           mkdir -p "$WORK"
           echo "work=$WORK" >> "$GITHUB_OUTPUT"
 
-          fetch_artifact() { # $1=name $2=destdir
-            local name="$1" dest="$2" deadline=$(( $(date +%s) + 1200 ))
+          # APK 必需（硬性）；engine/magiskboot/apd 可选——paths 过滤器下
+          # 未改 engine/apd 的 commit 不会有对应 artifact，缺失时跳过该部分
+          # 文件并在 pre 说明，而不是把整个发布卡死 20 分钟。
+          fetch_artifact() { # $1=name $2=destdir $3=required(yes/no) $4=wait_secs
+            local name="$1" dest="$2" req="$3" deadline=$(( $(date +%s) + $4 ))
             mkdir -p "$dest"
             while :; do
               local id
@@ -96,18 +114,27 @@ jobs:
                 return 0
               fi
               if [ "$(date +%s)" -ge "$deadline" ]; then
-                echo "::error::artifact '$name' for $SHA 未在 20 分钟内出现"
-                return 1
+                if [ "$req" = "yes" ]; then
+                  echo "::error::必需 artifact '$name' for $SHA 未出现"
+                  return 1
+                fi
+                echo "::notice::可选 artifact '$name' for $SHA 不存在（paths 过滤跳过），跳过该部分"
+                return 0
+              fi
+              if [ "$req" = "no" ]; then
+                # 可选项不等待——本轮没触发对应 workflow 就是没有
+                echo "::notice::可选 artifact '$name' 不存在，跳过"
+                return 0
               fi
               echo "… waiting for $name"
               sleep 20
             done
           }
 
-          fetch_artifact SPRoot-APK          "$WORK/apk"
-          fetch_artifact skroot-engine-arm64 "$WORK/engine"
-          fetch_artifact magiskboot-arm64    "$WORK/magiskboot"
-          fetch_artifact apd-aarch64-latest  "$WORK/apd"
+          fetch_artifact SPRoot-APK          "$WORK/apk"        yes 1200
+          fetch_artifact skroot-engine-arm64 "$WORK/engine"     no  0
+          fetch_artifact magiskboot-arm64    "$WORK/magiskboot" no  0
+          fetch_artifact apd-aarch64-latest  "$WORK/apd"        no  0
 
       - name: Assert — LIC files exist & APK is AArch64-only
         run: |
@@ -138,10 +165,19 @@ jobs:
           mkdir -p "$OUT"
           APK=$(find "$WORK/apk" -name '*.apk' | head -1)
           cp "$APK" "$OUT/SPRoot-${SHORT}.apk"
-          find "$WORK/engine" -name 'skroot-patch'  -exec cp {} "$OUT/skroot-patch-${SHORT}" \; -quit
-          find "$WORK/engine" -name 'libskrootpatch.so' -exec cp {} "$OUT/libskrootpatch-${SHORT}.so" \; -quit
-          find "$WORK/magiskboot" -type f ! -name '*.txt' ! -name '.*' -exec cp {} "$OUT/magiskboot-${SHORT}" \; -quit
-          find "$WORK/apd" -name 'libapd*.so' -exec cp {} "$OUT/libapd-${SHORT}.so" \; -quit
+          # 可选 artifact：目录非空才拷贝（collect 步已注明跳过原因）
+          [ -d "$WORK/engine/engine" ] && find "$WORK/engine/engine" -name 'skroot-patch' -exec cp {} "$OUT/skroot-patch-${SHORT}" \; -quit
+          [ -d "$WORK/engine/engine" ] && find "$WORK/engine/engine" -name 'libskrootpatch.so' -exec cp {} "$OUT/libskrootpatch-${SHORT}.so" \; -quit
+          [ -d "$WORK/magiskboot/magiskboot" ] && find "$WORK/magiskboot/magiskboot" -type f ! -name '*.txt' ! -name '.*' ! -name '*.zip' -exec cp {} "$OUT/magiskboot-${SHORT}" \; -quit
+          [ -d "$WORK/apd/apd" ] && find "$WORK/apd/apd" -name 'libapd*.so' -exec cp {} "$OUT/libapd-${SHORT}.so" \; -quit
+          MISSING=""
+          [ -f "$OUT/skroot-patch-${SHORT}" ]      || MISSING="$MISSING skroot-patch"
+          [ -f "$OUT/libskrootpatch-${SHORT}.so" ] || MISSING="$MISSING libskrootpatch.so"
+          [ -f "$OUT/magiskboot-${SHORT}" ]        || MISSING="$MISSING magiskboot"
+          [ -f "$OUT/libapd-${SHORT}.so" ]         || MISSING="$MISSING libapd.so"
+          if [ -n "$MISSING" ]; then
+            echo "::notice::本轮未包含:$MISSING（对应 workflow 未触发，paths 过滤正常行为）"
+          fi
           # 校验和
           ( cd "$OUT" && sha256sum --tag ./* > SHA256SUMS-${SHORT}.txt )
           # 更新日志（只属于 pre）
@@ -150,6 +186,9 @@ jobs:
             echo ""
             echo "- **构建时间**: ${{ steps.meta.outputs.date }} (UTC)"
             echo "- **commit**: [$SHORT](https://github.com/$REPO/commit/${{ steps.meta.outputs.sha }})"
+            if [ -n "$MISSING" ]; then
+              echo "- **本轮未包含**:$(echo "$MISSING" | sed 's/  / `/g; s/^ `/ `/; s/$/`/')（对应 workflow 本轮未触发）"
+            fi
             echo ""
             echo "### 本次包含的变更"
             echo ""
