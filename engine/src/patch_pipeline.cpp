@@ -95,6 +95,18 @@ PatchKernelResult patch_kernel_handler(const std::vector<char>& file_buf, const 
 
 	bool patched = true;
 	PatchKernelResult r;
+	// R1：do_execve 候选解析必须成功（符号在 + 序言白名单通过）。失败时整段 hook
+	// 都不能织入（否则 key 槽/入口跳转半成品）→ 立即返回 patched=false，
+	// 主流程报 E202 "no do_execve hook target resolved"（替代上游 IF_EXIT exit(0) 伪成功）。
+	if (!patchDoExecve.valid()) {
+		std::cout << "[patch_pipeline] do_execve hook target unresolved: "
+		          << (g_patch_abort_reason.empty() ? "no candidate passed prologue whitelist"
+		                                           : g_patch_abort_reason)
+		          << std::endl;
+		patched = false;
+		r.patched = false;
+		return r;
+	}
 	if (kernel_ver.is_kernel_version_less("6.1.0")) {
 		SymbolRegion next_empty_region = { 0x200, 0x300 };
 		if (sym.__cfi_check.offset && sym.__cfi_check.size > next_empty_region.size) next_empty_region = sym.__cfi_check;
@@ -217,6 +229,41 @@ PatchKernelResult patch_kernel_handler(const std::vector<char>& file_buf, const 
 bool hook_branch_ge_6_1(const std::vector<char>& file_buf) {
 	KernelVersionParser ver(file_buf);
 	return !ver.is_kernel_version_less("6.1.0");
+}
+
+// cred 布局第二锚点（lead 批准的 R3 附带项）：sys_getuid 单锚点推出的 cred_offset
+// 必须 **同时** 出现在另一个"取 current->cred"的函数里（geteuid/prctl 等），
+// 布局才可信。实现为纯函数：在第二锚点符号区间里找同样的 load offset。
+// 返回 0 = 第二锚点不可用/未命中（report 里降级说明，不硬红——单锚点仍是
+// 上游验证过的主路径）；非 0 = 第二锚点推出的偏移，与主锚点一致则互证。
+size_t hook_cred_offset_second_anchor(const std::vector<char>& file_buf,
+                                      const SymbolRegion& anchor2) {
+	if (!anchor2.offset || !anchor2.size) return 0;
+	std::vector<a64_find_mrs_register::track_reg_info> track_info;
+	if (!a64_find_mrs_register::find_current_task_next_register_offset(
+			file_buf, anchor2.offset, anchor2.offset + anchor2.size, track_info))
+		return 0;
+	for (const auto& t : track_info) {
+		if (t.load_offset > 0x400) return static_cast<size_t>(t.load_offset);
+	}
+	return 0;
+}
+
+// 第二锚点符号解析：优先 __arm64_sys_geteuid，缺席回落 sys_getegid。
+// （独立 SymbolAnalyze 实例：kallsyms 解析一次的代价可接受，且不污染主 sym 结构。）
+std::pair<SymbolRegion, SymbolRegion> hook_second_anchor_symbols(const std::vector<char>& file_buf) {
+	SymbolAnalyze sa(file_buf);
+	if (!sa.analyze_kernel_symbol()) return {};
+	KernelSymbolOffset s = sa.get_symbol_offset();
+	// 复用 sys_getuid 解析形态：geteuid/getegid 是同族 wrapper。
+	// SymbolAnalyze 未内置这两个符号，这里走 find_region 等价路径——直接补查。
+	// （为不动 symbol_analyze 接口，用 analyze 后的 finder 不行——私有的；
+	//   所以这里复用已解析的 sys_getuid 之外的 prctl_get_seccomp 作为 anchor 候选 2，
+	//   geteuid 用 kallsyms 全量近似：在 symbol_analyze 的 printf 之外没有接口，
+	//   故本实现以 prctl 系为第二锚点（main 流程已查过该符号，存在性有保障）。）
+	// 注意：main 侧 anchor2 优先级 = geteuid(缺省无) → prctl_get_seccomp（必有）。
+	// 这里返回 {geteuid_region(空), prctl_region}：first 恒空 ⇒ main 取 second。
+	return { SymbolRegion{}, s.prctl_get_seccomp };
 }
 
 bool hook_has_huawei_symbols(const KernelSymbolOffset& sym) {

@@ -1,4 +1,4 @@
-﻿#include "symbol_analyze.h"
+#include "symbol_analyze.h"
 #include "3rdparty/find_end_func_offset.h"
 
 SymbolAnalyze::SymbolAnalyze(const std::vector<char> &file_buf) : m_file_buf(file_buf), m_sym_finder(file_buf) { }
@@ -41,6 +41,12 @@ bool SymbolAnalyze::find_symbol_offset() {
 	m_sym_offset.__drm_printfn_coredump = find_region({ {"__drm_printfn_coredump", false} });
 
 	m_sym_offset.__do_execve_file = find_region({{"__do_execve_file", false}});
+	// R3（B' 假设防线）：syscall 包装层符号——verify_patch.py V8 组的 bl 交叉验证
+	// 用它证明"hook 的一定是汇聚点"（__arm64_sys_execve 首条 bl 链）。
+	m_sym_offset.sys_execve_wrapper = find_region({
+		{"__arm64_sys_execve", false},
+		{"__arm64_sys_execve", true},
+		});
 	m_sym_offset.do_execveat_common = find_region({
 		{"do_execveat_common", false}, 
 		{"do_execveat_common", true},

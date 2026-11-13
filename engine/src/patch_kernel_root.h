@@ -7,7 +7,15 @@
 #define ROOT_KEY_LEN 48
 #define FOLDER_HEAD_ROOT_KEY_LEN 16
 
-#define IF_EXIT(cond) do { if (cond) { printf("[ERROR] Patch empty addr!\n"); system("pause"); exit(0); } } while (0)
+// R1：IF_EXIT 不再 exit(0)（上游遗留：Linux 上 system("pause") 立即失败 → exit(0)
+// = **rc 0 伪成功**，绕过 fail() 的 E-code 体系；"hook 符号全缺席"会静默变成
+// "成功但无产物"，与用户"刷错旧镜像"的症状同构，无法排障）。
+// 现语义：条件为真时记录到 g_patch_abort_reason 并**不中断**，由调用方在
+// patch 结束后检查（PATCH_AND_CONSUME 的 0 长度本身就会让管线判断失败）。
+// 所有旧 IF_EXIT 调用点语义保持"报告异常"，退出码统一由 skroot_patch_main 的 fail() 决定。
+#include <string>
+extern std::string g_patch_abort_reason;
+#define IF_EXIT(cond) do { if (cond) { std::string __r = "[ERROR] Patch empty addr!"; printf("%s\n", __r.c_str()); if (g_patch_abort_reason.empty()) g_patch_abort_reason = __r; } } while (0)
 
 #define PATCH_AND_CONSUME(region, call_expr) \
     do { \

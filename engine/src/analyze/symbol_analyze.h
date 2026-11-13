@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "kernel_symbol_finder.h"
 #include <iostream>
 #include <vector>
@@ -11,6 +11,8 @@ struct KernelSymbolOffset {
 	SymbolRegion __drm_printfn_coredump = { 0 };
 
 	SymbolRegion __do_execve_file = { 0 };
+	// R3：syscall 包装层（__arm64_sys_execve），V8 bl 交叉验证用；缺席 = 0（V8 WARN 降级）
+	SymbolRegion sys_execve_wrapper = { 0 };
 	SymbolRegion do_execveat_common = { 0 };
 	SymbolRegion do_execve_common = { 0 };
 	SymbolRegion do_execveat = { 0 };

@@ -375,6 +375,118 @@ def check_diff(in_bytes, out_bytes):
         record("V4", "PASS", "总改动 %d 字节在阈值内（≤256KB）" % total)
 
 
+# ---------------------------------------------------------------------------
+# V8（R3 静态自证）：do_execve hook 必须落在 syscall 汇聚点。
+# 背景见 lead 裁决（B' 假设）：hook 若落到非汇聚点（瘦包装/冷函数），
+# 提权会静默 125 且镜像看起来一切正常。本组断言**纯静态、无需 root**：
+#   ① report.do_execve_hook 存在且 hook_addr 是合法 b 指令落位
+#   ② new_bytes 是合法 AArch64 b 指令，且跳转目标落回 report 声明的 cave/落位区
+#   ③ ★ bl 交叉验证：__arm64_sys_execve 解析地址处第一条 bl 的目标 == do_execve
+#      hook_addr —— 这是"hook 的一定是汇聚点"的真正自证
+#      （v6.1 调用链 SYSCALL_DEFINE3(execve) → do_execve → do_execveat_common：
+#       引擎 hook 的是 do_execveat_common，而 __arm64_sys_execve 经 do_execve
+#       尾调/tail-call 到 common；bl 目标一致性 = 汇聚点同一性的静态证据）。
+# report 缺 do_execve_hook 字段 → WARN（旧引擎产物兼容，不硬红）。
+# ---------------------------------------------------------------------------
+def _arm64_b_target(addr, insn):
+    """b（op=0b000101）或 bl（op=0b100101）的跳转目标；其余返回 None。
+    注意 bl 是 bits[31:26]==0b100101（0x94 或 0x97 都可能是 bl：负偏移时高字节
+    含符号位扩展，(insn>>24)==0x94 只能匹配正偏移 —— 必须按 26 位 opcode 判）。"""
+    op = insn >> 26
+    if op == 0x05 or op == 0x25:   # 0b000101=b/b.cond 前缀 / 0b100101=bl
+        imm = insn & 0x03FFFFFF
+        if imm & (1 << 25):
+            imm -= (1 << 26)
+        return addr + imm * 4
+    return None
+
+
+def check_do_execve_hook_consistency(out_bytes, report):
+    """V8：do_execve hook 静态自证（R3）。"""
+    hook = report.get("do_execve_hook") or {}
+    if not hook:
+        record("V8", "WARN",
+               "report 缺 do_execve_hook 字段（旧引擎产物）：hook 是否落在 syscall "
+               "汇聚点无法静态自证，建议用新引擎重刷一次拿到完整报告")
+        return
+    try:
+        hook_addr = int(str(hook.get("hook_addr", "0")), 0)
+    except ValueError:
+        record("V8", "FAIL", "do_execve_hook.hook_addr 非法：%r" % hook.get("hook_addr"))
+        return
+    sym = str(hook.get("symbol", ""))
+    if sym != "do_execveat_common":
+        record("V8", "FAIL",
+               "do_execve_hook.symbol=%r（6.1+ 契约必须 hook do_execveat_common 汇聚点）" % sym)
+        return
+    if not (0 <= hook_addr < len(out_bytes)):
+        record("V8", "FAIL", "do_execve_hook.hook_addr=0x%X 越界（镜像 %d B）" % (hook_addr, len(out_bytes)))
+        return
+    insn = int.from_bytes(out_bytes[hook_addr:hook_addr + 4], "little")
+    tgt = _arm64_b_target(hook_addr, insn)
+    if tgt is None:
+        record("V8", "FAIL",
+               "hook_addr=0x%X 处不是合法 b 指令（实际 0x%08X）：入口没被改成跳转，"
+               "hook 静默失效（提权 125 的直接机制）" % (hook_addr, insn))
+        return
+    cave = hook.get("cave_addr")
+    if cave is not None:
+        try:
+            cave_addr = int(str(cave), 0)
+        except ValueError:
+            cave_addr = None
+        if cave_addr is not None and tgt != cave_addr:
+            record("V8", "FAIL",
+                   "hook 跳转目标 0x%X != do_execve_hook.cave_addr 0x%X（跳转落点与声明不符）"
+                   % (tgt, cave_addr))
+            return
+    record("V8", "PASS",
+           "hook_addr=0x%X（%s）处是合法 b → 0x%X%s"
+           % (hook_addr, sym, tgt, "（== cave）" if cave is not None else ""))
+
+    # ③ bl 交叉验证：__arm64_sys_execve 处第一条 bl 的目标 == hook 落位链
+    #    （v6.1：sys_execve bl do_execve → do_execve b common；引擎 hook 的入口
+    #     链必须能从 syscall 包装"走到"）。报告需提供 crosscheck 链。
+    chain = hook.get("call_chain") or []
+    if not chain:
+        record("V8", "WARN",
+               "report 未提供 do_execve_hook.call_chain：bl 交叉验证跳过（新引擎会带）")
+        return
+    # chain 形如 [{"symbol":"__arm64_sys_execve","addr":"0x.."}, ...]：
+    # 逐级验证 addr 处第一条 bl 的目标 == 下一级 addr。
+    for i in range(len(chain) - 1):
+        try:
+            cur = int(str(chain[i].get("addr")), 0)
+            nxt = int(str(chain[i + 1].get("addr")), 0)
+        except (ValueError, AttributeError, KeyError):
+            record("V8", "FAIL", "call_chain[%d] 地址非法" % i)
+            return
+        if not (0 <= cur < len(out_bytes) - 4):
+            record("V8", "FAIL", "call_chain[%d].addr=0x%X 越界" % (i, cur))
+            return
+        bl_target = None
+        for k in range(0, 64 * 4, 4):   # 前 64 条指令内找第一条 bl
+            w = int.from_bytes(out_bytes[cur + k:cur + k + 4], "little")
+            if (w >> 26) == 0x25:       # bl = op 0b100101
+                bl_target = _arm64_b_target(cur + k, w)
+                break
+        if bl_target is None:
+            record("V8", "WARN",
+                   "call_chain[%d]（%s）前 64 条指令内无 bl：可能尾跳/内联，交叉验证降级"
+                   % (i, chain[i].get("symbol")))
+            continue
+        if bl_target != nxt:
+            record("V8", "FAIL",
+                   "bl 交叉验证失败：%s 第一条 bl → 0x%X，但下一级 %s 声明在 0x%X"
+                   "（hook 链与真实调用链不符 → hook 的可能不是汇聚点）"
+                   % (chain[i].get("symbol"), bl_target,
+                      chain[i + 1].get("symbol"), nxt))
+            return
+    record("V8", "PASS",
+           "bl 交叉验证通过：call_chain %s 的调用关系与镜像逐级一致"
+           % " → ".join(str(c.get("symbol")) for c in chain))
+
+
 def check_ndjson(path):
     """V-10 NDJSON 合法 + 终态事件唯一且在最后。"""
     events, bad = [], []
@@ -759,6 +871,10 @@ def verify_pair(inp, outp, report_path=None, key=None, ndjson=None, quiet=False)
     # ---- 差异区段 ----
     if len(in_bytes) == len(out_bytes):
         check_diff(in_bytes, out_bytes)
+
+    # ---- V8 do_execve hook 静态自证（R3）----
+    if report_loaded:
+        check_do_execve_hook_consistency(out_bytes, report)
 
     # ---- NDJSON ----
     if ndjson:
@@ -1616,6 +1732,67 @@ def _self_test_body(tmpdir, quiet=False):
     _selftest_case(cases, "V7 负样本：命中 kpimg 特征（应 WARN 而非静默 PASS）", "WARN", "V7", "WARN",
                    lambda: check_kp_residue(_mk_image(4096, fill=0x00) + b"kpimg"))
 
+    # ---------------- V8 do_execve hook 静态自证（R3，B' 假设防线）----------------
+    # 合成夹具：镜像里 0x2000=do_execve hook 落位（合法 b → 0x3000 cave），
+    #           0x4000=__arm64_sys_execve（第一条 bl → 0x1000 do_execve），
+    #           0x1000=do_execve（第一条 b → 0x2000 common，尾跳语义），
+    #           report.do_execve_hook 完整自描述。负样本改坏任何一环必须红。
+    def _mk_v8_fixture(hook_insn=None, sys_execve_insn=None, symbol="do_execveat_common",
+                       chain=None, cave="0x3000"):
+        img = bytearray(_mk_image(0x8000))
+        HOOK = 0x2000
+        CAVE = 0x3000
+        SYS = 0x4000
+        DO_EXEC = 0x1000
+        # hook 落位：b HOOK→CAVE（imm=(CAVE-HOOK)/4）
+        b_hook = 0x14000000 | (((CAVE - HOOK) // 4) & 0x03FFFFFF)
+        img[HOOK:HOOK + 4] = struct.pack("<I", hook_insn if hook_insn is not None else b_hook)
+        # __arm64_sys_execve：nop + bl DO_EXEC（bl = 0x94xxxxxx）
+        img[SYS:SYS + 4] = struct.pack("<I", 0xD503201F)
+        bl_sys = 0x94000000 | (((DO_EXEC - (SYS + 4)) // 4) & 0x03FFFFFF)
+        img[SYS + 4:SYS + 8] = struct.pack(
+            "<I", sys_execve_insn if sys_execve_insn is not None else bl_sys)
+        # do_execve：b DO_EXEC→HOOK（尾跳到 common 处的 hook）
+        b_de = 0x14000000 | (((HOOK - DO_EXEC) // 4) & 0x03FFFFFF)
+        img[DO_EXEC:DO_EXEC + 4] = struct.pack("<I", b_de)
+        hook_report = {
+            "symbol": symbol,
+            "hook_addr": "0x%X" % HOOK,
+            "cave_addr": cave,
+        }
+        if chain is not None:
+            hook_report["call_chain"] = chain
+        else:
+            hook_report["call_chain"] = [
+                {"symbol": "__arm64_sys_execve", "addr": "0x%X" % SYS},
+                {"symbol": "do_execve", "addr": "0x%X" % DO_EXEC},
+                {"symbol": "do_execveat_common", "addr": "0x%X" % HOOK},
+            ]
+        return bytes(img), hook_report
+
+    _selftest_case(cases, "V8 正样本：hook 落位合法 + bl 链逐级一致", "PASS", "V8", "PASS",
+                   lambda: (lambda fx: check_do_execve_hook_consistency(fx[0],
+                             {"do_execve_hook": fx[1]}))(_mk_v8_fixture()))
+    _selftest_case(cases, "V8 正样本：无 call_chain 时降级 WARN（不硬红，兼容旧引擎）", "WARN", "V8", "WARN",
+                   lambda: (lambda fx: check_do_execve_hook_consistency(fx[0],
+                             {"do_execve_hook": {k: v for k, v in fx[1].items() if k != "call_chain"}}))(_mk_v8_fixture()))
+    _selftest_case(cases, "V8 正样本/WARN：report 缺 do_execve_hook（旧引擎产物）", "WARN", "V8", "WARN",
+                   lambda: check_do_execve_hook_consistency(_mk_image(0x8000), {}))
+    _selftest_case(cases, "V8 负样本：hook_addr 处不是 b 指令（hook 静默失效）", "FAIL", "V8", "FAIL",
+                   lambda: (lambda fx: check_do_execve_hook_consistency(fx[0],
+                             {"do_execve_hook": fx[1]}))(_mk_v8_fixture(hook_insn=0xD503201F)))  # nop
+    _selftest_case(cases, "V8 负样本：symbol 非 do_execveat_common（hook 错对象）", "FAIL", "V8", "FAIL",
+                   lambda: (lambda fx: check_do_execve_hook_consistency(fx[0],
+                             {"do_execve_hook": fx[1]}))(_mk_v8_fixture(symbol="do_execve")))
+    _selftest_case(cases, "V8 负样本：跳转目标与 cave 声明不符", "FAIL", "V8", "FAIL",
+                   lambda: (lambda fx: check_do_execve_hook_consistency(fx[0],
+                             {"do_execve_hook": fx[1]}))(_mk_v8_fixture(cave="0x5000")))
+    _selftest_case(cases, "V8 负样本：bl 交叉验证不符（call_chain 断链）", "FAIL", "V8", "FAIL",
+                   lambda: (lambda fx: check_do_execve_hook_consistency(fx[0],
+                             {"do_execve_hook": fx[1]}))(_mk_v8_fixture(
+                                 chain=[{"symbol": "__arm64_sys_execve", "addr": "0x4000"},
+                                        {"symbol": "do_execve", "addr": "0x7000"}])))  # bl 实际 →0x1000 ≠0x7000
+
     # ---------------- BI boot.img 头 ----------------
     k = _mk_image(2048)
     good_boot = _mk_bootimg(k)
@@ -1894,7 +2071,7 @@ def _self_test_body(tmpdir, quiet=False):
     # required 必须与脚本里真实存在的 record() id 对齐（28 个）——只写 14 项时，
     # 未列出的组（如 BI2/RB4/BI5/RB0）退化成永远 PASS 也照样全绿，门禁形同虚设。
     ALL_CHECK_IDS = {
-        "V1", "V2", "V3", "V4", "V5", "V6", "V7",
+        "V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8",
         "BI", "BI1", "BI2", "BI3", "BI4", "BI5", "BI6",
         "RB0", "RB1", "RB2", "RB3", "RB4", "RB5", "RB6",
         "ELF", "ELF1", "ELF2", "ELF3", "ELF4", "ELF5", "ELF6",

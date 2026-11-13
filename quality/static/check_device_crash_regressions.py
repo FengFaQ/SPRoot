@@ -412,6 +412,91 @@ def check_export_order_and_permission(path: str) -> list:
     return problems
 
 
+# ── KEYFP-1 ─────────────────────────────────────────────────────────────────
+# 密钥指纹口径锚点 + 序列化完整性 + 记录点覆盖（真机 125 根因诊断，2026-11-13）
+FINGERPRINT_DEF_RE = re.compile(r"fun\s+fingerprintOf\s*\(")
+# InstallState 序列化 key（lead 补充 A：save/load 双向都要出现）
+KEYFP_PREFS_KEY = '"key_fingerprint"'
+# 记录点：markPatchedPendingFlash 调用处必须带 keyFingerprint 实参
+MARKPATCHED_CALL_RE = re.compile(r"InstallState\.markPatchedPendingFlash\s*\(")
+
+
+def check_key_fingerprint_anchors(path: str) -> list:
+    """KEYFP-1：密钥指纹（KeyMatch 三方对账）的三条静态断言。
+
+    ①口径锚点：SecretStore.kt 必须定义 fingerprintOf，且实现里对密钥做
+      `.take(16)`——这是与 apd `version --json` key_prefix_sha256（cli.rs
+      sha256_hex_stdin(key 前 16 字符)）逐字节对齐的唯一保证；口径漂移 =
+      三方对账全部失真（125 诊断永远误报/漏报）。
+    ②序列化完整性（lead 补充 A）：InstallState 的 save() 与 load() 都必须读写
+      "key_fingerprint" prefs key——漏掉一侧 = 指纹静默丢失 = NO_RECORD 误判。
+    ③记录点覆盖：PatchPipeline.kt 的 markPatchedPendingFlash 调用必须带
+      keyFingerprint 实参——漏记 = 内嵌密钥指纹从未落盘，对账无从谈起。
+    """
+    problems = []
+    lines = _read_lines(path)
+    if lines is None:
+        return problems
+    fname = os.path.basename(path)
+    text = "\n".join(lines)
+
+    if fname == "SecretStore.kt":
+        if not FINGERPRINT_DEF_RE.search(text):
+            problems.append((0, "KEYFP-1：SecretStore.kt 缺少 fingerprintOf 定义——"
+                                "KeyMatch 三方对账失去 App 侧指纹来源"))
+        else:
+            m = FINGERPRINT_DEF_RE.search(text)
+            tail = text[m.start():m.start() + 600]
+            if not re.search(r"\.take\(\s*16\s*\)", tail):
+                problems.append((
+                    text[:m.start()].count("\n") + 1,
+                    "KEYFP-1：fingerprintOf 实现没有 .take(16)——口径必须与 apd "
+                    "key_prefix_sha256（sha256(key 前 16 字符)）逐字节一致，"
+                    "否则三方对账字符串永远不相等（125 诊断失效）",
+                ))
+
+    if fname == "InstallState.kt":
+        if KEYFP_PREFS_KEY not in text:
+            problems.append((0, "KEYFP-1：InstallState.kt 未持久化 \"key_fingerprint\"——"
+                                "修补密钥指纹从不落盘，KeyMatch 只能永远 NO_RECORD"))
+        else:
+            # save() 与 load() 双向：各出现一次才算完整（lead 补充 A）
+            save_zone = text[text.find("fun save("):text.find("fun markPatching(")]
+            load_zone = text[text.find("fun load("):text.find("fun save(")]
+            for side, zone in (("load()", load_zone), ("save()", save_zone)):
+                if KEYFP_PREFS_KEY not in zone:
+                    problems.append((
+                        0,
+                        "KEYFP-1：InstallState.%s 没有读写 \"key_fingerprint\"——"
+                        "序列化单侧遗漏 = 指纹静默丢失（对账失效）" % side,
+                    ))
+
+    if fname == "PatchPipeline.kt":
+        for m in MARKPATCHED_CALL_RE.finditer(text):
+            # 调用体内（下一个平衡右括号前）必须出现 keyFingerprint = 实参
+            call_start = m.start()
+            i = text.find("(", call_start)
+            depth = 0
+            j = i
+            while j < len(text):
+                if text[j] == "(":
+                    depth += 1
+                elif text[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            call_body = text[i:j]
+            if "keyFingerprint" not in call_body:
+                problems.append((
+                    text[:call_start].count("\n") + 1,
+                    "KEYFP-1：markPatchedPendingFlash 调用未传 keyFingerprint——"
+                    "刷入镜像内嵌密钥的指纹不会落盘，root-exec 125 时无法做"
+                    "「密钥已重置 vs 镜像刷写问题」的精确诊断",
+                ))
+    return problems
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="真机崩溃回归门禁（THREAD-1 Toast 跨线程 / KEYABI-1 密钥 ABI 48→47）"
@@ -445,6 +530,7 @@ def main(argv=None) -> int:
                 + check_engine_key_abi(path)
                 + check_busy_finally_coverage(path)
                 + check_export_order_and_permission(path)
+                + check_key_fingerprint_anchors(path)
             ):
                 bad += 1
                 print("%s:%d: %s" % (path, line, msg))
@@ -488,6 +574,108 @@ fun bad() {
     val k = PatchEngine.lastRootKey()?.let { SecretStore.kernelKeyOf(it) } ?: "x"
 }
 """
+
+# KEYFP 夹具（3 断言 × 正/负）；文件名决定触发哪条断言（用 _run_keyfp_snippet）
+_GOOD_FINGERPRINT = """\
+package x
+class SecretStore {
+    companion object {
+        fun fingerprintOf(key: String): String {
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+                .digest(key.take(16).toByteArray(Charsets.UTF_8))
+            return digest.joinToString("") { "%02x".format(it) }
+        }
+    }
+}
+"""
+
+_BAD_FINGERPRINT = """\
+package x
+class SecretStore {
+    companion object {
+        fun fingerprintOf(key: String): String {
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+                .digest(key.toByteArray(Charsets.UTF_8))
+            return digest.joinToString("") { "%02x".format(it) }
+        }
+    }
+}
+"""
+
+_GOOD_INSTALLSTATE_FP = """\
+package x
+object InstallState {
+    fun load(context: Context): Snapshot {
+        val prefs = context.getSharedPreferences("p", 0)
+        return Snapshot(
+            status = Status.UNPATCHED,
+            keyFingerprint = prefs.getString("key_fingerprint", null),
+        )
+    }
+    fun save(context: Context, snapshot: Snapshot) {
+        context.getSharedPreferences("p", 0).edit()
+            .putString("key_fingerprint", snapshot.keyFingerprint)
+            .apply()
+    }
+    fun markPatching(context: Context) {}
+}
+"""
+
+_BAD_INSTALLSTATE_FP = """\
+package x
+object InstallState {
+    fun load(context: Context): Snapshot {
+        val prefs = context.getSharedPreferences("p", 0)
+        return Snapshot(status = Status.UNPATCHED)
+    }
+    fun save(context: Context, snapshot: Snapshot) {
+        context.getSharedPreferences("p", 0).edit()
+            .putString("note", snapshot.note)
+            .apply()
+    }
+    fun markPatching(context: Context) {}
+}
+"""
+
+_GOOD_MARKPATCHED_FP = """\
+package x
+object Pipeline {
+    fun done(context: Context) {
+        InstallState.markPatchedPendingFlash(
+            context = context,
+            artifactDisplayPath = "p",
+            artifactSha256 = "s",
+            artifactBytes = 1L,
+            kernelEqualLength = true,
+            keyFingerprint = SecretStore.fingerprintOf(rootKey),
+        )
+    }
+}
+"""
+
+_BAD_MARKPATCHED_FP = """\
+package x
+object Pipeline {
+    fun done(context: Context) {
+        InstallState.markPatchedPendingFlash(
+            context = context,
+            artifactDisplayPath = "p",
+            artifactSha256 = "s",
+            artifactBytes = 1L,
+            kernelEqualLength = true,
+        )
+    }
+}
+"""
+
+def _run_keyfp_snippet(src: str, filename: str):
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, filename)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(src)
+        return check_key_fingerprint_anchors(p)
 
 _GOOD_BUSY = """\
 package x
@@ -654,10 +842,39 @@ def _self_test() -> int:
             failures += 1
             print("     → 规则失效：%r 未被正确判定" % title)
 
+    # KEYFP-1：3 断言 × 正/负（文件名决定触发哪条断言）
+    keyfp_cases = [
+        ("KEYFP-1 正样本：fingerprintOf 含 take(16)",
+         _GOOD_FINGERPRINT, "SecretStore.kt", False),
+        ("KEYFP-1 负样本：fingerprintOf 丢 take(16)（口径漂移）",
+         _BAD_FINGERPRINT, "SecretStore.kt", True),
+        ("KEYFP-1 正样本：save/load 双向读写 key_fingerprint",
+         _GOOD_INSTALLSTATE_FP, "InstallState.kt", False),
+        ("KEYFP-1 负样本：序列化遗漏（双向都没写）",
+         _BAD_INSTALLSTATE_FP, "InstallState.kt", True),
+        ("KEYFP-1 正样本：markPatchedPendingFlash 带 keyFingerprint",
+         _GOOD_MARKPATCHED_FP, "PatchPipeline.kt", False),
+        ("KEYFP-1 负样本：markPatchedPendingFlash 漏记指纹",
+         _BAD_MARKPATCHED_FP, "PatchPipeline.kt", True),
+    ]
+    for title, src, fname, expect_problem in keyfp_cases:
+        problems = _run_keyfp_snippet(src, fname)
+        got = bool(problems)
+        ok = got == expect_problem
+        print("  %-46s 期望%s  实得%s  %s" % (
+            title,
+            "有问题" if expect_problem else "无问题",
+            "有问题" if got else "无问题",
+            "OK" if ok else "**FAIL**",
+        ))
+        if not ok:
+            failures += 1
+            print("     → 规则失效：%r 未被正确判定" % title)
+
     if failures:
         print("判定：SELF-TEST FAIL —— 有规则在负样本上没有变红（已退化为永远 PASS），禁止合入。")
         return 1
-    print("判定：SELF-TEST PASS —— 五条规则均在坏样本上变红、在好样本上放行。")
+    print("判定：SELF-TEST PASS —— 六条规则均在坏样本上变红、在好样本上放行。")
     return 0
 
 

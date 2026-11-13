@@ -173,7 +173,11 @@ object PatchPipeline {
             mode = current.mode,
         )
         stageDurations.clear()
-        InstallState.markPatching(appContext)
+        // 裁决①：修补开始就记当前密钥指纹（KeyMatch 三方对账的 A），防空窗。
+        val keyFp = runCatching { SecretStore.get(appContext).readRootKey() }
+            .getOrNull()?.let { SecretStore.fingerprintOf(it) }
+        InstallState.markPatching(appContext, keyFp)
+        AppLog.info(TAG, "修补开始：密钥指纹=${keyFp ?: "<不可用>"}")
 
         Thread({ execute(appContext, Uri.parse(uriString)) }, "sproot-patch").start()
     }
@@ -919,8 +923,13 @@ object PatchPipeline {
                     "rc_target=${state.value.rcTarget}；rc_source=${state.value.rcSource}；rc_reason=${state.value.rcReason}；" +
                     "products=" + artifacts.joinToString(",") { "${it.label}:${it.sha256.take(12)}@${it.bytes}" },
                 artifacts = artifacts,
+                // KeyMatch 对账的 A：**刷入镜像内嵌的密钥**指纹（rootKey 已 normalize 到 47）。
+                keyFingerprint = SecretStore.fingerprintOf(rootKey),
             )
-            AppLog.info(TAG, "==== 修补成功 ==== 产物=${exported.displayPath} sha256=$outSha")
+            AppLog.info(
+                TAG,
+                "==== 修补成功 ==== 产物=${exported.displayPath} sha256=$outSha 密钥指纹=${SecretStore.fingerprintOf(rootKey)}",
+            )
             logStageDurations()
         } catch (t: Throwable) {
             finishFailure(

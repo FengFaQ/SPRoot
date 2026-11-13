@@ -1,10 +1,24 @@
-﻿#pragma once
+#pragma once
 #include "patch_do_execve.h"
 #include "analyze/base_func.h"
 #include "3rdparty/aarch64_asm_helper.h"
 using namespace asmjit;
 using namespace asmjit::a64;
 using namespace asmjit::a64::Predicate;
+
+// R1：IF_EXIT 异常原因的全局落点（定义在引擎侧，patch_kernel_root.h 只 extern）。
+// 旧实现条件为真时直接 exit(0)（伪成功）；现在只记录，由管线/主流程判 E-code。
+std::string g_patch_abort_reason;
+
+// R2②：函数序言白名单 —— 选中候选的首指令必须属于这些形态之一。
+// 目的：①挡住 PC-relative 首指令（adrp/adr/b/cb 类搬到 blob 槽位后语义错误）；
+// ②确认这是"函数入口"而非中途落点（AArch64 序言必为 PAC/BTI/帧建立之一）。
+static bool insn_is_valid_prologue(uint32_t insn) {
+	return aarch64_insn_is_paciasp(insn) || aarch64_insn_is_pacibsp(insn)
+	    || aarch64_insn_is_paciaz(insn)  || aarch64_insn_is_pacibz(insn)
+	    || aarch64_insn_is_bti(insn)
+	    || aarch64_insn_is_stp_pre(insn);   // stp x29, x30, [sp, #-N]!（帧建立，非 PAC 内核）
+}
 
 #define MAX_ERRNO	4095
 #define TIF_SECCOMP 11
@@ -28,8 +42,35 @@ void PatchDoExecve::init_do_execve_param(const KernelSymbolOffset& sym) {
 		return true;
 	};
 	ExecveCandidate best{};
-	auto try_update_best = [&best](SymbolRegion execve_sym, uint8_t filename_reg, bool is_single_char_ptr) {
+	// R2①：版本带选（5.4- __do_execve_file 是唯一真身；6.1+ do_execveat_common 是
+	// 唯一汇聚点，已核对 v6.1.25/android14-6.1 调用链），size-max 仅作未知 vendor 兜底。
+	// R2②：序言白名单——不在集合的候选视为"非函数入口/不可搬移首指令"，跳过降级。
+	const bool ver_ge_5_5 = !m_kernel_ver_parser.is_kernel_version_less("5.5.0");
+	auto consider = [&](SymbolRegion execve_sym, uint8_t filename_reg, bool is_single_char_ptr,
+	                    bool preferred_5_5, bool preferred_pre_5_5) {
 		if (!execve_sym || execve_sym.size == 0) return;
+		// 序言白名单（R2②）：读首指令校验；越界/不在集合 → 跳过该候选。
+		const std::vector<char>& fbuf = m_file_buf;
+		if (execve_sym.offset + sizeof(uint32_t) > fbuf.size()) {
+			if (g_patch_abort_reason.empty()) g_patch_abort_reason = "execve candidate out of range";
+			return;
+		}
+		const uint32_t insn0 = *reinterpret_cast<const uint32_t*>(&fbuf[execve_sym.offset]);
+		if (!insn_is_valid_prologue(insn0)) {
+			if (g_patch_abort_reason.empty())
+				g_patch_abort_reason = "execve candidate prologue not in whitelist";
+			return;   // 降级下一候选（R2②）
+		}
+		// 带选优先：当前版本段的 preferred 候选直接锁定（不受 size 竞争干扰）。
+		if ((ver_ge_5_5 && preferred_5_5) || (!ver_ge_5_5 && preferred_pre_5_5)) {
+			best.execve_sym = execve_sym;
+			best.filename_reg = filename_reg;
+			best.is_single_char_ptr = is_single_char_ptr;
+			m_best_preferred = true;
+			return;
+		}
+		// 非 preferred：preferred 已锁定时不再参与 size-max；否则按 size-max 兜底。
+		if (m_best_preferred) return;
 		if (!best.execve_sym || execve_sym.size > best.execve_sym.size) {
 			best.execve_sym = execve_sym;
 			best.filename_reg = filename_reg;
@@ -37,17 +78,22 @@ void PatchDoExecve::init_do_execve_param(const KernelSymbolOffset& sym) {
 		}
 	};
 	if (m_kernel_ver_parser.is_kernel_version_less("3.14.0")) {
-		try_update_best(sym.do_execve_common, 0, true);
-		try_update_best(sym.do_execve, 0, true);
+		consider(sym.do_execve_common, 0, true, false, false);
+		consider(sym.do_execve, 0, true, false, false);
 	} else {
-		try_update_best(sym.__do_execve_file, 1, false);
-		try_update_best(sym.do_execveat_common, 1, false);
-		try_update_best(sym.do_execve, 0, false);
-		try_update_best(sym.do_execveat, 1, false);
-		try_update_best(sym.do_execve_common, 0, false);
+		// 顺序即带选优先级：preferred 段内首个命中即锁定（R2①）。
+		consider(sym.__do_execve_file, 1, false, /*preferred_5_5*/false, /*preferred_pre_5_5*/true);
+		consider(sym.do_execveat_common, 1, false, /*preferred_5_5*/true, false);
+		consider(sym.do_execve, 0, false, false, false);
+		consider(sym.do_execveat, 1, false, false, false);
+		consider(sym.do_execve_common, 0, false, false, false);
 	}
 	set_execve_param(best);
 	m_doexecve_reg_param.do_execve_addr = skip_pac_bti_at_func_start(m_doexecve_reg_param.do_execve_addr);
+	// R1：候选全空（或全部被序言白名单拒绝）→ valid=false，patch_do_execve 前置短路，
+	// 管线报 E202 而不是 IF_EXIT exit(0) 伪成功。
+	m_do_execve_valid = set_execve_param(best)
+		&& m_doexecve_reg_param.do_execve_addr != 0;
 }
 
 int PatchDoExecve::get_need_write_cap_cnt() {
@@ -58,6 +104,9 @@ int PatchDoExecve::get_need_write_cap_cnt() {
 size_t PatchDoExecve::patch_do_execve(const SymbolRegion& hook_func_start_region, size_t task_struct_cred_offset, size_t task_struct_seccomp_offset,
 	std::vector<patch_bytes_data>& vec_out_patch_bytes_data) {
 
+	// R1：候选全空（或全被序言白名单拒绝）→ 前置短路返回 0；管线据 valid()==false
+	// 报 E202（替代上游 IF_EXIT exit(0) 的 rc-0 伪成功）。
+	if (!m_do_execve_valid) return 0;
 	size_t hook_func_start_addr = hook_func_start_region.offset;
 	if (hook_func_start_addr == 0) return 0;
 	std::cout << "Start hooking addr:  " << std::hex << hook_func_start_addr << std::endl << std::endl;

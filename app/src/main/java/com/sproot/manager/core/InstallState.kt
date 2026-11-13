@@ -60,6 +60,13 @@ object InstallState {
         val note: String? = null,
         /** 本次修补的全部产物（boot / init_boot）；旧数据为空表示只有 artifactDisplayPath 一个 */
         val artifacts: List<Artifact> = emptyList(),
+        /**
+         * 修补所用密钥的指纹（SecretStore.fingerprintOf = sha256(key[0:16]) hex）。
+         * 语义：**刷入镜像内嵌的密钥**（A）。KeyMatch 用它与当前 App 密钥（B）、
+         * 已部署 key 文件（C）对账，root-exec 125 时给出精确诊断。
+         * markPatching 时提前写入（防空窗），markPatchedPendingFlash 时确认刷新。
+         */
+        val keyFingerprint: String? = null,
     ) {
         val updatedAtText: String
             get() = if (updatedAt <= 0L) "—" else
@@ -96,6 +103,7 @@ object InstallState {
                         )
                     } else null
                 }?.toList().orEmpty(),
+            keyFingerprint = prefs.getString("key_fingerprint", null),
         )
     }
 
@@ -112,12 +120,24 @@ object InstallState {
                 "artifacts",
                 snapshot.artifacts.joinToString("\n") { "${it.label}\t${it.displayPath}\t${it.sha256}\t${it.bytes}" },
             )
+            .putString("key_fingerprint", snapshot.keyFingerprint)
             .apply()
         AppLog.info(TAG, "状态 → ${snapshot.status.label}（${snapshot.note ?: "无备注"}）")
     }
 
-    fun markPatching(context: Context) {
-        save(context, load(context).copy(status = Status.PATCHING, updatedAt = System.currentTimeMillis(), note = "修补开始"))
+    fun markPatching(context: Context, keyFingerprint: String? = null) {
+        // 裁决①：修补开始时就记当前密钥指纹——防空窗（修补耗时约 10s，
+        // 期间清数据概率低但零成本防御）。修补成功时 markPatchedPendingFlash 会再确认。
+        val fp = keyFingerprint ?: load(context).keyFingerprint
+        save(
+            context,
+            load(context).copy(
+                status = Status.PATCHING,
+                updatedAt = System.currentTimeMillis(),
+                note = "修补开始",
+                keyFingerprint = fp,
+            ),
+        )
     }
 
     /**
@@ -132,6 +152,7 @@ object InstallState {
         kernelEqualLength: Boolean,
         audit: String? = null,
         artifacts: List<Artifact> = emptyList(),
+        keyFingerprint: String? = null,
     ) {
         val note = buildString {
             append("导出成功，等待刷入")
@@ -148,6 +169,7 @@ object InstallState {
                 updatedAt = System.currentTimeMillis(),
                 note = note,
                 artifacts = artifacts,
+                keyFingerprint = keyFingerprint ?: load(context).keyFingerprint,
             ),
         )
     }
