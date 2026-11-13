@@ -165,11 +165,13 @@ jobs:
           mkdir -p "$OUT"
           APK=$(find "$WORK/apk" -name '*.apk' | head -1)
           cp "$APK" "$OUT/SPRoot-${SHORT}.apk"
-          # 可选 artifact：目录非空才拷贝（collect 步已注明跳过原因）
-          [ -d "$WORK/engine/engine" ] && find "$WORK/engine/engine" -name 'skroot-patch' -exec cp {} "$OUT/skroot-patch-${SHORT}" \; -quit
-          [ -d "$WORK/engine/engine" ] && find "$WORK/engine/engine" -name 'libskrootpatch.so' -exec cp {} "$OUT/libskrootpatch-${SHORT}.so" \; -quit
-          [ -d "$WORK/magiskboot/magiskboot" ] && find "$WORK/magiskboot/magiskboot" -type f ! -name '*.txt' ! -name '.*' ! -name '*.zip' -exec cp {} "$OUT/magiskboot-${SHORT}" \; -quit
-          [ -d "$WORK/apd/apd" ] && find "$WORK/apd/apd" -name 'libapd*.so' -exec cp {} "$OUT/libapd-${SHORT}.so" \; -quit
+          # artifact zip 解包后文件在目录顶层（实测 engine artifact：
+          # skroot-patch / libskrootpatch.so 直接位于 $WORK/engine/ 下，无子目录）
+          # 可选 artifact：文件存在才拷贝（collect 步已注明跳过原因）
+          find "$WORK/engine"     -maxdepth 2 -name 'skroot-patch'      -exec cp {} "$OUT/skroot-patch-${SHORT}" \; -quit
+          find "$WORK/engine"     -maxdepth 2 -name 'libskrootpatch.so' -exec cp {} "$OUT/libskrootpatch-${SHORT}.so" \; -quit
+          find "$WORK/magiskboot" -maxdepth 2 -type f -name 'magiskboot*' ! -name '*.txt' ! -name '*.zip' -exec cp {} "$OUT/magiskboot-${SHORT}" \; -quit
+          find "$WORK/apd"        -maxdepth 2 -name 'libapd*.so'        -exec cp {} "$OUT/libapd-${SHORT}.so" \; -quit
           MISSING=""
           [ -f "$OUT/skroot-patch-${SHORT}" ]      || MISSING="$MISSING skroot-patch"
           [ -f "$OUT/libskrootpatch-${SHORT}.so" ] || MISSING="$MISSING libskrootpatch.so"
