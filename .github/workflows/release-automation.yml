@@ -74,11 +74,26 @@ jobs:
           echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
           echo "发布目标 commit: $SHA"
 
+      - name: Fallback — find latest successful APK build commit
+        id: fallback
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          # 手动触发时不依赖事件携带的 commit（可能是任意 commit），
+          # 直接找最近一次成功的 Build SPRoot Manager APK run 的 head_sha
+          SHA=$(gh api "/repos/$REPO/actions/workflows/apk.yml/runs?status=success&per_page=1" \
+            --jq '.workflow_runs[0].head_sha')
+          test -n "$SHA" || { echo "::error::找不到任何成功的 APK 构建"; exit 1; }
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          echo "兜底目标（最近成功 APK 构建）: $SHA"
+
       - name: Collect artifacts for this commit
         id: collect
         run: |
           set -euo pipefail
-          SHA="${{ steps.meta.outputs.sha }}"
+          SHA="${{ steps.fallback.outputs.sha || steps.meta.outputs.sha }}"
           WORK="$RUNNER_TEMP/release"
           mkdir -p "$WORK"
           echo "work=$WORK" >> "$GITHUB_OUTPUT"
