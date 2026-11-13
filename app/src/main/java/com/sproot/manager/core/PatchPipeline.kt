@@ -803,40 +803,57 @@ object PatchPipeline {
             stage(PatchStage.VERIFY, 92f, "回读校验通过：补丁已在产物中真实生效")
             val outSha = sha256(newBoot)
             val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-            val exportName = "boot_patched_$stamp.img"
-            val exported = Exporter.exportToDownloads(context, newBoot, exportName)
-            AppLog.info(
-                TAG,
-                "产物就绪：${exported.displayPath} size=${newBoot.length()} sha256=$outSha",
-            )
-            // P2：自启注入产物 init_boot（与内核修补产物 boot 同批导出；
-            // 此前任一校验失败都已中止，不会只出一半）
-            // 注：导出失败语义（boot 已出、init_boot 失败时是否回滚）待产品决策，维持原顺序。
-            if (initBootUriString.isNullOrBlank()) {
-                state.value = state.value.copy(initBootOutputPath = null)
-            } else {
+
+            // ---------- 导出前全部校验（EXPORT-1 铁律：先校验完，最后连续导出） ----------
+            // 双产物必须"校验完 → 一次性连续导出"。若 init_boot 的产物校验放在 boot 导出
+            // 之后，init_boot 校验失败时 boot_patched 已经落 Downloads——"一半成功"违反
+            // 不允许半成品刷入的承诺（boot 和 init_boot 必须同批刷）。
+            if (!initBootUriString.isNullOrBlank()) {
                 val initWork = File(workDir, "init_boot")
                 val initPatched = File(initWork, "init_boot_patched.img")
                 if (!initPatched.isFile || initBootSha == null) {
                     finishFailure(
                         "init_boot 产物缺失",
-                        "约定输出 ${initPatched.absolutePath} 不存在或未通过校验。已中止。",
+                        "约定输出 ${initPatched.absolutePath} 不存在或未通过校验。已中止，未导出任何产物。",
                         "E_INTERNAL",
                     )
                     return
                 }
+            }
+
+            // ---------- 导出（全部校验通过后，相邻执行；任一失败统一置 EXPORT_FAILED） ----------
+            // init_boot 先导：其失败时 boot 尚未落 Downloads，不存在"一半成功"的既成事实。
+            var initBootProduct: Exporter.Exported? = null
+            if (!initBootUriString.isNullOrBlank()) {
+                val initWork = File(workDir, "init_boot")
+                val initPatched = File(initWork, "init_boot_patched.img")
                 val initExportName = "init_boot_patched_$stamp.img"
-                initBootProduct = Exporter.exportToDownloads(context, initPatched, initExportName)
+                initBootProduct = runCatching {
+                    Exporter.exportToDownloads(context, initPatched, initExportName)
+                }.getOrElse { t ->
+                    finishExportFailure(context, t, workDir, stamp)
+                    return
+                }
                 state.value = state.value.copy(initBootOutputPath = initBootProduct.displayPath)
                 AppLog.info(
                     TAG,
                     "自启注入产物就绪：${initBootProduct.displayPath} size=$initBootBytesOut sha256=$initBootSha",
                 )
             }
+            val exportName = "boot_patched_$stamp.img"
+            val exported = runCatching {
+                Exporter.exportToDownloads(context, newBoot, exportName)
+            }.getOrElse { t ->
+                // init_boot 已导出、boot 导出失败：回滚已导出的 init_boot，不留一半
+                initBootProduct?.let { runCatching { Exporter.deleteExported(context, it) } }
+                finishExportFailure(context, t, workDir, stamp)
+                return
+            }
+            AppLog.info(
+                TAG,
+                "产物就绪：${exported.displayPath} size=${newBoot.length()} sha256=$outSha",
+            )
 
-            // 引擎 report 的 root_key 是**调引擎时传入的 48 字符**（47 字符 + 1 位填充），
-            // 内核真正内嵌的只是前 47 位。这里必须先归一到 47 再交给 kernelKeyOf，
-            // 否则会在 require(isValidKey) 处抛 IllegalArgumentException。
             // 引擎 report 的 root_key 是**调引擎时传入的 48 字符**（47 字符 + 1 位填充），
             // 内核真正内嵌的只是前 47 位。这里必须先归一到 47 再交给 kernelKeyOf，
             // 否则会在 require(isValidKey) 处抛 IllegalArgumentException。
@@ -845,6 +862,20 @@ object PatchPipeline {
             val rootKey = PatchEngine.lastRootKey()
                 ?.let { raw -> SecretStore.normalizeEngineKey(raw) }
                 ?: key
+            // 引擎 report 指针（BUG-APP-7）：workDir 在 finally 会被整体删除，直接引用
+            // 原路径必然指向已删文件——先把 report（<5KB 小文件）复制到
+            // filesDir/patch-reports/<批次>.json 常驻，再写 reportPath。
+            val reportPathValue = runCatching {
+                val reportSource = File(workDir, "kernel.patched.report.json")
+                if (reportSource.isFile) {
+                    val keepDir = File(context.filesDir, "patch-reports").apply { mkdirs() }
+                    val keep = File(keepDir, "patch-report-$stamp.json")
+                    reportSource.copyTo(keep, overwrite = true)
+                    keep.absolutePath
+                } else {
+                    null
+                }
+            }.getOrNull()
             state.value = state.value.copy(
                 stage = PatchStage.DONE,
                 progress = 1f,
@@ -861,8 +892,7 @@ object PatchPipeline {
                 initBootOutputSha256 = initBootSha,
                 initBootBytes = initBootBytesOut,
                 kernelEqualLength = true,
-                reportPath = File(workDir, "kernel.patched.report.json")
-                    .takeIf { it.isFile }?.absolutePath,
+                reportPath = reportPathValue,
                 rootKey = rootKey,
                 finishedAt = System.currentTimeMillis(),
             )
@@ -1111,8 +1141,38 @@ object PatchPipeline {
         }.getOrNull()
     }
 
-    private fun finishFailure(title: String, detail: String, code: String?) {
-        state.value = state.value.copy(
+    /**
+     * 导出失败（≠ 修补失败）：内核修补与全部校验已完成，产物仍在 workDir（失败现场保留），
+     * 只是写 Downloads 被拒/失败。状态机置 EXPORT_FAILED（"导出待重试"），不是 ERROR——
+     * 让用户知道"产物是好的，只差导出"，重新修补整条流水线即可恢复（输入相同会复用备份）。
+     */
+    private fun finishExportFailure(context: Context, t: Throwable, workDir: File?, stamp: String) {
+        val permissionHint = if (
+            android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.Q &&
+            t is SecurityException
+        ) {
+            "\n\n常见原因：Android 9 及以下写公共 Downloads 需要「写入存储」权限，请到系统设置授权后重试。"
+        } else {
+            ""
+        }
+        finishFailure(
+            title = "导出失败：产物已生成并保留在应用目录，可重新修补导出",
+            detail = "内核修补与全部校验已通过，但写入 Downloads/SPRoot/ 时失败：\n" +
+                "${t.javaClass.name}: ${t.message}\n" +
+                "工作目录（产物保留）：${workDir?.absolutePath ?: "—"}$permissionHint\n\n" +
+                "处理：授予存储权限或清理空间后，点「开始修补」重试（输入镜像相同会复用备份）。\n" +
+                "导出批次：$stamp\n\n${t.stackTraceToString()}",
+            code = "EXPORT_FAILED",
+            persistStatus = InstallState.Status.EXPORT_FAILED,
+        )
+    }
+
+    private fun finishFailure(
+        title: String,
+        detail: String,
+        code: String?,
+        persistStatus: InstallState.Status = InstallState.Status.ERROR,
+    ) {        state.value = state.value.copy(
             stage = PatchStage.FAILED,
             running = false,
             errorTitle = title,
@@ -1130,11 +1190,16 @@ object PatchPipeline {
         if (ctx == null) {
             AppLog.error(TAG, "内部错误：appContext 未初始化 → InstallState.markError 未执行（状态机不会置 ERROR）")
         } else {
-            val marked = runCatching { InstallState.markError(ctx, title) }
+            val marked = runCatching {
+                when (persistStatus) {
+                    InstallState.Status.EXPORT_FAILED -> InstallState.markExportFailed(ctx, title)
+                    else -> InstallState.markError(ctx, title)
+                }
+            }
             if (marked.isSuccess) {
-                AppLog.info(TAG, "状态机已置 ERROR（InstallState.markError 已执行）：$title")
+                AppLog.info(TAG, "状态机已置 $persistStatus：$title")
             } else {
-                AppLog.error(TAG, "写入 ERROR 状态失败（不影响失败展示）：${marked.exceptionOrNull()?.message}")
+                AppLog.error(TAG, "写入 $persistStatus 状态失败（不影响失败展示）：${marked.exceptionOrNull()?.message}")
             }
         }
     }

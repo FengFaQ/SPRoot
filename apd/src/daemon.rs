@@ -458,12 +458,27 @@ fn acquire_instance_lock() -> LockOutcome {
 // ---------------------------------------------------------------------------
 
 /// Abstract socket name, persisted for the client library (no key material).
+///
+/// BUG-APD-11 (2026-11-13): there is deliberately **no fixed fallback name**.
+/// The old `"sproot-default"` fallback handed every local app a predictable
+/// abstract-namespace target: an app that binds `@sproot-default` first wins
+/// the name (the abstract namespace is first-come-first-served with no
+/// permission check), the daemon's own bind then fails with EADDRINUSE — the
+/// supervisor retries 3 times and GaveUp — or worse, the squatter poses as the
+/// daemon and collects client commands. When the persisted name is unavailable
+/// a FRESH RANDOM name is generated (and best-effort persisted); a random name
+/// cannot be pre-squatted.
 fn socket_name() -> String {
     match ensure_socket_name() {
         Ok(name) => name,
         Err(e) => {
-            warn!("[daemon] socket name unavailable ({e:#}), using fallback");
-            "sproot-default".to_string()
+            let name = generate_socket_name();
+            warn!(
+                "[daemon] socket name unavailable ({e:#}); using a fresh random \
+                 name @{name} (the client library must be told via deploy; a fixed \
+                 fallback would be pre-squattable)"
+            );
+            name
         }
     }
 }
@@ -642,6 +657,31 @@ fn read_request(stream: &mut UnixStream) -> Result<String> {
     Ok(text)
 }
 
+/// Concurrently drain a piped stream into a buffer.
+///
+/// BUG-APD-3 (2026-11-13): the previous implementation called `wait_timeout`
+/// FIRST and only then `read_to_string`'d the pipes. Any command producing more
+/// output than the pipe buffer (~64 KiB on Linux) blocked inside its own
+/// `write(stdout)`, the parent sat in `wait_timeout` for the full
+/// SCRIPT_TIMEOUT_SECS and then SIGKILL'd it — every large-output command
+/// "timed out" and the response was empty. The fix is the standard pattern
+/// (same as the manager's ApdClient.rootExec): spawn reader threads that drain
+/// the pipes into buffers WHILE the main thread waits, so the child never
+/// blocks on a full pipe and the collected output is returned even when the
+/// session is killed.
+fn drain_stream<S>(stream: S) -> std::thread::JoinHandle<Vec<u8>>
+where
+    S: std::io::Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut stream = stream;
+        // Best effort: on error keep whatever was collected so far.
+        let _ = stream.read_to_end(&mut buf);
+        buf
+    })
+}
+
 fn run_su(su: &Path, cmd: &str, uid: u32) -> Result<(String, String, i32)> {
     use std::os::unix::process::CommandExt;
     let mut child = std::process::Command::new(su)
@@ -658,6 +698,11 @@ fn run_su(su: &Path, cmd: &str, uid: u32) -> Result<(String, String, i32)> {
         .spawn()
         .with_context(|| format!("spawn {}", su.display()))?;
 
+    // Start the drainers BEFORE waiting: this is the load-bearing ordering of
+    // the BUG-APD-3 fix.
+    let stdout_thread = child.stdout.take().map(drain_stream);
+    let stderr_thread = child.stderr.take().map(drain_stream);
+
     let timeout = Duration::from_secs(crate::defs::SCRIPT_TIMEOUT_SECS);
     let status = utils::wait_timeout(&mut child, timeout)?;
     let code = match status {
@@ -667,14 +712,17 @@ fn run_su(su: &Path, cmd: &str, uid: u32) -> Result<(String, String, i32)> {
             124
         }
     };
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_string(&mut stdout);
-    }
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr);
-    }
+    // Join the drainers: after wait/kill the writers are gone, so read_to_end
+    // returns promptly with everything the child produced before it died —
+    // output is preserved even on the timeout path instead of being lost.
+    let stdout = stdout_thread
+        .and_then(|h| h.join().ok())
+        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+        .unwrap_or_default();
+    let stderr = stderr_thread
+        .and_then(|h| h.join().ok())
+        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+        .unwrap_or_default();
     Ok((stdout, stderr, code))
 }
 
@@ -937,5 +985,228 @@ mod tests {
             );
             assert_eq!(r.state, "not_started");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // BUG-APD-3 (2026-11-13): run_su must drain the pipes CONCURRENTLY with
+    // the wait. The pre-fix order (wait_timeout first, read later) dead-locked
+    // on any command whose output exceeded the pipe buffer (~64 KiB): the child
+    // blocked in write(stdout), the parent waited out the whole timeout and
+    // then killed it — every large-output command "timed out" with empty
+    // output.
+    //
+    // The tests exercise the same drain machinery (`run_su` itself, parameter-
+    // ised over the binary so no deployed `su` is needed): `sh -c 'seq ...'`
+    // produces ~1.2 MB — far past the pipe buffer.
+    // -----------------------------------------------------------------------
+
+    /// Run a command through the exact run_su plumbing (same piped streams,
+    /// same drainers, same wait) but with an arbitrary program, so the test
+    /// needs no deployed su binary.
+    fn run_su_piping(program: &Path, args: &[&str]) -> Result<(String, String, i32)> {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .with_context(|| format!("spawn {}", program.display()))?;
+
+        // Same ordering run_su uses — drainers BEFORE wait. If someone reverts
+        // run_su to wait-then-read, this shared-shape test still passes (it
+        // uses the fixed ordering), which is why the source-level guard below
+        // pins run_su's actual ordering too.
+        let stdout_thread = child.stdout.take().map(drain_stream);
+        let stderr_thread = child.stderr.take().map(drain_stream);
+
+        let timeout = Duration::from_secs(30);
+        let status = utils::wait_timeout(&mut child, timeout)?;
+        let code = status
+            .as_ref()
+            .and_then(|s| s.code())
+            .unwrap_or_else(|| {
+                // Killed (timeout): the drained data still comes back.
+                124
+            });
+        let stdout = stdout_thread
+            .and_then(|h| h.join().ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+            .unwrap_or_default();
+        let stderr = stderr_thread
+            .and_then(|h| h.join().ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+            .unwrap_or_default();
+        Ok((stdout, stderr, code))
+    }
+
+    /// Large output (~1.2 MB, way past the ~64 KiB pipe buffer) must come back
+    /// complete and NOT be reported as a timeout (exit 124). Under the pre-fix
+    /// wait-then-read order the child blocks in write(), the parent burns the
+    /// whole timeout and returns 124 with truncated/empty data — this test
+    /// goes red there.
+    #[test]
+    fn large_stdout_does_not_deadlock_or_fake_timeout() {
+        let sh = Path::new("/bin/sh");
+        if !sh.exists() {
+            eprintln!("SKIP: no /bin/sh in this environment");
+            return;
+        }
+        let (stdout, _stderr, code) =
+            run_su_piping(sh, &["-c", "seq 1 200000"]).expect("spawn sh");
+        assert_ne!(
+            code, 124,
+            "a ~1.2MB-output command must complete, not fake-timeout"
+        );
+        assert_eq!(code, 0, "seq must exit cleanly");
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(
+            lines.len(),
+            200_000,
+            "all output must be drained (got {} lines)",
+            lines.len()
+        );
+        assert_eq!(lines[0], "1");
+        assert_eq!(lines[199_999], "200000");
+    }
+
+    /// Even a killed (timed-out) session returns the output produced before
+    /// the kill — the drainers collect what was already written.
+    #[test]
+    fn killed_session_still_returns_collected_output() {
+        use std::os::unix::process::CommandExt;
+        let sh = Path::new("/bin/sh");
+        if !sh.exists() {
+            eprintln!("SKIP: no /bin/sh in this environment");
+            return;
+        }
+        // Emit a known line, then sleep long enough to be killed.
+        let mut child = std::process::Command::new(sh)
+            .args(["-c", "echo BEFORE-KILL; sleep 60"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn sh");
+        let stdout_thread = child.stdout.take().map(drain_stream);
+        let stderr_thread = child.stderr.take().map(drain_stream);
+        // Short timeout so the kill path is taken deterministically.
+        let status = utils::wait_timeout(&mut child, Duration::from_secs(2)).expect("wait");
+        assert!(status.is_none(), "the sleeper must be killed by the timeout");
+        let stdout = stdout_thread
+            .and_then(|h| h.join().ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+            .unwrap_or_default();
+        let _ = stderr_thread.map(|h| h.join());
+        assert!(
+            stdout.contains("BEFORE-KILL"),
+            "output produced before the kill must be returned, got {stdout:?}"
+        );
+    }
+
+    /// Strip `//` line comments (and the prose inside them) from Rust source,
+    /// so source-level guards match actual code and never trip over the
+    /// comments that document the very defect they forbid. (A previous
+    /// incarnation of these guards failed exactly that way.)
+    fn strip_rust_comments(src: &str) -> String {
+        let mut code = String::with_capacity(src.len());
+        for line in src.lines() {
+            code.push_str(line.split("//").next().unwrap_or(line));
+            code.push('\n');
+        }
+        code
+    }
+
+    /// Source-level guard on run_su's load-bearing ordering: the drainers must
+    /// be started BEFORE wait_timeout. Reverting to wait-then-read (the
+    /// deadlock) trips this. Comments stripped so the guard matches code only.
+    #[test]
+    fn run_su_starts_drainers_before_waiting() {
+        let src = strip_rust_comments(include_str!("daemon.rs"));
+        let fn_start = src
+            .find("fn run_su(")
+            .expect("run_su must exist");
+        let fn_body = &src[fn_start..];
+        let drain_at = fn_body
+            .find("drain_stream")
+            .expect("run_su must use drain_stream readers");
+        let wait_at = fn_body
+            .find("wait_timeout")
+            .expect("run_su must wait with a timeout");
+        assert!(
+            drain_at < wait_at,
+            "drain threads must start BEFORE wait_timeout \
+             (the pre-fix wait-then-read order dead-locked on large output)"
+        );
+        // And the old shape must stay gone from run_su (bounded to the
+        // function body so helpers elsewhere in the file stay out of scope).
+        let body_end = fn_body
+            .find("fn respond(")
+            .unwrap_or(fn_body.len());
+        let body = &fn_body[..body_end];
+        assert!(
+            !body.contains("read_to_string"),
+            "run_su must not read the pipes after waiting (BUG-APD-3 deadlock)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // BUG-APD-11 (2026-11-13): no fixed socket-name fallback.
+    //
+    // The abstract namespace is first-come-first-served with no permission
+    // check, so a fixed fallback name ("sproot-default") could be pre-squatted
+    // by any local app: the daemon's bind would then fail (GaveUp after 3
+    // retries) or the squatter would impersonate the daemon. The fallback must
+    // be a FRESH RANDOM name every time.
+    // -----------------------------------------------------------------------
+
+    /// Source-level negative sample: the fixed fallback name must be gone from
+    /// the fallback path. Restoring `"sproot-default"` → red. Comments are
+    /// stripped and the search stops at the tests module, so neither the
+    /// documentation of why the name is forbidden nor this test's own string
+    /// literals can trip the guard.
+    #[test]
+    fn socket_name_fallback_never_uses_a_fixed_name() {
+        let full = strip_rust_comments(include_str!("daemon.rs"));
+        let code = full
+            .split("mod tests")
+            .next()
+            .expect("daemon.rs must contain the tests module marker")
+            .to_string();
+        let fn_start = code.find("fn socket_name(").expect("socket_name must exist");
+        let fn_body = &code[fn_start..];
+        assert!(
+            !fn_body.contains("sproot-default"),
+            "socket_name must never fall back to a fixed name (it is \
+             pre-squattable in the abstract namespace — BUG-APD-11)"
+        );
+        // The fallback must generate a random name instead.
+        let fallback_at = fn_body
+            .find("generate_socket_name()")
+            .expect("the fallback must generate a random name");
+        let err_at = fn_body
+            .find("Err(e)")
+            .expect("the fallback must handle the read error");
+        assert!(
+            err_at < fallback_at,
+            "the random name must be produced on the Err branch of the name read"
+        );
+    }
+
+    /// The fallback name is random, i.e. two successive fallbacks differ and
+    /// neither collides with the old fixed name.
+    #[test]
+    fn generated_socket_names_are_random_and_unpredictable() {
+        let a = generate_socket_name();
+        let b = generate_socket_name();
+        assert!(a.starts_with("sproot-") && b.starts_with("sproot-"));
+        assert_ne!(a, b, "two generated names must differ (randomness)");
+        assert_ne!(a, "sproot-default");
+        // Shape: `sproot-` + 12 hex chars.
+        let suffix = &a["sproot-".len()..];
+        assert_eq!(suffix.len(), 12);
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

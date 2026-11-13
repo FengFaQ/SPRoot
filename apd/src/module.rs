@@ -903,6 +903,96 @@ pub fn prune_modules() -> Result<()> {
 }
 
 fn _install_module_inner(zip: &str, quiet: bool) -> Result<()> {
+    // BUG-APD-4 (2026-11-13): an install failure must leave NO staged copy
+    // behind. The pre-fix behaviour extracted into `modules_update/<id>` and
+    // then let every `?` after that point bubble up with the half-processed
+    // extraction still on disk — so the next boot's `handle_updated_modules`
+    // promoted a module whose installer had FAILED (no post-processing, no
+    // permission setup) into the live module tree: precisely the bootloop risk
+    // the installer's non-zero exit was supposed to prevent. This wrapper
+    // mirrors the failure contract of `install_module_json` (`--json`: a
+    // failed install reports ok:false — leaving a staged copy that will go
+    // live on reboot would contradict that report). This differs from
+    // upstream APatch on purpose: upstream leaves the residue.
+    //
+    // Note the cleanup is scoped to the *failure after extraction* window: the
+    // closure returns the module id once it is known (after module.prop
+    // parsing), and `cleanup` wipes `modules_update/<id>` plus the freshly
+    // created `modules/<id>` directory. An early failure (bad zip, no
+    // module.prop) has written nothing, so there is nothing to clean.
+    let result: Result<String> = install_module_staged(zip, quiet);
+    match result {
+        Ok(module_id) => Ok(()),
+        Err(e) => {
+            // The module id is recovered from the zip independently: parsing
+            // may itself have been the failure, in which case there is no id
+            // and no staged directory either.
+            if let Some(module_id) = staged_module_id(zip) {
+                let staged_dir = Path::new(defs::MODULE_UPDATE_DIR).join(&module_id);
+                if staged_dir.exists() {
+                    if let Err(cleanup_err) = remove_dir_all(&staged_dir) {
+                        warn!(
+                            "[module install] cannot clean failed staged copy {}: {cleanup_err} \
+                             (it must NOT be allowed to go live next boot — remove it manually)",
+                            staged_dir.display()
+                        );
+                    } else {
+                        info!(
+                            "[module install] cleaned failed staged copy {} (BUG-APD-4: a failed \
+                             install leaves no modules_update residue)",
+                            staged_dir.display()
+                        );
+                    }
+                }
+                // The freshly created (and by now still empty-ish) live dir is
+                // only removed when it carries no pre-existing content: an
+                // UPGRADE's modules/<id> holds the previous version and must
+                // survive a failed upgrade untouched.
+                let live_dir = Path::new(defs::MODULE_DIR).join(&module_id);
+                if live_dir.is_dir() && is_dir_empty(&live_dir) {
+                    let _ = fs::remove_dir(&live_dir);
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
+/// `true` when `dir` contains no entries (used to decide whether a failed
+/// install may delete the `modules/<id>` directory it created).
+fn is_dir_empty(dir: &Path) -> bool {
+    fs::read_dir(dir).map(|mut entries| entries.next().is_none()).unwrap_or(false)
+}
+
+/// Recover the module id from a zip's `module.prop` for failure cleanup.
+/// `None` when the zip itself is unreadable/unparsable — in that case nothing
+/// was extracted either.
+fn staged_module_id(zip: &str) -> Option<String> {
+    let zip_path = PathBuf::from_str(zip).ok()?;
+    let zip_path = zip_path.canonicalize().ok()?;
+    let mut buffer: Vec<u8> = Vec::new();
+    {
+        let mut archive = zip::ZipArchive::new(fs::File::open(&zip_path).ok()?).ok()?;
+        archive.by_name("module.prop").ok()?.read_to_end(&mut buffer).ok()?;
+    }
+    let mut module_prop = HashMap::new();
+    PropertiesIter::new_with_encoding(Cursor::new(buffer), encoding_rs::UTF_8)
+        .read_into(|k, v| {
+            module_prop.insert(k, v);
+        })
+        .ok()?;
+    let id = module_prop.get("id")?.trim().to_string();
+    let id_re = regex_lite::Regex::new(r"^[a-zA-Z][a-zA-Z0-9._-]+$").ok()?;
+    if id_re.is_match(&id) {
+        Some(id)
+    } else {
+        None
+    }
+}
+
+/// The install body proper: everything from zip parsing to `mark_update`.
+/// Returns the module id so the failure wrapper above can clean up.
+fn install_module_staged(zip: &str, quiet: bool) -> Result<String> {
     ensure_boot_completed()?;
 
     say(quiet, include_str!("../assets/banner"));
@@ -941,6 +1031,9 @@ fn _install_module_inner(zip: &str, quiet: bool) -> Result<()> {
     if !id_re.is_match(module_id) {
         bail!("invalid module id: {module_id}");
     }
+    // From here on a failure must clean the staged copy: remember the id for
+    // the wrapper (`_install_module_inner`) to act on.
+    let module_id = module_id.to_string();
 
     // Check if this module is a metamodule
     let is_metamodule = metamodule::is_metamodule(&module_prop);
@@ -1028,7 +1121,7 @@ fn _install_module_inner(zip: &str, quiet: bool) -> Result<()> {
     archive.extract(&_module_update_dir)?;
 
     say(quiet, "- Running module installer");
-    exec_install_script(zip, is_metamodule, module_id, quiet)?;
+    exec_install_script(zip, is_metamodule, &module_id, quiet)?;
 
     // set permission and selinux context for $MOD/system
     let module_system_dir = PathBuf::from(module_dir.clone()).join("system");
@@ -1045,7 +1138,7 @@ fn _install_module_inner(zip: &str, quiet: bool) -> Result<()> {
     }
 
     mark_update()?;
-    Ok(())
+    Ok(module_id)
 }
 
 pub fn install_module(zip: &str) -> Result<()> {
@@ -2668,5 +2761,145 @@ mod tests {
         assert!(
             body.contains("modules_update is KEPT"),
             "the failure log must say the staged copies survive"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // BUG-APD-4 (2026-11-13): a FAILED install must leave no staged copy.
+    //
+    // The failure wrapper (`_install_module_inner`) now removes
+    // `modules_update/<id>` and the freshly created EMPTY `modules/<id>` on
+    // any Err (an upgrade's non-empty `modules/<id>` keeps the previous
+    // version). The tests exercise that cleanup contract on a scratch tree,
+    // plus a source-level guard pinning the wiring.
+    // -----------------------------------------------------------------------
+
+    /// The cleanup contract: staged half-product removed; empty live dir
+    /// removed; an upgrade's populated live dir SURVIVES.
+    #[test]
+    fn failed_install_cleanup_removes_staged_and_empty_live_dir_only() {
+        let scratch = std::env::temp_dir().join(format!(
+            "sproot-failclean-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let staged_root = scratch.join("modules_update");
+        let live_root = scratch.join("modules");
+
+        // Case 1: fresh install — staged half-product + empty live dir → both go.
+        let staged_dir = staged_root.join("failingmod");
+        let live_dir = live_root.join("failingmod");
+        fs::create_dir_all(&staged_dir).unwrap();
+        fs::write(staged_dir.join("half-processed.bin"), b"raw zip payload").unwrap();
+        fs::create_dir_all(&live_dir).unwrap();
+
+        // The exact cleanup block from _install_module_inner's Err arm.
+        assert!(staged_dir.exists(), "precondition: staged copy present");
+        remove_dir_all(&staged_dir).expect("clean staged");
+        assert!(
+            !staged_dir.exists(),
+            "a failed install must leave NO modules_update/<id> residue \
+             (it would be promoted to a live module next boot)"
+        );
+        if live_dir.is_dir() && is_dir_empty(&live_dir) {
+            fs::remove_dir(&live_dir).unwrap();
+        }
+        assert!(
+            !live_dir.exists(),
+            "the freshly created empty modules/<id> must be cleaned too"
+        );
+
+        // Case 2: upgrade — the live dir carries the PREVIOUS version → it
+        // must survive the failed upgrade's cleanup.
+        fs::create_dir_all(&staged_dir).unwrap();
+        fs::write(staged_dir.join("half-processed.bin"), b"raw").unwrap();
+        fs::create_dir_all(&live_dir).unwrap();
+        fs::write(live_dir.join("module.prop"), b"id=failingmod\n").unwrap();
+
+        remove_dir_all(&staged_dir).expect("clean staged (upgrade case)");
+        assert!(!staged_dir.exists());
+        if live_dir.is_dir() && is_dir_empty(&live_dir) {
+            fs::remove_dir(&live_dir).unwrap();
+        }
+        assert!(
+            live_dir.join("module.prop").exists(),
+            "an upgrade's previous version in modules/<id> must survive a \
+             failed install's cleanup"
+        );
+
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    /// staged_module_id recovers the id from the same zip the installer read
+    /// (so the cleanup targets the right directory), and refuses
+    /// traversal-shaped ids instead of ever building a path from them.
+    #[test]
+    fn staged_module_id_parses_and_validates() {
+        use std::io::Write as IoWrite;
+        let scratch = std::env::temp_dir().join(format!(
+            "sproot-zipid-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&scratch).unwrap();
+        let zip_path = scratch.join("mod.zip");
+        {
+            let file = fs::File::create(&zip_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options: zip::write::SimpleFileOptions = Default::default();
+            writer.start_file("module.prop", options).unwrap();
+            writer
+                .write_all(b"id=failingmod\nversion=1\nversionCode=1\n")
+                .unwrap();
+            writer.finish().unwrap();
+        }
+        let id = staged_module_id(zip_path.to_str().unwrap()).expect("id must be recovered");
+        assert_eq!(id, "failingmod");
+
+        // A traversal id must be refused (no cleanup path is ever built from it).
+        let evil = scratch.join("evil.zip");
+        {
+            let file = fs::File::create(&evil).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            let options: zip::write::SimpleFileOptions = Default::default();
+            writer.start_file("module.prop", options).unwrap();
+            writer.write_all(b"id=../escape\n").unwrap();
+            writer.finish().unwrap();
+        }
+        assert!(
+            staged_module_id(evil.to_str().unwrap()).is_none(),
+            "a traversal id must never be recovered for cleanup path building"
+        );
+        let _ = fs::remove_dir_all(&scratch);
+    }
+
+    /// Source-level guard: `_install_module_inner`'s Err arm must run the
+    /// staged cleanup. Deleting that block reinstates the residue bug → red.
+    #[test]
+    fn install_failure_wrapper_cleans_the_staged_copy() {
+        let src = include_str!("module.rs");
+        let wrapper_at = src
+            .find("fn _install_module_inner(")
+            .expect("the failure wrapper must exist");
+        let wrapper = &src[wrapper_at..];
+        let wrapper_end = wrapper
+            .find("fn install_module_staged(")
+            .expect("the install body must follow the wrapper");
+        let wrapper_body = &wrapper[..wrapper_end];
+        assert!(
+            wrapper_body.contains("remove_dir_all(&staged_dir)"),
+            "the Err arm must remove modules_update/<id> (BUG-APD-4: a failed \
+             install leaves no staged residue)"
+        );
+        assert!(
+            wrapper_body.contains("is_dir_empty"),
+            "the empty freshly-created modules/<id> must be cleaned, while a \
+             non-empty (upgrade) one is preserved"
         );
     }

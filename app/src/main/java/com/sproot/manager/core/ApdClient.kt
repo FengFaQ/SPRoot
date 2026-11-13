@@ -153,10 +153,16 @@ object ApdClient {
                 val stderr = StringBuilder()
                 val reader = Thread {
                     runCatching {
+                        // BUG-APP-8：截断到上限后必须 drain 到 EOF（读而不存）——
+                        // 否则子进程写满 stdout 管道会阻塞在 write 上，被外层超时判成 124（假超时）。
                         process.inputStream.bufferedReader().useLines { seq ->
-                            seq.take(outputLineLimit).forEach { line ->
-                                stdout.append(line).append('\n')
-                                AppLog.debug(TAG, "stdout| $line")
+                            var captured = 0
+                            seq.forEach { line ->
+                                if (captured < outputLineLimit) {
+                                    stdout.append(line).append('\n')
+                                    AppLog.debug(TAG, "stdout| $line")
+                                    captured++
+                                }
                             }
                         }
                     }
@@ -164,9 +170,13 @@ object ApdClient {
                 val errReader = Thread {
                     runCatching {
                         process.errorStream.bufferedReader().useLines { seq ->
-                            seq.take(outputLineLimit).forEach { line ->
-                                stderr.append(line).append('\n')
-                                AppLog.warn(TAG, "stderr| $line")
+                            var captured = 0
+                            seq.forEach { line ->
+                                if (captured < outputLineLimit) {
+                                    stderr.append(line).append('\n')
+                                    AppLog.warn(TAG, "stderr| $line")
+                                    captured++
+                                }
                             }
                         }
                     }
@@ -287,15 +297,28 @@ object ApdClient {
             val stderr = StringBuilder()
             val t1 = Thread {
                 runCatching {
+                    // BUG-APP-8：drain 到 EOF，超出 2000 行丢弃不存，避免管道满阻塞子进程（假超时）
+                    var captured = 0
                     process.inputStream.bufferedReader().useLines { seq ->
-                        seq.take(2000).forEach { line -> stdout.append(line).append('\n') }
+                        seq.forEach { line ->
+                            if (captured < 2000) {
+                                stdout.append(line).append('\n')
+                                captured++
+                            }
+                        }
                     }
                 }
             }.apply { isDaemon = true; start() }
             val t2 = Thread {
                 runCatching {
+                    var captured = 0
                     process.errorStream.bufferedReader().useLines { seq ->
-                        seq.take(2000).forEach { line -> stderr.append(line).append('\n') }
+                        seq.forEach { line ->
+                            if (captured < 2000) {
+                                stderr.append(line).append('\n')
+                                captured++
+                            }
+                        }
                     }
                 }
             }.apply { isDaemon = true; start() }

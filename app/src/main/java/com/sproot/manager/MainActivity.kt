@@ -62,5 +62,31 @@ class MainActivity : ComponentActivity() {
                 throw error
             }
         }
+        // ② Android 8.0~9（minSdk 26 覆盖范围）导出产物到公共 Downloads 需要
+        //    WRITE_EXTERNAL_STORAGE 运行时授权（Android 10+ 走 MediaStore 无需）。
+        //    首启请求一次；用户拒绝后导出失败文案（EXPORT_FAILED）会引导去设置授权，
+        //    重新修补导出时本请求会再次弹出（BUG-APP-6）。
+        if (android.os.Build.VERSION.SDK_INT <= android.os.Build.VERSION_CODES.P &&
+            checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(android.Manifest.permission.WRITE_EXTERNAL_STORAGE), 1001)
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 1001) {
+            val granted = grantResults.isNotEmpty() &&
+                grantResults[0] == android.content.pm.PackageManager.PERMISSION_GRANTED
+            com.sproot.manager.core.AppLog.info(
+                "Activity",
+                "WRITE_EXTERNAL_STORAGE 授权结果：${if (granted) "已授予" else "被拒绝（导出时将引导去设置）"}",
+            )
+        }
     }
 }

@@ -26,6 +26,13 @@ class SPRootApp : Application() {
             }
             if (stale.isNotEmpty()) AppLog.warn("App", "启动清理 exec-keys 残留 ${stale.size} 个")
         }.onFailure { android.util.Log.e("SPRootApp", "exec-keys 启动清理失败", it) }
+        // PATCHING 过期调和（BUG-APP-10）：修补中进程被杀 → 状态机永久卡"修补中"。
+        // 启动时 PATCHING 且超过 30 分钟未更新 → 降级 UNPATCHED（重新修补即可）。
+        runCatching {
+            if (com.sproot.manager.core.InstallState.reconcileStalePatching(this)) {
+                AppLog.warn("App", "检测到过期的 PATCHING 状态，已调和（详见 InstallState 日志）")
+            }
+        }.onFailure { android.util.Log.e("SPRootApp", "PATCHING 过期调和失败", it) }
         // App 自引导（人类指令 A）：冷启动时确保 AP 守护在运行。
         // 内部先 apd selftest 探测（stage=daemon_ready 即在跑），未部署视为正常初始态；
         // 已部署但未运行 → 通过 root-exec 拉起 daemon。结果落 SharedPreferences，主页只读展示。

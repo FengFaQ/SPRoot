@@ -22,6 +22,31 @@ object Exporter {
 
     data class Exported(val displayPath: String, val absolutePath: String, val bytes: Long)
 
+    /**
+     * Android 9 及以下写公共 Downloads 需要运行时 WRITE_EXTERNAL_STORAGE
+     * （Android 10+ 走 MediaStore 无需）。调用方（Pipeline/PatchPage）导出失败时
+     * 用它区分"缺权限"与其它 IO 失败，给出可操作的文案（EXPORT-2）。
+     */
+    fun needsLegacyStoragePermission(context: Context): Boolean =
+        Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
+            context.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+
+    /** 删除一次已导出的产物（双产物"一半成功"回滚用；MediaStore 与 legacy 双路径）。 */
+    fun deleteExported(context: Context, exported: Exported): Boolean {
+        return if (exported.absolutePath.startsWith("content:")) {
+            runCatching {
+                context.contentResolver.delete(
+                    android.net.Uri.parse(exported.absolutePath),
+                    null,
+                    null,
+                ) > 0
+            }.getOrDefault(false)
+        } else {
+            File(exported.absolutePath).delete()
+        }
+    }
+
     fun exportToDownloads(context: Context, source: File, displayName: String): Exported {
         require(source.isFile) { "待导出文件不存在：${source.absolutePath}" }
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {

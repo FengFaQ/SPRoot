@@ -334,6 +334,84 @@ def check_busy_finally_coverage(path: str) -> list:
     return problems
 
 
+# ── EXPORT-1 / EXPORT-2 ─────────────────────────────────────────────────────
+EXPORT_CALL_RE = re.compile(r"Exporter\.exportToDownloads\s*\(")
+# 校验步骤的标志行（导出必须发生在最后一个校验之后）
+VERIFY_MARK_RE = re.compile(
+    r"回读校验通过|checkAvb\s*\(|kernelReadbackSha\s*\(|verifyProduct\s*\("
+)
+# EXPORT-2：导出调用链上必须有权限检查（Exporter 自身或调用文件内）
+PERM_CHECK_RE = re.compile(
+    r"needsLegacyStoragePermission|checkSelfPermission.*WRITE_EXTERNAL_STORAGE"
+)
+
+
+def check_export_order_and_permission(path: str) -> list:
+    """EXPORT-1：同函数内多个 exportToDownloads 之前必须先完成校验（回读/AVB/rc verify），
+    导出调用之间不允许再夹校验失败出口造成的"一半成功"。
+
+    判据（行号单调性）：PatchPipeline.execute() 内，第一个 exportToDownloads 的行号
+    必须 > 最后一个校验标志（回读校验通过 / checkAvb / kernelReadbackSha / verifyProduct）
+    的行号。若导出被挪回校验之前（回归 2026-11-13 修复前的"先导 boot 后校验 init_boot"
+    形态），判 FAIL。
+
+    EXPORT-2：文件内出现 exportToDownloads 调用时，Exporter.kt 必须提供
+    needsLegacyStoragePermission（或调用文件内有 checkSelfPermission WRITE_EXTERNAL_STORAGE），
+    否则 Android 8~9 设备导出必失败且文案不区分原因。
+    """
+    problems = []
+    lines = _read_lines(path)
+    if lines is None:
+        return problems
+
+    export_lines = [i + 1 for i, l in enumerate(lines) if EXPORT_CALL_RE.search(_strip_line_comment(l))]
+    if not export_lines:
+        return problems
+
+    # EXPORT-2（文件级）：权限检查可以在调用文件内，也可以在 Exporter.kt 自身
+    # （needsLegacyStoragePermission 定义在那里，供调用方导出前查询）。
+    def _has_perm_check(file_path, text_lines):
+        return bool(PERM_CHECK_RE.search("\n".join(_strip_line_comment(l) for l in text_lines)))
+
+    if not _has_perm_check(path, lines):
+        exporter_path = os.path.join(os.path.dirname(path), "Exporter.kt")
+        exporter_lines = _read_lines(exporter_path) if os.path.isfile(exporter_path) else None
+        if exporter_lines is None or not _has_perm_check(exporter_path, exporter_lines):
+            problems.append((
+                export_lines[0],
+                "EXPORT-2：文件内调用 Exporter.exportToDownloads，但本文件与 Exporter.kt "
+                "均没有存储权限检查（needsLegacyStoragePermission / checkSelfPermission"
+                "(WRITE_EXTERNAL_STORAGE)）。Android 8~9（minSdk=26）缺运行时授权时导出"
+                "必抛 SecurityException，且失败文案无法区分「缺权限」与其它 IO 失败。",
+            ))
+
+    # EXPORT-1（仅针对流水线主文件 execute 函数）
+    if not path.replace("\\", "/").endswith("core/PatchPipeline.kt"):
+        return problems
+    blocks = _extract_function_blocks(lines)
+    for fname, start, end in blocks:
+        if fname != "execute":
+            continue
+        verify_marks = [
+            i + 1 for i in range(start, end + 1)
+            if VERIFY_MARK_RE.search(_strip_line_comment(lines[i]))
+        ]
+        func_exports = [ln for ln in export_lines if start + 1 <= ln <= end + 1]
+        if not func_exports or not verify_marks:
+            continue
+        if min(func_exports) < max(verify_marks):
+            problems.append((
+                min(func_exports),
+                "EXPORT-1：execute() 中 exportToDownloads（第 %d 行）出现在校验步骤"
+                "（最后一批校验标志在第 %d 行）之前——导出先行会造成"
+                "「boot 已落 Downloads、后续校验失败」的一半成功产物。"
+                "铁律：先全部校验（回读/AVB/rc verify），最后连续导出（init_boot 先、boot 后，"
+                "boot 失败时回滚已导出的 init_boot）。"
+                % (min(func_exports), max(verify_marks)),
+            ))
+    return problems
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="真机崩溃回归门禁（THREAD-1 Toast 跨线程 / KEYABI-1 密钥 ABI 48→47）"
@@ -366,6 +444,7 @@ def main(argv=None) -> int:
                 check_thread_toast(path)
                 + check_engine_key_abi(path)
                 + check_busy_finally_coverage(path)
+                + check_export_order_and_permission(path)
             ):
                 bad += 1
                 print("%s:%d: %s" % (path, line, msg))
@@ -446,6 +525,53 @@ object Pipeline {
 }
 """
 
+# EXPORT 夹具：模拟 PatchPipeline 的形态（文件名不影响——检查走 path 参数），
+# 这里只测 EXPORT-2（权限检查）与 EXPORT-1（顺序），用 _run_snippet_export(path) 控制文件名。
+_GOOD_EXPORT_ORDER = '''\
+package x
+class Pipeline {
+    fun execute() {
+        verifyReadback()
+        checkAvb()
+        // 回读校验通过
+        val a = Exporter.exportToDownloads(ctx, init, "i.img")
+        val b = Exporter.exportToDownloads(ctx, boot, "b.img")
+    }
+}
+'''
+
+_BAD_EXPORT_ORDER = '''\
+package x
+class Pipeline {
+    fun execute() {
+        val b = Exporter.exportToDownloads(ctx, boot, "b.img")
+        verifyReadback()
+        checkAvb()
+        // 回读校验通过
+        val a = Exporter.exportToDownloads(ctx, init, "i.img")
+    }
+}
+'''
+
+_NO_PERM_EXPORT = '''\
+package x
+class Page {
+    fun save() {
+        Exporter.exportToDownloads(ctx, file, "log.txt")
+    }
+}
+'''
+
+_WITH_PERM_EXPORT = '''\
+package x
+class Page {
+    fun save() {
+        if (Exporter.needsLegacyStoragePermission(ctx)) return
+        Exporter.exportToDownloads(ctx, file, "log.txt")
+    }
+}
+'''
+
 
 def _run_snippet(src: str):
     """把片段写成临时文件，跑三条规则，返回 (thread, keyabi, busy) 问题列表。"""
@@ -456,6 +582,19 @@ def _run_snippet(src: str):
         with open(p, "w", encoding="utf-8") as f:
             f.write(src)
         return check_thread_toast(p), check_engine_key_abi(p), check_busy_finally_coverage(p)
+
+
+def _run_export_snippet(src: str, filename: str):
+    """EXPORT 规则夹具：允许指定文件名（EXPORT-1 只对 core/PatchPipeline.kt 生效）。"""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        sub = os.path.join(d, "core")
+        os.makedirs(sub)
+        p = os.path.join(sub, filename)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(src)
+        return check_export_order_and_permission(p)
 
 
 def _self_test() -> int:
@@ -487,10 +626,38 @@ def _self_test() -> int:
             failures += 1
             print("     → 规则失效：%r 未被正确判定" % title)
 
+    # EXPORT-1/2：需要控制文件名，走独立夹具
+    export_cases = [
+        ("EXPORT-1 正样本：导出在全部校验之后",
+         _GOOD_EXPORT_ORDER, "PatchPipeline.kt", "order", False),
+        ("EXPORT-1 负样本：导出先于校验（一半成功）",
+         _BAD_EXPORT_ORDER, "PatchPipeline.kt", "order", True),
+        ("EXPORT-2 正样本：调用前有 needsLegacyStoragePermission",
+         _WITH_PERM_EXPORT, "SomePage.kt", "perm", False),
+        ("EXPORT-2 负样本：导出无任何权限检查",
+         _NO_PERM_EXPORT, "SomePage.kt", "perm", True),
+    ]
+    for title, src, fname, kind, expect_problem in export_cases:
+        problems = _run_export_snippet(src, fname)
+        if kind == "order":
+            got = any("EXPORT-1" in m for _, m in problems)
+        else:
+            got = any("EXPORT-2" in m for _, m in problems)
+        ok = got == expect_problem
+        print("  %-46s 期望%s  实得%s  %s" % (
+            title,
+            "有问题" if expect_problem else "无问题",
+            "有问题" if got else "无问题",
+            "OK" if ok else "**FAIL**",
+        ))
+        if not ok:
+            failures += 1
+            print("     → 规则失效：%r 未被正确判定" % title)
+
     if failures:
         print("判定：SELF-TEST FAIL —— 有规则在负样本上没有变红（已退化为永远 PASS），禁止合入。")
         return 1
-    print("判定：SELF-TEST PASS —— 三条规则均在坏样本上变红、在好样本上放行。")
+    print("判定：SELF-TEST PASS —— 五条规则均在坏样本上变红、在好样本上放行。")
     return 0
 
 

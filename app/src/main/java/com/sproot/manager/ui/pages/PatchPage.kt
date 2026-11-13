@@ -495,6 +495,11 @@ private fun LogExportLine() {
                 Thread {
                     val outcome = runCatching {
                         val file = AppLog.currentLogFile() ?: error("日志文件尚未初始化")
+                        // EXPORT-2：Android 8~9 写公共 Downloads 需运行时权限；
+                        // 缺权限时给出可操作文案（引导授权），而不是裸 SecurityException。
+                        if (Exporter.needsLegacyStoragePermission(context)) {
+                            error("缺少存储权限：请到系统设置为本应用授予「写入存储」后重试")
+                        }
                         val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
                             .format(java.util.Date())
                         Exporter.exportToDownloads(context, file, "sproot-log-$stamp.txt")
