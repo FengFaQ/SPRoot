@@ -111,7 +111,10 @@ object ModuleRepository {
         }
         if (result.exitCode != ApdClient.EXIT_OK) {
             val message = when (result.exitCode) {
-                ApdClient.EXIT_ESCALATION -> "密钥无效或需重新修补（125），不自动重试"
+                ApdClient.EXIT_ESCALATION ->
+                    "提权被内核拒绝（125）。\n" +
+                        (runCatching { KeyMatch.escalationExplanation(context) }
+                            .getOrElse { "当前密钥与内核不匹配：请重新修补镜像并刷入（用当前密钥），或导出日志反馈。" })
                 ApdClient.EXIT_NOT_EXECUTABLE -> "AP 不可执行（126），需重新部署"
                 ApdClient.EXIT_NOT_FOUND -> "AP 不存在（127），需先部署"
                 ApdClient.EXIT_FAIL -> "apd 业务失败（1）：${result.stderr.take(400).ifBlank { "无 stderr" }}"
@@ -160,6 +163,7 @@ object ModuleRepository {
             rawStderr = result.stderr,
             hints = if (ok) emptyList() else ModuleFailureHints.analyze(
                 result.exitCode, result.stdout, result.stderr, if (enable) "启用" else "禁用",
+                keyHint(context, result),
             ),
         )
     }
@@ -201,6 +205,7 @@ object ModuleRepository {
             hints = if (ok) emptyList() else ModuleFailureHints.analyze(
                 if (result.timedOut) ApdClient.EXIT_TIMEOUT else result.exitCode,
                 result.stdout, result.stderr, "安装",
+                keyHint(context, result),
             ),
             parsed = obj,
         )
@@ -228,6 +233,7 @@ object ModuleRepository {
             rawStderr = result.stderr,
             hints = if (ok) emptyList() else ModuleFailureHints.analyze(
                 result.exitCode, result.stdout, result.stderr, "卸载",
+                keyHint(context, result),
             ),
             parsed = obj,
         )
@@ -260,4 +266,12 @@ object ModuleRepository {
         subCommand = subCommand,
         timeoutSec = timeoutSec,
     )
+
+    /** 125 时的 KeyMatch 精确诊断（裁决②）；非 125 / 诊断异常返回 null（退回通用文案）。 */
+    private fun keyHint(context: android.content.Context, result: ApdClient.Result): String? =
+        if (result.exitCode == ApdClient.EXIT_ESCALATION) {
+            runCatching { KeyMatch.escalationExplanation(context) }.getOrNull()
+        } else {
+            null
+        }
 }

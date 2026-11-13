@@ -17,22 +17,36 @@ object ModuleFailureHints {
 
     /**
      * @param operation 人类可读操作名（"安装"/"卸载"/"启用"/"禁用"/"读取列表"）
+     * @param keyHint 125 时的精确诊断（KeyMatch.escalationExplanation，裁决②）；
+     *                null 时退回通用文案。调用方（有 context 的页面/仓库）传参。
      */
-    fun analyze(exitCode: Int, stdout: String, stderr: String, operation: String): List<Hint> {
+    fun analyze(
+        exitCode: Int,
+        stdout: String,
+        stderr: String,
+        operation: String,
+        keyHint: String? = null,
+    ): List<Hint> {
         val text = (stdout + "\n" + stderr).lowercase()
         val hints = mutableListOf<Hint>()
 
         // ---- 先按退出码给确定性的提示（模块子命令码表 NEW-DOC-05 §3.1.2，优先级最高） ----
         ModuleExitCode.describe(exitCode)?.let { (cause, action) ->
-            hints += Hint(cause = cause, action = action, basis = "exit=$exitCode（NEW-DOC-05 §3.1.2）")
+            // 125 的 action 用 keyHint 覆盖（若提供）——统一 5 个 125 出口的精确文案。
+            if (exitCode == ApdClient.EXIT_ESCALATION && !keyHint.isNullOrBlank()) {
+                hints += Hint(cause = cause, action = keyHint, basis = "exit=125（KeyMatch 三方对账）")
+            } else {
+                hints += Hint(cause = cause, action = action, basis = "exit=$exitCode（NEW-DOC-05 §3.1.2）")
+            }
             return hints
         }
 
         when (exitCode) {
             ApdClient.EXIT_ESCALATION -> hints += Hint(
-                cause = "密钥无效或被内核静默拒绝（exit=125）",
-                action = "该密钥与当前内核不匹配：请重新走一次「修补 → 刷入」，或到设置页确认密钥；本 App 不会自动重试",
-                basis = "exit=125",
+                cause = "当前密钥被内核拒绝（exit=125）",
+                action = keyHint
+                    ?: "该密钥与当前内核不匹配：请重新走一次「修补 → 刷入」，或到设置页确认密钥；本 App 不会自动重试",
+                basis = "exit=125" + if (keyHint != null) "（KeyMatch 三方对账）" else "",
             )
             ApdClient.EXIT_NOT_EXECUTABLE -> hints += Hint(
                 cause = "AP 不可执行（exit=126）",

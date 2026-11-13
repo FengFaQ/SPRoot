@@ -140,7 +140,7 @@ object AuthRepository {
         }
         val result = exec(context, superKey, listOf("auth", "list", "--json"), 60)
         if (!result.ok) {
-            return ListResult(false, explain(result), emptyList(), rawOf(result))
+            return ListResult(false, explain(context, result), emptyList(), rawOf(result))
         }
         val rows = parseObjectArray(result.stdout)
         if (rows.isEmpty() && result.stdout.trim().let { it.isNotEmpty() && it != "[]" }) {
@@ -215,7 +215,7 @@ object AuthRepository {
             listOf("auth", "set", "--uid", uid.toString(), "--state", state.wire, "--json"),
             60,
         )
-        return opResult(result, state)
+        return opResult(context, result, state)
     }
 
     /** 撤销授权（等价置为拒绝）。 */
@@ -224,12 +224,12 @@ object AuthRepository {
             return AuthOpResult(false, false, "Root 密钥不可用：请到设置页重新生成")
         }
         val result = exec(context, superKey, listOf("auth", "revoke", "--uid", uid.toString(), "--json"), 60)
-        return opResult(result, AuthState.DENY)
+        return opResult(context, result, AuthState.DENY)
     }
 
-    private fun opResult(result: ApdClient.Result, target: AuthState): AuthOpResult {
+    private fun opResult(context: Context, result: ApdClient.Result, target: AuthState): AuthOpResult {
         if (!result.ok) {
-            return AuthOpResult(false, result.exitCode != 2, explain(result), rawOf(result))
+            return AuthOpResult(false, result.exitCode != 2, explain(context, result), rawOf(result))
         }
         val fields = MiniJson.objectOf(result.stdout)
         val jsonOk = fields["ok"]?.equals("true", ignoreCase = true) == true
@@ -254,7 +254,7 @@ object AuthRepository {
         }
         val result = exec(context, superKey, listOf("auth", "log", "--json", "--limit", limit.toString()), 60)
         if (!result.ok) {
-            return LogResult(false, explain(result), emptyList(), rawOf(result))
+            return LogResult(false, explain(context, result), emptyList(), rawOf(result))
         }
         val rows = parseObjectArray(result.stdout)
         val entries = rows.mapNotNull { row ->
@@ -292,11 +292,14 @@ object AuthRepository {
     private fun rawOf(result: ApdClient.Result): String =
         (result.stdout + if (result.stderr.isNotBlank()) "\n[stderr]\n" + result.stderr else "").trim()
 
-    /** 退出码 → 人话（125 = 内核未刷补丁镜像的"正常初始态"，不标红为失败契约错误）。 */
-    private fun explain(result: ApdClient.Result): String = when {
+    /** 退出码 → 人话（125 = 当前密钥被内核拒绝：KeyMatch 给精确诊断，不笼统标失败）。 */
+    private fun explain(context: Context, result: ApdClient.Result): String = when {
         result.timedOut -> "apd auth 调用超时（124），请重试"
         result.exitCode == ApdClient.EXIT_ESCALATION ->
-            "尚未部署 AP 守护（125，需先刷入修补后的镜像并部署 AP）"
+            "提权被内核拒绝（125）。\n" +
+                // KeyMatch 异常时回退通用文案——诊断器挂掉不能丢 125 本身。
+                (runCatching { KeyMatch.escalationExplanation(context) }
+                    .getOrElse { "当前密钥与内核不匹配：请重新修补镜像并刷入（用当前密钥），或导出日志反馈。" })
         result.exitCode == ApdClient.EXIT_USAGE ->
             "apd auth 参数与客户端不一致（2，契约不匹配，请上报 apd-dev）：${result.stderr.take(300)}"
         result.exitCode == ApdClient.EXIT_NOT_EXECUTABLE || result.exitCode == ApdClient.EXIT_NOT_FOUND ->

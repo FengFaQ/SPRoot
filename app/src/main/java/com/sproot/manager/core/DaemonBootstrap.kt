@@ -126,9 +126,15 @@ object DaemonBootstrap {
                 markInstalled(context, probe)
                 return save(context, Result(State.RUNNING, "AP 守护已在运行", probe.stage, now))
             }
-            "undeployed", "escalation_failed", "no_ap_binary" -> return save(
+            "undeployed", "no_ap_binary" -> return save(
                 context,
                 Result(State.NOT_DEPLOYED, probe.stageLabel, probe.stage, now),
+            )
+            "escalation_failed" -> return save(
+                context,
+                // 125 = 当前密钥被内核拒绝：给 KeyMatch 的精确诊断（密钥不一致 → 重新修补刷入），
+                // 不再笼统标 NOT_DEPLOYED。NOT_DEPLOYED 态不标红（isNormalInitial），错误态更诚实。
+                Result(State.FAILED, KeyMatch.escalationExplanation(context).take(300), probe.stage, now),
             )
         }
 

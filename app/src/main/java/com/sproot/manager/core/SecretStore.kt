@@ -117,6 +117,21 @@ class SecretStore private constructor(private val context: Context) {
             }
             return kernelKeyOf(trimmed)
         }
+
+        /**
+         * 密钥指纹：sha256(密钥前 16 字符) 的 lowercase hex。
+         *
+         * 口径必须与 apd `version --json` 的 `key_prefix_sha256`（cli.rs print_version：
+         * `sha256_hex_stdin(key 前 16 字符)`）**逐字节一致**——两边字符串直接比较，
+         * 供 KeyMatch 三方对账（修补时密钥 A / 当前密钥 B / 已部署 key 文件 C）。
+         * 只含 sha256 摘要、不含密钥本体或片段，写日志/持久化无泄露面
+         * （与 apd 契约 "never the key or any fragment" 对齐）。
+         */
+        fun fingerprintOf(key: String): String {
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+                .digest(key.take(16).toByteArray(Charsets.UTF_8))
+            return digest.joinToString("") { "%02x".format(it) }
+        }
     }
 
     private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -135,7 +150,7 @@ class SecretStore private constructor(private val context: Context) {
         readRootKey()?.let { return it }
         val fresh = generateKey()
         saveRootKey(fresh)
-        AppLog.info(TAG, "已生成新的 47 字符 Root 密钥（内核 ABI 47+NUL；隐藏目录前缀=${fresh.take(16)}）")
+        AppLog.info(TAG, "已生成新的 47 字符 Root 密钥（内核 ABI 47+NUL；隐藏目录前缀=${fresh.take(16)}；指纹=${fingerprintOf(fresh)}）")
         return fresh
     }
 
@@ -186,7 +201,7 @@ class SecretStore private constructor(private val context: Context) {
         AppLog.warn(
             TAG,
             "检测到旧格式密钥（48 字符），已重新生成 47 字符密钥；" +
-                "若你已修补过镜像，请重新修补并刷入（旧镜像内嵌的是旧密钥）",
+                "若你已修补过镜像，请重新修补并刷入（旧镜像内嵌的是旧密钥；新密钥指纹=${fingerprintOf(fresh)}）",
         )
         return fresh
     }
@@ -208,7 +223,7 @@ class SecretStore private constructor(private val context: Context) {
     fun rotate(): String {
         val fresh = generateKey()
         saveRootKey(fresh)
-        AppLog.warn(TAG, "Root 密钥已轮换；旧密钥修补的内核将无法提权，必须重新修补并刷入")
+        AppLog.warn(TAG, "Root 密钥已轮换；旧密钥修补的内核将无法提权，必须重新修补并刷入（新密钥指纹=${fingerprintOf(fresh)}）")
         return fresh
     }
 

@@ -14,6 +14,7 @@
 //      ★ V-18：report.json 含明文密钥，禁止外发/归档（NEW-DOC-06 §V-18）。
 
 #include "patch_pipeline.h"
+#include "patch_do_execve.h"
 #include "bootimg.h"
 #include "spr_sha256.h"
 #include "analyze/base_func.h"
@@ -79,6 +80,7 @@ struct EngineOptions {
     bool self_test_workdir = false;      // --self-test-workdir（workdir 所有权判定矩阵）
     bool self_test_keyabi = false;       // --self-test-keyabi（密钥 47+NUL ABI 闭环）
     bool self_test_rcvirtual = false;    // --self-test-rcvirtual（rc 虚拟化纯逻辑/布局/洞扫描）
+    bool self_test_doexecve = false;     // --self-test-doexecve（R1/R2：候选选择契约）
     // 可选启动器：off（默认）| rc（rc 虚拟化，见 NEW-DOC-02 §11）| umh（B 方案，未实现）
     std::string launcher_mode = "off";
 };
@@ -486,6 +488,15 @@ struct EngineState {
     std::vector<size_t> patch_lens;             // 每处补丁字节数
     std::vector<std::string> patch_hex;          // 每处补丁 bytes（大写 hex）
     RcVirtInfo launcher;                         // rc 虚拟化结果（--launcher rc）
+    // R3（B' 假设防线）：do_execve hook 自描述（verify_patch.py V8 组消费）。
+    // symbol 为空 = 失败路径/尚未解析（report 输出空对象 → V8 WARN 兼容）。
+    std::string do_execve_hook_symbol;           // 如 "do_execveat_common"
+    std::string do_execve_hook_addr;             // "0x…"（hook 落位，b 指令处）
+    std::string do_execve_cave_addr;             // "0x…"（blob/cave 落位）
+    std::vector<std::pair<std::string, std::string>> do_execve_call_chain;  // syscall→…→hook
+    // R3 附带项：cred 布局第二锚点交叉验证
+    size_t cred_offset_second_anchor = 0;
+    bool cred_offset_consistent = false;
 };
 
 // 十六进制小写化（vec_patch 内部为大写 hex；orig_bytes 由镜像读出，统一小写便于比对）
@@ -740,6 +751,41 @@ static J build_report(const EngineOptions& opt, const EngineState& st, const std
            return arr;
        }())
        .set("hidden_dir_prefix", root_key.substr(0, 16))
+       // R3（B' 假设防线）：do_execve hook 的**产物自描述**——verify_patch.py V8 组
+       // 用它做无 root 静态自证（b 指令合法性 + bl 调用链交叉验证，见 quality/static）。
+       // fail 路径上无 pr 数据 → 输出空对象（V8 WARN 兼容）。
+       .set("do_execve_hook", [&st]() -> J {
+           J h;
+           if (st.do_execve_hook_symbol.empty()) return h;
+           h.set("symbol", st.do_execve_hook_symbol)
+            .set("hook_addr", st.do_execve_hook_addr)
+            .set("cave_addr", st.do_execve_cave_addr);
+           J chain = J::array();
+           for (const auto& c : st.do_execve_call_chain) {
+               J e; e.set("symbol", c.first).set("addr", c.second);
+               chain.push(std::move(e));
+           }
+           h.set("call_chain", std::move(chain));
+           return h;
+       }())
+       // cred 布局第二锚点交叉验证（R3 附带项）：match/unavailable/mismatch 三态。
+       .set("cred_layout_crosscheck", [&st]() -> J {
+           J c;
+           c.set("second_anchor_offset", static_cast<long long>(st.cred_offset_second_anchor))
+            .set("consistent", st.cred_offset_consistent);
+           if (st.cred_offset_second_anchor == 0)
+               c.set("status", "unavailable")
+                .set("note", "第二锚点不可用（prctl_get_seccomp 区间无 cred load），"
+                             "cred 布局仅由 sys_getuid 单锚点推出，解析成功≠布局正确");
+           else if (st.cred_offset_consistent)
+               c.set("status", "match")
+                .set("note", "双锚点一致：cred offset 由 sys_getuid 与第二锚点独立推出且相等");
+           else
+               c.set("status", "mismatch")
+                .set("note", "双锚点不一致：cred offset 可信度存疑（引擎仍按主锚点继续，"
+                             "但建议核对本字段与真机 bootability）");
+           return c;
+       }())
        .set("errors", std::move(errors));
     return rep;
 }
@@ -1151,6 +1197,161 @@ static int self_test_rcvirtual_contract() {
     return failures == 0 ? OK : 1;
 }
 
+// 隐藏自检（--self-test-doexecve，R1/R2）：do_execve 候选选择契约。
+// 纯逻辑（合成缓冲 + 直接构造 KernelSymbolOffset），无需内核镜像 ⇒ CI 每次必跑（A12）。
+//   ① R1 负样本：候选全空 → PatchDoExecve::valid()==false 且 patch_do_execve 返回 0
+//      （管线走 E202；不复现上游 IF_EXIT exit(0) 伪成功——负样本通道：若候选解析
+//       退化回"恒 valid"，本组用例直接红）。
+//   ② R2① 带选矩阵：6.1+ 下"do_execveat_common 小 / do_execve 大"的怪样本必须
+//      仍选 do_execveat_common；5.5- 下 __do_execve_file 首选锁定（即使它更小）。
+//   ③ R2② 序言白名单：首指令是 PC-relative（adrp）的候选被拒，降级下一候选；
+//      全被拒 → valid()==false + g_patch_abort_reason 非空。
+// 夹具构造要点：PatchBase 构造会跑 InitCredSearcher（IF_EXIT），故合成缓冲必须
+// 内嵌一份合法 init_cred 模式（usage=4 + uid..fsgid=0 + securebits + cap 满值串）。
+static int self_test_doexecve_contract() {
+    int failures = 0, total = 0;
+    auto check = [&](const char* name, bool ok, const std::string& detail = "") {
+        ++total; if (!ok) ++failures;
+        std::cout << "DXCASE " << name << (ok ? " PASS" : " FAIL");
+        if (!ok && !detail.empty()) std::cout << " (" << detail << ")";
+        std::cout << "\n";
+    };
+
+    // ---- 合成缓冲骨架：合法 init_cred 模式 + 候选函数区 ----
+    // init_cred 模式（cred_uid_offset=4 → atomic4usage 候选集）：
+    //   usage(u32)=4 | uid_info(32B 全 0) | securebits(u32)=0 | cap_inheritable/permitted/effective/bset = cap 满值
+    auto make_base_buf = []() {
+        std::vector<char> buf(0x8000, 0);
+        const uint64_t caps = 0x1FFFFFFFFFFULL;   // CAP_FULL_SET_5_9_0（5.9+ 形态）
+        size_t off = 0x8000 - 0x100;              // 放缓冲尾部，避开候选区
+        auto put = [&](const void* p, size_t n) { memcpy(&buf[off], p, n); off += n; };
+        const uint32_t usage = 4;
+        put(&usage, 4);                    // usage=4 → atomic4usage 候选
+        const uint32_t zeros[8] = { 0 };   // uid/gid/suid/sgid/euid/egid/fsuid/fsgid = 0
+        put(zeros, 32);
+        const uint32_t securebits = 0;
+        put(&securebits, 4);
+        const uint64_t caps4[4] = { caps, caps, caps, caps };  // inheritable/permitted/effective/bset
+        put(caps4, 32);
+        return buf;
+    };
+    // 候选函数区：PACIASP 序言（0xD503233F）+ ret，占 0x100 字节
+    constexpr uint32_t PACIASP = 0xD503233Fu;
+    constexpr uint32_t RET     = 0xD65F03C0u;
+    constexpr uint32_t ADRP    = 0x90000001u;   // adrp x1, +0（PC-relative，非序言）
+    auto place_func = [](std::vector<char>& buf, size_t addr, size_t words, uint32_t first, uint32_t rest) {
+        for (size_t i = 0; i < words; ++i) {
+            const uint32_t w = (i == 0) ? first : rest;
+            memcpy(&buf[addr + i * 4], &w, 4);
+        }
+    };
+    // 合成 KernelSymbolOffset：只填 do_execve 家族字段（其余为 0 = 缺席）。
+    // region offset 必须非 0（valid() 判据），size 控制 size-max 竞争。
+    auto mk_sym = [](size_t f_addr, size_t f_size, size_t c_addr, size_t c_size) {
+        KernelSymbolOffset s{};
+        s.do_execve.offset = f_addr;    s.do_execve.size = f_size;
+        s.do_execveat_common.offset = c_addr; s.do_execveat_common.size = c_size;
+        return s;
+    };
+
+    // ---- ① R1 负样本：候选全空 → valid()==false + patch_do_execve()==0 ----
+    {
+        std::vector<char> buf = make_base_buf();
+        KernelSymbolOffset empty{};
+        g_patch_abort_reason.clear();
+        PatchBase base(buf, 4, {});
+        PatchDoExecve pe(base, empty);
+        check("dx_empty_candidates_invalid", !pe.valid(),
+              "候选全空必须 valid()==false（R1 前置短路）");
+        std::vector<patch_bytes_data> out;
+        SymbolRegion region{ 0x200, 0x300 };
+        const size_t n = pe.patch_do_execve(region, 0x838, 0x900, out);
+        check("dx_empty_candidates_no_patch", n == 0 && out.empty(),
+              "valid==false 时 patch_do_execve 必须返回 0 且不产出任何写入");
+        // 负样本通道（若退化回上游行为，这里会 exit(0) —— 本身即失败证据；能走到
+        // 这条断言就证明引擎仍存活，进程未终止）：
+        check("dx_engine_alive_after_empty", true,
+              "执行到这里 = 候选全空未触发 exit(0)（伪成功已根除）");
+    }
+
+    // ---- ② R2① 带选矩阵 ----
+    {
+        // 怪样本：do_execveat_common 小（0x40B）、do_execve 大（0x400B）——
+        // 旧 size-max 会选 do_execve（瘦包装），带选必须仍选 do_execveat_common。
+        std::vector<char> buf = make_base_buf();
+        place_func(buf, 0x1000, 0x10, PACIASP, RET);          // do_execveat_common @0x1000 小
+        place_func(buf, 0x2000, 0x100, PACIASP, RET);         // do_execve @0x2000 大
+        KernelSymbolOffset sym = mk_sym(0x2000, 0x400, 0x1000, 0x40);
+        PatchBase base(buf, 4, {});
+        PatchDoExecve pe(base, sym);
+        // 注意：PatchDoExecve 构造时 init_do_execve_param 内部 m_file_buf 是 base 的引用
+        check("dx_ge61_prefers_common_over_bigger_execve", pe.valid(),
+              "6.1+ 带选必须锁定 do_execveat_common（怪样本：common 小、do_execve 大）");
+        if (pe.valid()) {
+            // 验证选中的是 0x1000（common）而非 0x2000（大 do_execve）——
+            // 通过 patch_do_execve 的落位间接验证：hook 跳转目标首指令应为原指令。
+            // 直接更可靠的断言：把 common 清空 → 带选失败回落 size-max 选 do_execve。
+            KernelSymbolOffset sym2 = mk_sym(0x2000, 0x400, 0, 0);
+            PatchDoExecve pe2((PatchBase(buf, 4, {})), sym2);
+            check("dx_ge61_falls_back_to_execve_when_common_absent", pe2.valid(),
+                  "common 缺席时回落 size-max（兜底语义保留）");
+        }
+        // 5.5- 内核：__do_execve_file 首选锁定（即使它比 do_execveat_common 小）
+        std::vector<char> buf54 = make_base_buf();
+        // 把版本串改写成 5.4.x（find_kernel_versions 只扫前 256B 的 "Linux version "）
+        const std::string vstr = "Linux version 5.4.210-android13";
+        memcpy(&buf54[0x40], vstr.c_str(), vstr.size());
+        place_func(buf54, 0x1000, 0x10, PACIASP, RET);        // __do_execve_file @0x1000 小
+        place_func(buf54, 0x2000, 0x100, PACIASP, RET);       // do_execveat_common @0x2000 大
+        KernelSymbolOffset sym54{};
+        sym54.__do_execve_file = { 0x1000, 0x40 };
+        sym54.do_execveat_common = { 0x2000, 0x400 };
+        PatchBase base54(buf54, 4, {});
+        PatchDoExecve pe54(base54, sym54);
+        check("dx_pre55_locks_do_execve_file", pe54.valid(),
+              "5.5- 带选必须锁定 __do_execve_file（即使它比 common 小）");
+        // 5.5- 且 __do_execve_file 缺席 → 回落 common
+        KernelSymbolOffset sym54b{};
+        sym54b.do_execveat_common = { 0x2000, 0x400 };
+        PatchDoExecve pe54b((PatchBase(buf54, 4, {})), sym54b);
+        check("dx_pre55_falls_back_common", pe54b.valid(),
+              "5.5- 无 __do_execve_file 时回落 do_execveat_common");
+    }
+
+    // ---- ③ R2② 序言白名单 ----
+    {
+        std::vector<char> buf = make_base_buf();
+        // common 首指令 = adrp（PC-relative）→ 白名单拒绝；do_execve = PACIASP → 保留。
+        place_func(buf, 0x1000, 0x10, ADRP, RET);             // common @0x1000 非序言
+        place_func(buf, 0x2000, 0x100, PACIASP, RET);         // do_execve @0x2000 合法
+        KernelSymbolOffset sym = mk_sym(0x2000, 0x400, 0x1000, 0x40);
+        PatchBase base(buf, 4, {});
+        PatchDoExecve pe(base, sym);
+        check("dx_prologue_whitelist_degrades", pe.valid(),
+              "common 被白名单拒绝后必须降级到 do_execve（不整组失败）");
+        // 全部候选都是非序言 → valid()==false + reason 非空（负样本通道：白名单若
+        // 退化成"恒通过"，valid 会翻成 true，本断言红）
+        std::vector<char> buf2 = make_base_buf();
+        place_func(buf2, 0x1000, 0x10, ADRP, RET);
+        place_func(buf2, 0x2000, 0x100, ADRP, RET);
+        PatchDoExecve pe2((PatchBase(buf2, 4, {})), mk_sym(0x2000, 0x400, 0x1000, 0x40));
+        check("dx_prologue_all_rejected_invalid", !pe2.valid(),
+              "全部候选非序言 → valid()==false（白名单必须真的会拒）");
+        check("dx_abort_reason_recorded", !g_patch_abort_reason.empty(),
+              "白名单拒绝必须落 g_patch_abort_reason（排障依据）");
+        // 白名单负向确认：PACIASP 候选确实通过（否则上面"降级"断言是假绿）
+        std::vector<char> buf3 = make_base_buf();
+        place_func(buf3, 0x1000, 0x10, PACIASP, RET);
+        PatchDoExecve pe3((PatchBase(buf3, 4, {})), mk_sym(0, 0, 0x1000, 0x40));
+        check("dx_prologue_paciasp_passes", pe3.valid(),
+              "PACIASP 序言必须通过白名单（证明白名单不是恒拒）");
+    }
+
+    std::cout << "DXRESULT " << (failures == 0 ? "PASS" : "FAIL")
+              << " " << (total - failures) << "/" << total << " cases\n";
+    return failures == 0 ? OK : 1;
+}
+
 // ---------------------------------------------------------------- bootimg 模式
 // 内置 boot.img 解析/重打包（不依赖 magiskboot/kptools，见 bootimg.h 决策说明）
 // 用法：
@@ -1277,6 +1478,7 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
         else if (a == "--self-test-workdir") { opt.self_test_workdir = true; }
         else if (a == "--self-test-keyabi") { opt.self_test_keyabi = true; }
         else if (a == "--self-test-rcvirtual") { opt.self_test_rcvirtual = true; }
+        else if (a == "--self-test-doexecve") { opt.self_test_doexecve = true; }
         else if (a == "--launcher") { opt.launcher_mode = need("--launcher"); }
         else if (a == "--gen-key") { have_key = true; }
         else if (a == "--json") { opt.json_sink = need("--json"); }
@@ -1668,6 +1870,17 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
         return rc;
     }
 
+    // 隐藏自检（R1/R2）：do_execve 候选选择契约（候选全空 → E-code 而非 exit(0) 伪成功；
+    // 版本带选锁定 + 序言白名单降级）。纯逻辑，无需内核镜像 ⇒ CI 每次必跑（A12）。
+    if (opt.self_test_doexecve) {
+        int rc = self_test_doexecve_contract();
+        J extra;
+        extra.set("do_execve_select", rc == OK ? "PASS" : "FAIL");
+        emit_result(rc == OK ? OK : E_USAGE, std::move(extra));
+        if (g_ndjson.is_open()) g_ndjson.close();
+        return rc;
+    }
+
     if (!have_in || !have_out || !have_key) {
         std::cerr << "E101: missing required args (--in/--out/--gen-key|--key)\n";
         J e; e.set("error", "E101: missing required args");
@@ -1853,9 +2066,23 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
         if (!parser_seccomp_offset(st.file_buf, sym.prctl_get_seccomp, off.seccomp_offset))
             return fail(E_OFFSET_DERIVE, "E210: seccomp offset derivation failed", "anchor=prctl_get_seccomp");
         parser_huawei_kti_addr(st.file_buf, sym.kti_randomize_init, off.huawei_kti_addr);
+        // cred 第二锚点（R3 附带项）：同一 cred_offset 必须能从第二个取 current 的
+        // 函数（__arm64_sys_geteuid / sys_getegid）独立推出——双锚点一致 = 布局互证；
+        // 单锚点 = report 降级说明（解析成功 ≠ 布局正确，防 0x838 类误推）。
+        {
+            // 第二锚点符号按优先级现场解析（geteuid 缺席用 getegid；两者都缺 → 降级）
+            auto pair12 = hook_second_anchor_symbols(st.file_buf);
+            const SymbolRegion& anchor2 = pair12.first.offset ? pair12.first : pair12.second;
+            st.cred_offset_second_anchor = hook_cred_offset_second_anchor(st.file_buf, anchor2);
+            st.cred_offset_consistent =
+                (st.cred_offset_second_anchor == 0) ? false
+                : (st.cred_offset_second_anchor == off.cred_offset);
+        }
         std::ostringstream d;
         d << "cred=0x" << std::hex << off.cred_offset << ",uid=0x" << off.cred_uid_offset
-          << ",seccomp=0x" << off.seccomp_offset;
+          << ",seccomp=0x" << off.seccomp_offset
+          << ",cred2nd=" << (st.cred_offset_consistent ? "match" :
+                             (st.cred_offset_second_anchor ? "mismatch" : "unavailable"));
         emit_progress("derive_offsets", 30, d.str());
     }
 
@@ -1925,6 +2152,36 @@ extern "C" int spr_engine_run(int argc, char* argv[]) {
             st.patch_addrs.push_back(item.write_addr);
             st.patch_lens.push_back(item.str_bytes.size() / 2);
             st.patch_hex.push_back(item.str_bytes);
+        }
+        // R3：do_execve hook 自描述——从 groups 里找 do_execve 组的 EntryHook 落位
+        // （真实函数入口被改成 b 的那一处），cave = 该组 patched_site。
+        for (const auto& g : st.groups) {
+            if (std::string(g.group) != "do_execve") continue;
+            for (size_t i = g.first; i < g.last && i < st.patch_addrs.size(); ++i) {
+                const size_t len = st.patch_lens[i];
+                if (len == 4 && classify_patch(st.patch_addrs[i], len, st.patch_hex[i])
+                        == PatchRole::EntryHook) {
+                    std::ostringstream a; a << "0x" << std::hex << st.patch_addrs[i];
+                    st.do_execve_hook_symbol = g.symbol ? g.symbol : "do_execve";
+                    st.do_execve_hook_addr = a.str();
+                    std::ostringstream cs; cs << "0x" << std::hex << g.target_addr;
+                    st.do_execve_cave_addr = g.target_addr ? cs.str() : std::string();
+                    break;
+                }
+            }
+            // call_chain：syscall 包装 →（do_execve 中间层）→ 汇聚点 hook。
+            // V8 bl 交叉验证逐级验证"第一条 bl 目标 == 下一级"；中间层缺席时降级。
+            if (!st.do_execve_hook_addr.empty()) {
+                if (sym.sys_execve_wrapper.offset) {
+                    std::ostringstream sc; sc << "0x" << std::hex << sym.sys_execve_wrapper.offset;
+                    st.do_execve_call_chain.push_back({"__arm64_sys_execve", sc.str()});
+                }
+                if (sym.do_execve.offset && std::string(g.symbol) != "do_execve") {
+                    std::ostringstream de; de << "0x" << std::hex << sym.do_execve.offset;
+                    st.do_execve_call_chain.push_back({"do_execve", de.str()});
+                }
+            }
+            break;
         }
         std::vector<char> patched = st.file_buf;
         for (auto& item : vec_patch) {

@@ -43,7 +43,7 @@
 
 ## 2. 来自 SKRoot 上游的内容（逐文件清单）
 
-### 2.1 与上游**逐字节完全相同**的文件（13 个）
+### 2.1 与上游**逐字节完全相同**的文件（12 个）
 
 以下文件与上游 `Lite_version/src/patch_kernel_root/` 同名文件 **`diff` 结果完全一致（0 差异）**，
 可视为上游原始文件的副本。**许可状态：原作者保留所有权利。**
@@ -51,26 +51,26 @@
 | # | 文件 | 大小（字节） | sha256（固定指纹） | 与上游比对 |
 |---|---|---|---|---|
 | 1 | `engine/src/patch_base.h` | 1,706 | `85ed4a29dc97829cf42312fa3286c71d9fb2afc46e4ec54b360b1ea343f7b4cb` | 完全相同 |
-| 2 | `engine/src/patch_do_execve.cpp` | 6,067 | `92828a418f3c0db75f298f98551be6604b58bc394274b6cba8871e731174626e` | 完全相同 |
-| 4 | `engine/src/patch_do_execve.h` | 735 | `4061fd4af6c9276c23b984483e67a9f32f512d4d47044bed1e80844f0b3e5908` | 完全相同 |
-| 5 | `engine/src/patch_avc_denied.cpp` | 2,267 | `c812a30ca6d234eab3f6f8bc89a146d4718acef936caac3d22460a2cbd211e73` | 完全相同 |
-| 6 | `engine/src/patch_avc_denied.h` | 433 | `503fe20399b33593f31fcf9bed5c70583759bcdc7d1824ce42191b2a0d510171` | 完全相同 |
-| 7 | `engine/src/patch_audit_log_start.cpp` | 2,471 | `469439f739051d0d0c5afc37905a20a69091590e4cdf14e68a583482a8369192` | 完全相同 |
-| 8 | `engine/src/patch_audit_log_start.h` | 502 | `d16c07379522ddf1cb6b8e80c039e6f842e9ebbe8fe2f467393225e865c4d667` | 完全相同 |
-| 9 | `engine/src/patch_current_avc_check.cpp` | 2,436 | `0e3a96563f08cf0ef14d928697fc4d696f95fcfc93cfbdb2912497ed409f34d8` | 完全相同 |
-| 10 | `engine/src/patch_current_avc_check.h` | 389 | `97509f8f490428f3feb67b405cc0e7dd41237087d25b856d6a8afa514e0a0e5f` | 完全相同 |
-| 11 | `engine/src/patch_filldir64.cpp` | 3,796 | `9981c6d63484c07920996b9445ca0915094b555421441f407b2b94a2be590426` | 完全相同 |
-| 12 | `engine/src/patch_filldir64.h` | 605 | `3c88aea9c0d9fd6816943a24d24ad1ce2febb3456527269edb1c8fd2dc631d01` | 完全相同 |
-| 13 | `engine/src/patch_compat_filldir.cpp` | 3,905 | `30963060865f9eea04735a3a80a3a76d8d7d6b6734d5dd7b310c8fd1f67b0929` | 完全相同 |
-| 14 | `engine/src/patch_compat_filldir.h` | 642 | `48ec8c1080d2a7f98a6132a6c942010d4fad083bf95d5afffe8d08a6f1efed93` | 完全相同 |
+| 2 | `engine/src/patch_avc_denied.cpp` | 2,267 | `c812a30ca6d234eab3f6f8bc89a146d4718acef936caac3d22460a2cbd211e73` | 完全相同 |
+| 3 | `engine/src/patch_avc_denied.h` | 433 | `503fe20399b33593f31fcf9bed5c70583759bcdc7d1824ce42191b2a0d510171` | 完全相同 |
+| 4 | `engine/src/patch_audit_log_start.cpp` | 2,471 | `469439f739051d0d0c5afc37905a20a69091590e4cdf14e68a583482a8369192` | 完全相同 |
+| 5 | `engine/src/patch_audit_log_start.h` | 502 | `d16c07379522ddf1cb6b8e80c039e6f842e9ebbe8fe2f467393225e865c4d667` | 完全相同 |
+| 6 | `engine/src/patch_current_avc_check.cpp` | 2,436 | `0e3a96563f08cf0ef14d928697fc4d696f95fcfc93cfbdb2912497ed409f34d8` | 完全相同 |
+| 7 | `engine/src/patch_current_avc_check.h` | 389 | `97509f8f490428f3feb67b405cc0e7dd41237087d25b856d6a8afa514e0a0e5f` | 完全相同 |
+| 8 | `engine/src/patch_filldir64.cpp` | 3,796 | `9981c6d63484c07920996b9445ca0915094b555421441f407b2b94a2be590426` | 完全相同 |
+| 9 | `engine/src/patch_filldir64.h` | 605 | `3c88aea9c0d9fd6816943a24d24ad1ce2febb3456527269edb1c8fd2dc631d01` | 完全相同 |
+| 10 | `engine/src/patch_compat_filldir.cpp` | 3,905 | `30963060865f9eea04735a3a80a3a76d8d7d6b6734d5dd7b310c8fd1f67b0929` | 完全相同 |
+| 11 | `engine/src/patch_compat_filldir.h` | 642 | `48ec8c1080d2a7f98a6132a6c942010d4fad083bf95d5afffe8d08a6f1efed93` | 完全相同 |
 
-### 2.2 基于上游**改造**的文件（3 个）
+### 2.2 基于上游**改造**的文件（5 个）
 
 | 文件 | 大小 | sha256（当前指纹） | 上游对应文件 | 关系 |
 |---|---|---|---|---|
 | `engine/src/patch_base.cpp` | 9,489 | `f19531b831643d099171259ed99dc93d618b94d56c4887cce6f60ef973bf6a1c` | `patch_base.cpp`（7,485） | **改造衍生**：保留上游 emit/patch 原语，新增 ①拷贝构造补拷 `m_huawei_kti_calc_base`（修复华为内核 rc 路径 adrp 基址为 0）、②`emit_safe_bl`/`patch_jump` 返回值可检（汇编失败不再静默产出空字节）、③`_exit(EXIT_FAILURE)` 猝死出口改为 `handleError` 统一失败路径（保 C1 契约）、④`skip_pac_bti_at_func_start`/`find_all_aarch64_ret_offsets` 边界钳制。**上游部分仍属原作者保留所有权利**，本项目新增部分属 AGPL-3.0。 |
-| `engine/src/skroot_patch_main.cpp` | 117,526 | `1a2c4a87e48e22ad3f4b37ed568450efc0abdb77a60b6a5f3d19b2a7762bbfa3` | `patch_kernel_root.cpp`（12,492） | **改造衍生**：保留上游核心修补与提权逻辑，新增命令行契约（`--in/--out/--key/--gen-key/--json/--workdir/--quiet`）、NDJSON 进度上报、退出码体系、确定性输出。**上游部分仍属原作者保留所有权利**，本项目新增部分属 AGPL-3.0。 |
-| `engine/src/patch_kernel_root.h` | 3,028 | `e1ac978236e4c48505ad1d2d66b20402818dedae719c3eec734a7414a943ada7` | `patch_kernel_root.h`（2,630） | **改造衍生**：保留上游宏与数据结构定义，新增缓冲区边界守卫（`patch_ret_*` 读首指令前的 `start+4 <= size` 检查、`patch_data` 的 `start+buf_size <= size` 检查——修复畸形 kallsyms 输入下的越界读）。**上游部分仍属原作者保留所有权利**，本项目新增守卫部分属 AGPL-3.0。 |
+| `engine/src/skroot_patch_main.cpp` | 133,255 | `770529202c71be50a085617918bda5548f026a32784e481cb4464d5bdcacb15f` | `patch_kernel_root.cpp`（12,492） | **改造衍生**：保留上游核心修补与提权逻辑，新增命令行契约（`--in/--out/--key/--gen-key/--json/--workdir/--quiet`）、NDJSON 进度上报、退出码体系、确定性输出。**上游部分仍属原作者保留所有权利**，本项目新增部分属 AGPL-3.0。 |
+| `engine/src/patch_kernel_root.h` | 3,756 | `5d60925bf35bafbc4eeae70dbee0c5d0bff079686729c169c62572ff74916471` | `patch_kernel_root.h`（2,630） | **改造衍生**：保留上游宏与数据结构定义，新增缓冲区边界守卫（`patch_ret_*` 读首指令前的 `start+4 <= size` 检查、`patch_data` 的 `start+buf_size <= size` 检查——修复畸形 kallsyms 输入下的越界读）。**上游部分仍属原作者保留所有权利**，本项目新增守卫部分属 AGPL-3.0。 |
+| `engine/src/patch_do_execve.cpp` | 9,128 | `af91548aaba78a8ba3107bc2bc4c6d1ad0a5b06a58cca37f162bf610fa0c71de` | `patch_do_execve.cpp`（6,067） | **改造衍生**：保留上游 hook 语义（filename 逐字节比对 + cred/seccomp 清除），新增 ①hook 候选版本带选（≥5.5 锁定 do_execveat_common 汇聚点、<5.5 锁定 __do_execve_file，size-max 降为兜底）②序言白名单（paciasp/pacibsp/bti/stp-pre，拒绝 PC-relative 首指令搬移）③`valid()` 前置短路（候选全空走 E202 而非 IF_EXIT exit(0) 伪成功）。**上游部分仍属原作者保留所有权利**，本项目新增部分属 AGPL-3.0。 |
+| `engine/src/patch_do_execve.h` | 1,119 | `dc37e62854f47f92781a13a38286758a32e608717dd6b1e53cc286da5c5124e5` | `patch_do_execve.h`（735） | **改造衍生**：新增 `valid()` 接口与白名单常量声明（配合 .cpp 的版本带选/序言白名单/前置短路）。**上游部分仍属原作者保留所有权利**，本项目新增部分属 AGPL-3.0。 |
 
 ### 2.3 上述内容在本仓库中的位置与影响面
 

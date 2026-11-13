@@ -39,6 +39,7 @@ import androidx.compose.ui.unit.sp
 import com.sproot.manager.BuildConfig
 import com.sproot.manager.core.DaemonBootstrap
 import com.sproot.manager.core.InstallState
+import com.sproot.manager.core.KeyMatch
 import com.sproot.manager.core.PatchEngine
 import com.sproot.manager.core.SecretStore
 import com.sproot.manager.ui.components.BlurredBar
@@ -179,6 +180,8 @@ data class HomeSnapshot(
     val keyReady: Boolean = false,
     val daemon: DaemonBootstrap.Result? = null,
     val loaded: Boolean = false,
+    /** KeyMatch 对账结论（A vs B）：APP_KEY_CHANGED 时首页出"密钥已重置"警示卡 */
+    val keyVerdict: KeyMatch.Verdict = KeyMatch.Verdict.NO_RECORD,
 ) {
     companion object {
         fun load(context: android.content.Context): HomeSnapshot {
@@ -189,6 +192,7 @@ data class HomeSnapshot(
                 engine = engine,
                 keyReady = keyReady,
                 daemon = DaemonBootstrap.load(context),
+                keyVerdict = runCatching { KeyMatch.check(context) }.getOrDefault(KeyMatch.Verdict.NO_RECORD),
                 loaded = true,
             )
         }
@@ -211,6 +215,15 @@ private fun HomeWarnings(snapshot: HomeSnapshot) {
         if (snapshot.install.status == InstallState.Status.ERROR) {
             WarningCard(
                 message = "上次修补失败：" + (snapshot.install.note ?: "详情见修补页"),
+                level = WarningLevel.Error,
+            )
+        }
+        // ③.5 密钥与镜像不匹配（裁决③：Error 色——它阻断一切 root 功能）：
+        // 修补记录里的密钥（刷进内核的）≠ 当前 App 密钥 → 重新修补+刷入。
+        if (snapshot.keyVerdict == KeyMatch.Verdict.APP_KEY_CHANGED) {
+            WarningCard(
+                message = "密钥已重置：当前密钥与刷入镜像内嵌的密钥不一致，root 无法生效。" +
+                    "请到「修补」页重新修补 boot.img 并刷入（用当前密钥）。",
                 level = WarningLevel.Error,
             )
         }

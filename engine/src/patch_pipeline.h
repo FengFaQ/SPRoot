@@ -146,6 +146,13 @@ inline size_t hook_groups_expected_count(bool kernel_ge_6_1, bool has_huawei_sym
 
 // 内核是否 >= 6.1（与 patch_kernel_handler 内部选路判据保持一致）
 bool hook_branch_ge_6_1(const std::vector<char>& file_buf);
+// cred 布局第二锚点：在 anchor2（如 prctl_get_seccomp）区间里独立推导
+// task_struct.cred load offset；返回 0 = 锚点不可用/未命中（report 降级说明）。
+size_t hook_cred_offset_second_anchor(const std::vector<char>& file_buf,
+                                      const SymbolRegion& anchor2);
+// 第二锚点符号解析：first=__arm64_sys_geteuid（当前恒空，kallsyms 接口未含），
+// second=prctl_get_seccomp（主流程必查符号，存在性有保障）。main 取非空者。
+std::pair<SymbolRegion, SymbolRegion> hook_second_anchor_symbols(const std::vector<char>& file_buf);
 // 内核是否存在华为 hkip_check_*_root 符号族（决定是否多一组 huawei_bypass）
 bool hook_has_huawei_symbols(const KernelSymbolOffset& sym);
 // 实际命中的 huawei 符号名（空 = 一个都没命中）。供 report 的 breakdown 列出具名证据。

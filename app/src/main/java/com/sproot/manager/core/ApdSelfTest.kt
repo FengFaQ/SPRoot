@@ -103,9 +103,17 @@ object ApdSelfTest {
             ApdClient.runDirect(context, listOf("selftest", "--json"), timeoutSec = minOf(timeoutSec, 10))
         }
         val interpreted = interpret(execResult, viaRootExec)
-        save(context, interpreted)
-        AppLog.info(TAG, interpreted.describe())
-        return interpreted
+        // escalation_failed（125）时把 KeyMatch 的精确诊断并入 summary：
+        // 用户看到的是"密钥不一致 → 重新修补刷入"而不是笼统的"密钥无效"。
+        val enriched = if (interpreted.stage == "escalation_failed") {
+            val hint = runCatching { KeyMatch.escalationExplanation(context) }.getOrNull()
+            if (hint != null) interpreted.copy(summary = hint.take(500)) else interpreted
+        } else {
+            interpreted
+        }
+        save(context, enriched)
+        AppLog.info(TAG, enriched.describe())
+        return enriched
     }
 
     private fun interpret(result: ApdClient.Result, viaRootExec: Boolean): Result {
