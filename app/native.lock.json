@@ -4,29 +4,31 @@
   "engine": {
     "description": "SKRoot 修补引擎 JNI 共享库（aarch64 ET_DYN，Android 侧 System.loadLibrary(\"skrootpatch\")）",
     "artifact": "skroot-engine-arm64",
-    "run_id": 42817636832,
+    "run_id": 43539470760,
     "file": "libskrootpatch.so",
     "target": "libskrootpatch.so",
-    "sha256": "e294b8aa7171425212774f2ccbe7b9fd08f987a8df3c165202f7d049e4e7d558",
-    "size": 3066816,
+    "sha256": "70d82e00b0c80d38c83c02407c585be7b08ee91a0046609a64cb19b10fa10bb4",
+    "size": 3151984,
     "extra_assets": {
-      "ENGINE-META.txt": "8812ce049b19b8f08daaecf508a432710cabec7df41a1e05c02e2461a6eb4717",
-      "SYMBOLS-libskrootpatch.txt": "663826aa21db479a12f555ed87f953d02a7ed8b53239968288367a235d22b42d",
-      "SHA256SUMS": "6ad3f98f19a462cd6cb6d7ec6b6a14421f6ac128b1d52b1c978a1bf51ccd5e1a"
-    }
+      "ENGINE-META.txt": "d4e6976771e780b5942891524c25169e108434cab136960604e2d770b7da0bad",
+      "SYMBOLS-libskrootpatch.txt": "074ab4c1b89dd51bb333c9a77a4b01d889d303b4d95c306dabe086a5904d110a",
+      "SHA256SUMS": "f7eaaf4a648b27451ca8af2411f96cebcbbcb69dd862f93da8ebf1efe1d359e9"
+    },
+    "commit": "b215ecf735e552344b23f39fd765d1e5fb9769c4",
+    "version": "b215ecf"
   },
   "apd": {
     "description": "SPRoot AP 守护（aarch64 PIE 可执行 ELF；部署时复制为 /data/adb/apd）",
     "artifact": "apd-aarch64-latest",
-    "run_id": 43015986161,
+    "run_id": 43423195282,
     "file": "libapd-arm64.so",
     "target": "libapd.so",
-    "sha256": "9e900643093f786b82045c3546ca3e693725a053bf6db26c2ffec35bbc9b3adc",
-    "size": 2202072,
-    "commit": "19c19bb91784564e695811b66880863b02a14f59",
-    "version": "19c19bb",
+    "sha256": "652129ecb9c1c36a153788fb145bb74cd407c862880ea3b61a186bc04cb816cb",
+    "size": 2208208,
+    "commit": "38d90b232f5e5dba8b1068a28605615979afdb7a",
+    "version": "38d90b2",
     "extra_assets": {
-      "apd-version.txt": "6966754437c671458dcbab8754f1093f2dde0f26908b624fe76d9795c15c701a",
+      "apd-version.txt": "dd583a5973e07bd18e6ad6b98058cbdedb8ba0d096ce5360141c1d5036707052",
       "apd-capabilities.txt": "8e63fe526e4e2046345dbe91cfde5844ad4e16dfe0eddebe0e414b3cb54c384d"
     }
   },
