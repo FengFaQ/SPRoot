@@ -1296,6 +1296,55 @@ static int self_test_doexecve_contract() {
             check("dx_ge61_falls_back_to_execve_when_common_absent", pe2.valid(),
                   "common 缺席时回落 size-max（兜底语义保留）");
         }
+        // ★ bootloop 回归（2026-11-14 真机事故）：PAC skip 撤销防线。
+        // 事故：R1 改动曾在 skip_pac_bti 之后再次调用 set_execve_param(best)，把
+        // do_execve_addr 重写回未跳过 PAC 的符号原址——入口 b 落在 PACIASP 槽位、
+        // restore 槽位语义错位，真机 6.1.25 bootloop。本用例锁死：
+        // 候选首指令为 PACIASP 时，patch_do_execve 的入口 b 必须落在 **+4**（skip
+        // 之后），且 blob restore 槽位必须是 skip 后的首指令（stp），绝不是 PACIASP。
+        {
+            std::vector<char> bufp = make_base_buf();
+            // common @0x1000：PACIASP + stp x29,x30,[sp,#-0x20]!(0xD10143FF) + ret…
+            place_func(bufp, 0x1000, 0x10, PACIASP, RET);
+            const uint32_t STP_PRE = 0xD10143FFu;
+            memcpy(&bufp[0x1000 + 4], &STP_PRE, 4);
+            KernelSymbolOffset symp = mk_sym(0, 0, 0x1000, 0x40);
+            PatchBase basep(bufp, 4, {});
+            PatchDoExecve pep(basep, symp);
+            check("dx_pac_skip_setup_valid", pep.valid(), "PACIASP 序言候选必须 valid");
+            if (pep.valid()) {
+                std::vector<patch_bytes_data> out;
+                SymbolRegion cave{ 0x4000, 0x800 };
+                const size_t n = pep.patch_do_execve(cave, 0x838, 0x900, out);
+                check("dx_pac_skip_patch_produced", n > 0 && !out.empty(),
+                      "PACIASP 候选必须产出 blob+entry b");
+                // entry b 落位 = 0x1004（PACIASP 之后），new_bytes 是 b 指令；
+                // blob（write_addr==0x4000 的整块）内部偏移 48（key 之后）是 restore
+                // 槽位 —— 必须是 STP_PRE（skip 后首指令），绝不是 PACIASP。
+                bool entry_ok = false, restore_ok = false;
+                for (const auto& p : out) {
+                    if (p.write_addr == 0x1004) {
+                        const uint32_t w = [&] {
+                            std::vector<uint8_t> b(p.str_bytes.length() / 2);
+                            hex2bytes((uint8_t*)p.str_bytes.c_str(), b.data());
+                            uint32_t v; memcpy(&v, b.data(), 4); return v;
+                        }();
+                        entry_ok = (w >> 26) == 0x05;   // b
+                    }
+                    if (p.write_addr == 0x4000 && p.str_bytes.length() >= 104) {
+                        // restore 槽位在 blob 内偏移 48（48 字符密钥之后）：
+                        const std::string slot = p.str_bytes.substr(96, 8);
+                        restore_ok = (slot == "ff4301d1");   // STP_PRE 小端 hex
+                    }
+                }
+                check("dx_pac_skip_entry_at_plus4", entry_ok,
+                      "入口 b 必须落在 PACIASP 之后（+4），绝不能改写 PACIASP 槽位"
+                      "（bootloop 根因回归：skip 被 set_execve_param 撤销时此断言红）");
+                check("dx_pac_skip_restore_is_stp", restore_ok,
+                      "blob 内偏移 48 的 restore 槽位必须是 skip 后首指令（stp），"
+                      "绝不是 PACIASP（bootloop 根因回归）");
+            }
+        }
         // 5.5- 内核：__do_execve_file 首选锁定（即使它比 do_execveat_common 小）
         std::vector<char> buf54 = make_base_buf();
         // 把版本串改写成 5.4.x（find_kernel_versions 只扫前 256B 的 "Linux version "）
@@ -1348,7 +1397,7 @@ static int self_test_doexecve_contract() {
     }
 
     std::cout << "DXRESULT " << (failures == 0 ? "PASS" : "FAIL")
-              << " " << (total - failures) << "/" << total << " cases\n";
+              << " " << std::to_string(total - failures) << "/" << std::to_string(total) << " cases\n";
     return failures == 0 ? OK : 1;
 }
 

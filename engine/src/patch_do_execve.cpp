@@ -92,7 +92,15 @@ void PatchDoExecve::init_do_execve_param(const KernelSymbolOffset& sym) {
 	m_doexecve_reg_param.do_execve_addr = skip_pac_bti_at_func_start(m_doexecve_reg_param.do_execve_addr);
 	// R1：候选全空（或全部被序言白名单拒绝）→ valid=false，patch_do_execve 前置短路，
 	// 管线报 E202 而不是 IF_EXIT exit(0) 伪成功。
-	m_do_execve_valid = set_execve_param(best)
+	// ★ 真机 bootloop 根因修复（2026-11-14）：此处**不得**再次调用 set_execve_param(best)——
+	//   它会把 do_execve_addr 重写回未跳过 PAC 的 best.execve_sym.offset（0x38fcd0），
+	//   撤销上一行 skip_pac_bti 的 +4。后果：入口 b 改写 PACIASP 槽位本身、restore 槽位
+	//   变成 PACIASP、blob 尾跳到 0x38fcd4——控制流虽自洽，但 PACIASP 在 blob 内执行时
+	//   SP 已是函数入口 SP（等价），真正的差异在 blob 尾跳回 0x38fcd4 而非 0x38fcd8，
+	//   与 restore 槽位语义（应恢复 hook_site 首指令 = stp）错位 → 每次函数调用都
+	//   多执行一次 PACIASP 路径差异，PAC 寄存器上下文被破坏 → 真机 bootloop。
+	//   正确语义（与旧引擎一致）：skip 之后 valid 只检查 addr != 0 且 best 非空。
+	m_do_execve_valid = (best.execve_sym && best.execve_sym.size != 0)
 		&& m_doexecve_reg_param.do_execve_addr != 0;
 }
 
